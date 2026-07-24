@@ -94,7 +94,7 @@ async function initializePaystackPayment(email, amountNgn, userId) {
       },
       {
         headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
+          Authorization: `Bearer ${PAYSTACK_SECRET_KEY.trim()}`,
           'Content-Type': 'application/json'
         }
       }
@@ -109,11 +109,12 @@ async function initializePaystackPayment(email, amountNgn, userId) {
 // ------------------- LOGSDOMAIN INTEGRATION -------------------
 
 async function getCountries() {
-  if (!SMS_API_KEY) return [];
+  const cleanKey = SMS_API_KEY ? SMS_API_KEY.trim() : null;
+  if (!cleanKey) return [];
   try {
     const res = await axios.get(`${LOGSDOMAIN_BASE_URL}/numbers/countries`, {
       ...robustAxiosConfig,
-      headers: { ...robustAxiosConfig.headers, 'Authorization': `Bearer ${SMS_API_KEY}` }
+      headers: { ...robustAxiosConfig.headers, 'Authorization': `Bearer ${cleanKey}` }
     });
     return res.data?.success ? res.data.data : [];
   } catch (err) {
@@ -123,11 +124,12 @@ async function getCountries() {
 }
 
 async function getLogsDomainServices(countryId) {
-  if (!SMS_API_KEY) return [];
+  const cleanKey = SMS_API_KEY ? SMS_API_KEY.trim() : null;
+  if (!cleanKey) return [];
   try {
     const res = await axios.get(`${LOGSDOMAIN_BASE_URL}/numbers/services?country_id=${countryId}`, {
       ...robustAxiosConfig,
-      headers: { ...robustAxiosConfig.headers, 'Authorization': `Bearer ${SMS_API_KEY}` }
+      headers: { ...robustAxiosConfig.headers, 'Authorization': `Bearer ${cleanKey}` }
     });
     if (!res.data || !res.data.data) return [];
     return Array.isArray(res.data.data) ? res.data.data : Object.values(res.data.data);
@@ -140,19 +142,39 @@ async function getLogsDomainServices(countryId) {
 // ------------------- ALLSMSVERIFY INTEGRATION -------------------
 
 async function getAllSmsVerifyServices(countryShortCode) {
-  if (!SECOND_SMS_API_KEY) return [];
+  const cleanApiKey = SECOND_SMS_API_KEY ? SECOND_SMS_API_KEY.trim() : null;
+  if (!cleanApiKey) {
+    console.log("AllSMSVerify: SECOND_SMS_API_KEY missing");
+    return [];
+  }
+
+  // Format country code to uppercase (e.g. 'us' -> 'US')
+  const formattedCountry = (countryShortCode || 'US').toUpperCase();
+
   try {
     const res = await axios.get(ALLSMSVERIFY_BASE_URL, {
       ...robustAxiosConfig,
       params: {
         action: 'getServices',
-        api_key: SECOND_SMS_API_KEY,
-        country: countryShortCode
+        api_key: cleanApiKey,
+        country: formattedCountry
       }
     });
 
     const data = res.data;
-    if (typeof data === 'string' && (data.includes('<!DOCTYPE html>') || data.includes('BAD_KEY') || data.includes('404'))) {
+    const respString = String(data).trim();
+
+    if (respString.includes('BAD_KEY')) {
+      console.error("AllSMSVerify Error: BAD_KEY returned from provider! Check SECOND_SMS_API_KEY in Render.");
+      return [];
+    }
+
+    if (respString.includes('BAD_COUNTRY')) {
+      console.error(`AllSMSVerify Error: BAD_COUNTRY returned for '${formattedCountry}'`);
+      return [];
+    }
+
+    if (respString.includes('<!DOCTYPE html>') || respString.includes('404')) {
       return [];
     }
 
@@ -256,13 +278,16 @@ function matchesServiceQuery(serviceName, query) {
 async function executePurchase(provider, countryId, countryShort, serviceId, operatorId) {
   if (provider === 'a' || provider === 'allsmsverify') {
     try {
+      const formattedCountry = (countryShort || 'US').toUpperCase();
+      const cleanApiKey = SECOND_SMS_API_KEY ? SECOND_SMS_API_KEY.trim() : '';
+
       const res = await axios.get(ALLSMSVERIFY_BASE_URL, {
         ...robustAxiosConfig,
         params: {
           action: 'getNumber',
-          api_key: SECOND_SMS_API_KEY,
+          api_key: cleanApiKey,
           service: serviceId,
-          country: countryShort
+          country: formattedCountry
         }
       });
 
@@ -277,6 +302,7 @@ async function executePurchase(provider, countryId, countryShort, serviceId, ope
     }
   } else {
     try {
+      const cleanApiKey = SMS_API_KEY ? SMS_API_KEY.trim() : '';
       const payload = {
         country_id: parseInt(countryId),
         service_id: parseInt(serviceId),
@@ -286,7 +312,7 @@ async function executePurchase(provider, countryId, countryShort, serviceId, ope
 
       const res = await axios.post(`${LOGSDOMAIN_BASE_URL}/numbers/orders`, payload, {
         ...robustAxiosConfig,
-        headers: { ...robustAxiosConfig.headers, 'Authorization': `Bearer ${SMS_API_KEY}` }
+        headers: { ...robustAxiosConfig.headers, 'Authorization': `Bearer ${cleanApiKey}` }
       });
       return res.data;
     } catch (err) {
@@ -298,9 +324,10 @@ async function executePurchase(provider, countryId, countryShort, serviceId, ope
 async function checkSmsCode(provider, orderId) {
   try {
     if (provider === 'a' || provider === 'allsmsverify') {
+      const cleanApiKey = SECOND_SMS_API_KEY ? SECOND_SMS_API_KEY.trim() : '';
       const res = await axios.get(ALLSMSVERIFY_BASE_URL, {
         ...robustAxiosConfig,
-        params: { action: 'getStatus', api_key: SECOND_SMS_API_KEY, id: orderId }
+        params: { action: 'getStatus', api_key: cleanApiKey, id: orderId }
       });
       const respText = String(res.data).trim();
       if (respText.startsWith('STATUS_OK')) {
@@ -308,9 +335,10 @@ async function checkSmsCode(provider, orderId) {
       }
       return { success: false };
     } else {
+      const cleanApiKey = SMS_API_KEY ? SMS_API_KEY.trim() : '';
       const res = await axios.post(`${LOGSDOMAIN_BASE_URL}/numbers/orders/${orderId}/check`, {}, {
         ...robustAxiosConfig,
-        headers: { ...robustAxiosConfig.headers, 'Authorization': `Bearer ${SMS_API_KEY}` }
+        headers: { ...robustAxiosConfig.headers, 'Authorization': `Bearer ${cleanApiKey}` }
       });
       return res.data;
     }
@@ -322,14 +350,16 @@ async function checkSmsCode(provider, orderId) {
 async function cancelOrder(provider, orderId) {
   try {
     if (provider === 'a' || provider === 'allsmsverify') {
+      const cleanApiKey = SECOND_SMS_API_KEY ? SECOND_SMS_API_KEY.trim() : '';
       await axios.get(ALLSMSVERIFY_BASE_URL, {
         ...robustAxiosConfig,
-        params: { action: 'setStatus', api_key: SECOND_SMS_API_KEY, id: orderId, status: 8 }
+        params: { action: 'setStatus', api_key: cleanApiKey, id: orderId, status: 8 }
       });
     } else {
+      const cleanApiKey = SMS_API_KEY ? SMS_API_KEY.trim() : '';
       await axios.post(`${LOGSDOMAIN_BASE_URL}/numbers/orders/${orderId}/cancel`, {}, {
         ...robustAxiosConfig,
-        headers: { ...robustAxiosConfig.headers, 'Authorization': `Bearer ${SMS_API_KEY}` }
+        headers: { ...robustAxiosConfig.headers, 'Authorization': `Bearer ${cleanApiKey}` }
       });
     }
   } catch (err) {
