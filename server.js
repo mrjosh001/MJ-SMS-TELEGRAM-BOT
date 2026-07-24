@@ -4,6 +4,8 @@ const axios = require('axios');
 const https = require('https');
 
 const app = express();
+
+// Express JSON Middleware (Critical for receiving Paystack webhooks)
 app.use(express.json());
 
 // Environment variables provided by Render
@@ -26,7 +28,7 @@ if (!BOT_TOKEN) {
 const bot = new Telegraf(BOT_TOKEN);
 const userSessions = {};
 
-// Custom HTTPS agent to keep connection alive and prevent TLS drops
+// Custom HTTPS agent to prevent TLS drops
 const agent = new https.Agent({
   keepAlive: true,
   rejectUnauthorized: false
@@ -70,6 +72,7 @@ function calculateRetailPrice(serviceName, providerPriceNgn) {
 
 async function initializePaystackPayment(email, amountNgn, userId) {
   if (!PAYSTACK_SECRET_KEY) {
+    console.error("PAYSTACK_SECRET_KEY is missing in Render Environment Variables.");
     return { status: false, message: "Paystack secret key is missing." };
   }
   try {
@@ -334,7 +337,7 @@ async function cancelOrder(provider, orderId) {
   }
 }
 
-// ------------------- ELSA BOT FLOW -------------------
+// ------------------- ELSA BOT COMMANDS & FLOWS -------------------
 
 bot.start((ctx) => {
   const userId = ctx.from.id;
@@ -354,7 +357,6 @@ bot.start((ctx) => {
   );
 });
 
-// Deposit / Wallet Command
 bot.command(['fund', 'deposit', 'wallet', 'balance'], (ctx) => {
   const userId = ctx.from.id;
   if (!userSessions[userId]) userSessions[userId] = { balance: 0 };
@@ -370,6 +372,8 @@ bot.command(['fund', 'deposit', 'wallet', 'balance'], (ctx) => {
   );
 });
 
+// ------------------- TEXT MESSAGE HANDLER -------------------
+
 bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
   const rawText = ctx.message.text.trim();
@@ -378,16 +382,40 @@ bot.on('text', async (ctx) => {
   if (!userSessions[userId]) userSessions[userId] = { balance: 0, state: 'AWAITING_COUNTRY' };
   const session = userSessions[userId];
 
-  // Deposit Amount Input Handler
-  if (session.state === 'AWAITING_DEPOSIT_AMOUNT') {
-    const amount = parseInt(rawText.replace(/[^0-9]/g, ''));
-    if (isNaN(amount) || amount < 100) {
-      ctx.reply(`Please enter a valid amount (minimum ₦100). E.g. *1000*`);
+  // A. Catch plain "balance", "wallet"
+  if (['balance', 'wallet', 'my balance', 'check balance'].includes(lowerText)) {
+    const bal = session.balance || 0;
+    ctx.reply(
+      `💰 *YOUR WALLET BALANCE:* ₦${bal.toLocaleString()}\n\n` +
+      `To top up, type */fund* or reply with an amount like *fund 1000*.`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
+  // B. Catch plain "fund", "deposit", "topup"
+  if (['fund', 'deposit', 'topup', 'top up'].includes(lowerText)) {
+    session.state = 'AWAITING_DEPOSIT_AMOUNT';
+    ctx.reply(
+      `💳 *MJ SMS WALLET TOP-UP*\n\n` +
+      `💰 *Current Balance:* ₦${(session.balance || 0).toLocaleString()}\n\n` +
+      `Enter the amount you want to deposit in Naira (e.g., reply with *1000*, *2000*, or *5000*):`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
+  // C. Catch "fund 1000" or "deposit 5000"
+  const fundMatch = lowerText.match(/^(?:fund|deposit|topup)\s+(\d+)$/i);
+  if (fundMatch) {
+    const amount = parseInt(fundMatch[1]);
+    if (amount < 100) {
+      ctx.reply("Minimum deposit amount is ₦100.");
       return;
     }
 
     ctx.reply(`Generating your Paystack payment link... ⏳`);
-    const userEmail = `${userId}@mjsms.com`; // Fallback email format for Telegram users
+    const userEmail = `${userId}@mjsms.com`;
     const payment = await initializePaystackPayment(userEmail, amount, userId);
 
     if (payment.status && payment.data?.authorization_url) {
@@ -404,12 +432,43 @@ bot.on('text', async (ctx) => {
         }
       );
     } else {
-      ctx.reply(`❌ *Payment Error:* Could not generate payment link. Please try again later.`);
+      ctx.reply(`❌ Could not generate payment link. Please try again.`);
     }
     return;
   }
 
-  // Detect "Which one dey available?" Intent
+  // D. Deposit Amount Input Handler
+  if (session.state === 'AWAITING_DEPOSIT_AMOUNT') {
+    const amount = parseInt(rawText.replace(/[^0-9]/g, ''));
+    if (isNaN(amount) || amount < 100) {
+      ctx.reply(`Please enter a valid amount (minimum ₦100). E.g. *1000*`);
+      return;
+    }
+
+    ctx.reply(`Generating your Paystack payment link... ⏳`);
+    const userEmail = `${userId}@mjsms.com`;
+    const payment = await initializePaystackPayment(userEmail, amount, userId);
+
+    if (payment.status && payment.data?.authorization_url) {
+      session.state = 'IDLE';
+      ctx.reply(
+        `💳 *PAYSTACK PAYMENT LINK READY*\n\n` +
+        `Amount: *₦${amount.toLocaleString()}*\n\n` +
+        `Tap the button below to complete payment. Your wallet will be credited automatically once done! 👇`,
+        {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([
+            [Markup.button.url('💳 Pay Now via Paystack', payment.data.authorization_url)]
+          ])
+        }
+      );
+    } else {
+      ctx.reply(`❌ *Payment Error:* Could not generate payment link.`);
+    }
+    return;
+  }
+
+  // E. Detect "Which one dey available?" Intent
   const isAvailableQuery = [
     'available', 'which one', 'what is available', 'list', 'show', 'any number', 'which app'
   ].some(keyword => lowerText.includes(keyword));
@@ -443,7 +502,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // Standard Greetings
+  // F. Standard Greetings
   if (['hi', 'hello', 'hey', 'awfa', 'howfar', 'how far', 'xup'].some(g => lowerText.includes(g))) {
     ctx.reply(
       `How far my boss! 😊 My name na *Elsa*, welcome to *MJ SMS*!\n` +
@@ -456,7 +515,7 @@ bot.on('text', async (ctx) => {
 
   const countries = await getCountries();
 
-  // Multi-word Input Detection ("USA WhatsApp")
+  // G. Multi-word Input Detection ("USA WhatsApp")
   if (countries.length > 0) {
     const words = lowerText.split(/\s+/);
     let matchedCountry = null;
@@ -485,7 +544,7 @@ bot.on('text', async (ctx) => {
     }
   }
 
-  // Country Selection Logic
+  // H. Country Selection Logic
   if (session.state === 'AWAITING_COUNTRY' || session.state === 'IDLE') {
     ctx.reply(`Hold on boss, make I check available countries... 🔎`);
     
@@ -510,7 +569,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // Service Selection Logic
+  // I. Service Selection Logic
   if (session.state === 'AWAITING_SERVICE') {
     const newCountryMatch = countries.find(c => 
       c.name.toLowerCase() === lowerText || 
@@ -629,7 +688,7 @@ const TELEGRAM_WEBHOOK_PATH = `/webhook/telegram`;
 app.use(bot.webhookCallback(TELEGRAM_WEBHOOK_PATH));
 
 // Paystack Webhook Handler
-app.post('/webhook/paystack', express.json(), async (req, res) => {
+app.post('/webhook/paystack', async (req, res) => {
   const event = req.body;
 
   if (event && event.event === 'charge.success') {
