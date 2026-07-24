@@ -71,7 +71,8 @@ const robustAxiosConfig = {
 };
 
 const USD_TO_NGN_RATE = 1500; 
-const DEFAULT_MARGIN = 1.4;
+// Updated to 70% profit margin markup (1 + 0.70 = 1.7)
+const DEFAULT_MARGIN = 1.7;
 
 // ------------------- PAYSTACK INTEGRATION -------------------
 async function initializePaystackPayment(email, amountNgn, userId) {
@@ -450,7 +451,6 @@ bot.action(/^buy\|(.+)\|(.+)$/, async (ctx) => {
   const countryId = ctx.match[1];
   const serviceId = ctx.match[2];
 
-  // 1. Fetch live service details/price to check user wallet balance first
   const availableServers = await fetchCombinedServices({ id: countryId, name: countryId });
   const targetService = availableServers.find(s => String(s.service_id) === String(serviceId));
   
@@ -471,7 +471,6 @@ bot.action(/^buy\|(.+)\|(.+)$/, async (ctx) => {
   const response = await executeJuicyPurchase(serviceId, countryId);
 
   if (response.success && response.data) {
-    // Deduct user balance on successful purchase
     if (calculatedNgnPrice > 0) {
       session.balance = Math.max(0, session.balance - calculatedNgnPrice);
       saveSessions();
@@ -509,7 +508,6 @@ bot.action(/^buy\|(.+)\|(.+)$/, async (ctx) => {
       } else if (pollCount >= maxPolls) {
         clearInterval(intervalId);
         await cancelJuicyOrder(orderId);
-        // Refund user balance if timed out/canceled
         if (calculatedNgnPrice > 0) {
           session.balance += calculatedNgnPrice;
           saveSessions();
@@ -564,7 +562,7 @@ app.post('/webhook/paystack', async (req, res) => {
   res.sendStatus(200);
 });
 
-app.get('/', (reque, res) => res.send('MJ SMS Bot Active!'));
+app.get('/', (req, res) => res.send('MJ SMS Bot Active!'));
 
 app.listen(PORT, async () => {
   console.log(`Server listening on port ${PORT}`);
