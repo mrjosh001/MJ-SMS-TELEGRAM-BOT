@@ -61,7 +61,6 @@ async function getUserSession(userId) {
     const ordersRes = await axios.get(`${SUPABASE_REST_URL}/orders?user_id=eq.${userId}&select=*`, { headers });
     const txRes = await axios.get(`${SUPABASE_REST_URL}/transactions?user_id=eq.${userId}&select=*`, { headers });
 
-    // Normalize country stored in db back to an object if it's a string
     let parsedCountry = user.country;
     if (typeof parsedCountry === 'string') {
       const allSupportedCountries = [...JUICYSMS_COUNTRIES, ...PLUSVERIFY_COUNTRIES];
@@ -697,10 +696,11 @@ async function promptServerSelection(ctx, session) {
   const availableServers = await fetchCombinedServices(session.country);
   const q = (session.selectedServiceQuery || '').toLowerCase().trim();
   
+  // FIXED: Flexible partial & case-insensitive matching for service names (e.g., "whatsapp" matches "WhatsApp", "whatsapp-business")
   const filtered = availableServers.filter(s => {
     const sName = String(s.service_name || '').toLowerCase();
     const sId = String(s.service_id || '').toLowerCase();
-    return sName === q || sName.includes(q) || q.includes(sName) || sId === q || sId.includes(q);
+    return sName.includes(q) || q.includes(sName) || sId.includes(q);
   });
 
   if (filtered.length === 0) {
@@ -753,10 +753,11 @@ bot.action(/^server\|(.+)\|(.+)$/, async (ctx) => {
   const availableServers = await fetchCombinedServices(session.country);
   const q = (session.selectedServiceQuery || '').toLowerCase().trim();
 
+  // FIXED: Flexible partial matching here too
   const filtered = availableServers.filter(s => {
     const sName = String(s.service_name || '').toLowerCase();
     const sId = String(s.service_id || '').toLowerCase();
-    return String(s.provider) === String(provider) && (sName === q || sName.includes(q) || q.includes(sName) || sId === q || sId.includes(q));
+    return String(s.provider) === String(provider) && (sName.includes(q) || q.includes(sName) || sId.includes(q));
   });
 
   if (filtered.length === 0) {
