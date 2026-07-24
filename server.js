@@ -2,6 +2,8 @@ const express = require('express');
 const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 
@@ -26,7 +28,38 @@ if (!BOT_TOKEN) {
 }
 
 const bot = new Telegraf(BOT_TOKEN);
-const userSessions = {};
+
+// ------------------- PERSISTENT BALANCE STORAGE -------------------
+const DB_FILE = path.join(__dirname, 'users.json');
+let userSessions = {};
+
+// Load user sessions/balances from disk on startup
+function loadSessions() {
+  try {
+    if (fs.existsSync(DB_FILE)) {
+      const rawData = fs.readFileSync(DB_FILE, 'utf8');
+      userSessions = JSON.parse(rawData);
+      console.log(`Loaded ${Object.keys(userSessions).length} user balances from storage.`);
+    } else {
+      userSessions = {};
+    }
+  } catch (err) {
+    console.error("Error reading users.json database:", err.message);
+    userSessions = {};
+  }
+}
+
+// Save user sessions/balances to disk whenever updated
+function saveSessions() {
+  try {
+    fs.writeFileSync(DB_FILE, JSON.stringify(userSessions, null, 2), 'utf8');
+  } catch (err) {
+    console.error("Error saving users.json database:", err.message);
+  }
+}
+
+// Initialize sessions on server startup
+loadSessions();
 
 // Custom HTTPS agent to prevent TLS drops
 const agent = new https.Agent({
@@ -141,15 +174,15 @@ async function getLogsDomainServices(countryId) {
 
 // ------------------- ALLSMSVERIFY INTEGRATION -------------------
 
-async function getAllSmsVerifyServices(countryShortCode) {
+async function getAllSmsVerifyServices(countryShortCode, countryId) {
   const cleanApiKey = SECOND_SMS_API_KEY ? SECOND_SMS_API_KEY.trim() : null;
   if (!cleanApiKey) {
     console.log("AllSMSVerify: SECOND_SMS_API_KEY missing");
     return [];
   }
 
-  // Format country code to uppercase (e.g. 'us' -> 'US')
-  const formattedCountry = (countryShortCode || 'US').toUpperCase();
+  // Use numeric Country ID to satisfy handler_api.php stub requirements (e.g. 12 for USA)
+  const numericCountry = countryId || (countryShortCode?.toLowerCase() === 'us' ? 12 : 0);
 
   try {
     const res = await axios.get(ALLSMSVERIFY_BASE_URL, {
@@ -157,7 +190,7 @@ async function getAllSmsVerifyServices(countryShortCode) {
       params: {
         action: 'getServices',
         api_key: cleanApiKey,
-        country: formattedCountry
+        country: numericCountry
       }
     });
 
@@ -170,7 +203,7 @@ async function getAllSmsVerifyServices(countryShortCode) {
     }
 
     if (respString.includes('BAD_COUNTRY')) {
-      console.error(`AllSMSVerify Error: BAD_COUNTRY returned for '${formattedCountry}'`);
+      console.error(`AllSMSVerify Error: BAD_COUNTRY returned for Country ID '${numericCountry}'`);
       return [];
     }
 
@@ -237,8 +270,8 @@ async function fetchCombinedServices(country) {
     });
   }
 
-  // AllSMSVerify
-  const allSmsData = await getAllSmsVerifyServices(country.short);
+  // AllSMSVerify (Passes numeric country ID)
+  const allSmsData = await getAllSmsVerifyServices(country.short, country.id);
   if (Array.isArray(allSmsData)) {
     allSmsData.forEach(s => {
       const serviceName = s.service_name || s.name || s.title || s.service || '';
@@ -278,8 +311,8 @@ function matchesServiceQuery(serviceName, query) {
 async function executePurchase(provider, countryId, countryShort, serviceId, operatorId) {
   if (provider === 'a' || provider === 'allsmsverify') {
     try {
-      const formattedCountry = (countryShort || 'US').toUpperCase();
       const cleanApiKey = SECOND_SMS_API_KEY ? SECOND_SMS_API_KEY.trim() : '';
+      const numericCountry = countryId || (countryShort?.toLowerCase() === 'us' ? 12 : 0);
 
       const res = await axios.get(ALLSMSVERIFY_BASE_URL, {
         ...robustAxiosConfig,
@@ -287,7 +320,7 @@ async function executePurchase(provider, countryId, countryShort, serviceId, ope
           action: 'getNumber',
           api_key: cleanApiKey,
           service: serviceId,
-          country: formattedCountry
+          country: numericCountry
         }
       });
 
@@ -367,14 +400,24 @@ async function cancelOrder(provider, orderId) {
   }
 }
 
+// Helper to ensure session exists without overwriting stored balance
+function getUserSession(userId) {
+  if (!userSessions[userId]) {
+    userSessions[userId] = { balance: 0, state: 'AWAITING_COUNTRY' };
+    saveSessions();
+  }
+  return userSessions[userId];
+}
+
 // ------------------- ELSA BOT COMMANDS & FLOWS -------------------
 
 bot.start((ctx) => {
   const userId = ctx.from.id;
-  if (!userSessions[userId]) userSessions[userId] = { balance: 0 };
-  userSessions[userId].state = 'AWAITING_COUNTRY';
+  const session = getUserSession(userId);
+  session.state = 'AWAITING_COUNTRY';
+  saveSessions();
 
-  const balance = userSessions[userId].balance || 0;
+  const balance = session.balance || 0;
 
   ctx.reply(
     `How far boss! 👋 My name is *Elsa*. Welcome to *MJ SMS*! ✨\n` +
@@ -389,14 +432,13 @@ bot.start((ctx) => {
 
 bot.command(['fund', 'deposit', 'wallet', 'balance'], (ctx) => {
   const userId = ctx.from.id;
-  if (!userSessions[userId]) userSessions[userId] = { balance: 0 };
-  const balance = userSessions[userId].balance || 0;
-
-  userSessions[userId].state = 'AWAITING_DEPOSIT_AMOUNT';
+  const session = getUserSession(userId);
+  session.state = 'AWAITING_DEPOSIT_AMOUNT';
+  saveSessions();
 
   ctx.reply(
     `💳 *MJ SMS WALLET TOP-UP*\n\n` +
-    `💰 *Current Balance:* ₦${balance.toLocaleString()}\n\n` +
+    `💰 *Current Balance:* ₦${(session.balance || 0).toLocaleString()}\n\n` +
     `Enter the amount you want to deposit in Naira (e.g., reply with *1000*, *2000*, or *5000*):`,
     { parse_mode: 'Markdown' }
   );
@@ -409,8 +451,7 @@ bot.on('text', async (ctx) => {
   const rawText = ctx.message.text.trim();
   const lowerText = rawText.toLowerCase();
 
-  if (!userSessions[userId]) userSessions[userId] = { balance: 0, state: 'AWAITING_COUNTRY' };
-  const session = userSessions[userId];
+  const session = getUserSession(userId);
 
   // A. Catch plain "balance", "wallet"
   if (['balance', 'wallet', 'my balance', 'check balance'].includes(lowerText)) {
@@ -426,6 +467,7 @@ bot.on('text', async (ctx) => {
   // B. Catch plain "fund", "deposit", "topup"
   if (['fund', 'deposit', 'topup', 'top up'].includes(lowerText)) {
     session.state = 'AWAITING_DEPOSIT_AMOUNT';
+    saveSessions();
     ctx.reply(
       `💳 *MJ SMS WALLET TOP-UP*\n\n` +
       `💰 *Current Balance:* ₦${(session.balance || 0).toLocaleString()}\n\n` +
@@ -450,6 +492,7 @@ bot.on('text', async (ctx) => {
 
     if (payment.status && payment.data?.authorization_url) {
       session.state = 'IDLE';
+      saveSessions();
       ctx.reply(
         `💳 *PAYSTACK PAYMENT LINK READY*\n\n` +
         `Amount: *₦${amount.toLocaleString()}*\n\n` +
@@ -481,6 +524,7 @@ bot.on('text', async (ctx) => {
 
     if (payment.status && payment.data?.authorization_url) {
       session.state = 'IDLE';
+      saveSessions();
       ctx.reply(
         `💳 *PAYSTACK PAYMENT LINK READY*\n\n` +
         `Amount: *₦${amount.toLocaleString()}*\n\n` +
@@ -507,6 +551,7 @@ bot.on('text', async (ctx) => {
     if (!session.country) {
       ctx.reply(`Please tell me which country you want to check first! (e.g., _United States_, _Nigeria_)`, { parse_mode: 'Markdown' });
       session.state = 'AWAITING_COUNTRY';
+      saveSessions();
       return;
     }
 
@@ -529,6 +574,7 @@ bot.on('text', async (ctx) => {
 
     ctx.reply(message, { parse_mode: 'Markdown' });
     session.state = 'AWAITING_SERVICE';
+    saveSessions();
     return;
   }
 
@@ -540,6 +586,7 @@ bot.on('text', async (ctx) => {
       `Which country virtual number you wan buy today? Just drop the country name for me.`
     );
     session.state = 'AWAITING_COUNTRY';
+    saveSessions();
     return;
   }
 
@@ -568,6 +615,7 @@ bot.on('text', async (ctx) => {
     if (matchedCountry && matchedServiceQuery) {
       session.country = matchedCountry;
       session.state = 'AWAITING_SERVICE';
+      saveSessions();
       ctx.reply(`Oya wait make Elsa check available servers for *${matchedServiceQuery}* (${matchedCountry.name})... 🔎`, { parse_mode: 'Markdown' });
       await processServiceSelection(ctx, session, matchedServiceQuery);
       return;
@@ -588,6 +636,7 @@ bot.on('text', async (ctx) => {
     if (matchedCountry) {
       session.country = matchedCountry;
       session.state = 'AWAITING_SERVICE';
+      saveSessions();
       ctx.reply(
         `Ehen! You select *${matchedCountry.name}* 👌\n\n` +
         `Which app or service you wan verify? (e.g. _WhatsApp_, _Telegram_, _Facebook_)`,
@@ -609,6 +658,7 @@ bot.on('text', async (ctx) => {
 
     if (newCountryMatch) {
       session.country = newCountryMatch;
+      saveSessions();
       ctx.reply(`Switched country to *${newCountryMatch.name}* 👌\n\nWhich app or service you wan verify?`, { parse_mode: 'Markdown' });
       return;
     }
@@ -708,7 +758,9 @@ bot.action(/^b\|(.+)\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
 bot.action('reset_flow', (ctx) => {
   ctx.answerCbQuery();
   const userId = ctx.from.id;
-  userSessions[userId] = { ...userSessions[userId], state: 'AWAITING_COUNTRY' };
+  const session = getUserSession(userId);
+  session.state = 'AWAITING_COUNTRY';
+  saveSessions();
   ctx.reply(`No p boss! Which country number you wan check now?`);
 });
 
@@ -727,15 +779,16 @@ app.post('/webhook/paystack', async (req, res) => {
     const amountPaidNgn = data.amount / 100;
 
     if (userId) {
-      if (!userSessions[userId]) userSessions[userId] = { balance: 0 };
-      userSessions[userId].balance = (userSessions[userId].balance || 0) + amountPaidNgn;
+      const session = getUserSession(userId);
+      session.balance = (session.balance || 0) + amountPaidNgn;
+      saveSessions(); // Write updated balance to disk immediately
 
       try {
         await bot.telegram.sendMessage(
           userId,
           `🎉 *PAYMENT SUCCESSFUL!*\n\n` +
           `💳 *Amount Credited:* ₦${amountPaidNgn.toLocaleString()}\n` +
-          `💰 *New Wallet Balance:* ₦${userSessions[userId].balance.toLocaleString()}\n\n` +
+          `💰 *New Wallet Balance:* ₦${session.balance.toLocaleString()}\n\n` +
           `You can now select a country and buy virtual numbers!`,
           { parse_mode: 'Markdown' }
         );
@@ -748,7 +801,7 @@ app.post('/webhook/paystack', async (req, res) => {
   res.sendStatus(200);
 });
 
-app.get('/', (req, res) => res.send('MJ SMS Bot (Elsa) with Paystack is Active!'));
+app.get('/', (req, res) => res.send('MJ SMS Bot (Elsa) with Persistent Balances & Paystack is Active!'));
 
 app.listen(PORT, async () => {
   console.log(`Server listening on port ${PORT}`);
