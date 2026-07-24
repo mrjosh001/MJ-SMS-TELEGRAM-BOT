@@ -136,11 +136,14 @@ const USD_TO_NGN_RATE = 1500;
 function calculateFinalPrice(rawPrice, isAlreadyNgn = false) {
   const numericPrice = parseFloat(rawPrice) || 0;
   const baseCostNgn = isAlreadyNgn ? numericPrice : (numericPrice * USD_TO_NGN_RATE);
-  if (baseCostNgn <= 0) return 500; // safety fallback if price is missing
-  if (baseCostNgn < 3500) {
-    return Math.ceil(baseCostNgn + 3000);
+  if (baseCostNgn <= 0) return 3500; // safety fallback
+
+  if (baseCostNgn < 3000) {
+    // If supplier cost is less than 3k, add mandatory ₦3,500 markup
+    return Math.ceil(baseCostNgn + 3500);
   } else {
-    return Math.ceil(baseCostNgn * 2);
+    // Otherwise, apply 80% profit margin markup (Cost * 1.8)
+    return Math.ceil(baseCostNgn * 1.8);
   }
 }
 
@@ -195,7 +198,9 @@ const COUNTRY_ALIASES = {
   'india': { id: 'in', name: 'India (IN)' },
   'in': { id: 'in', name: 'India (IN)' },
   'germany': { id: 'de', name: 'Germany (DE)' },
-  'de': { id: 'de', name: 'Germany (DE)' }
+  'de': { id: 'de', name: 'Germany (DE)' },
+  'france': { id: 'fr', name: 'France (FR)' },
+  'fr': { id: 'fr', name: 'France (FR)' }
 };
 
 function intelligentTranslateService(rawQuery) {
@@ -577,10 +582,11 @@ async function promptServerSelection(ctx, session) {
   const availableServers = await fetchCombinedServices(session.country);
   const q = (session.selectedServiceQuery || '').toLowerCase().trim();
 
+  // STRICT filtering: Service name must precisely match the searched app (e.g., whatsapp)
   const filtered = availableServers.filter(s => {
     const sName = String(s.service_name || '').toLowerCase();
     const sId = String(s.service_id || '').toLowerCase();
-    return sName.includes(q) || q.includes(sName) || sId.includes(q) || sName.replace(/[^a-z0-9]/g, '').includes(q.replace(/[^a-z0-9]/g, ''));
+    return sName === q || sName.includes(q) || sId === q;
   });
 
   const userId = ctx.from.id;
@@ -597,7 +603,6 @@ async function promptServerSelection(ctx, session) {
 
   const serverButtons = [];
   uniqueServersMap.forEach((srv, label) => {
-    // Clean server labels without showing internal provider tags
     serverButtons.push([Markup.button.callback(`🖥️ ${label}`, `server|${srv.provider}|${srv.server_label}`)]);
   });
   serverButtons.push([Markup.button.callback('🔄 Choose Another Country', 'reset_flow')]);
@@ -613,7 +618,12 @@ bot.action(/^server\|(.+)\|(.+)$/, async (ctx) => {
   const availableServers = await fetchCombinedServices(session.country);
   const q = (session.selectedServiceQuery || '').toLowerCase().trim();
 
-  const filtered = availableServers.filter(s => String(s.provider) === String(provider) && (String(s.service_name).toLowerCase().includes(q) || q.includes(String(s.service_name).toLowerCase()) || s.service_id));
+  // Strict filtering per server as well
+  const filtered = availableServers.filter(s => {
+    const sName = String(s.service_name || '').toLowerCase();
+    const sId = String(s.service_id || '').toLowerCase();
+    return String(s.provider) === String(provider) && (sName === q || sName.includes(q) || sId === q);
+  });
 
   const buttons = filtered.map(srv => {
     const finalPrice = calculateFinalPrice(srv.price, srv.is_ngn);
