@@ -13,10 +13,12 @@ const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SERVER_URL = process.env.RENDER_EXTERNAL_URL;
 const JUICYSMS_API_KEY = process.env.JUICYSMS_API_KEY || process.env.SECOND_SMS_API_KEY;
+const PLUSVERIFY_API_KEY = process.env.PLUSVERIFY_API_KEY; // PlusVerify API Key from https://plusverify.com.ng/profile.php
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 
-// JuicySMS API Base URL
+// API Base URLs
 const JUICYSMS_BASE_URL = 'https://juicysms.com/api';
+const PLUSVERIFY_BASE_URL = 'https://plusverify.com.ng/api'; // Official PlusVerify Base URL endpoints
 
 if (!BOT_TOKEN) {
   console.error("FATAL ERROR: BOT_TOKEN environment variable is missing!");
@@ -25,7 +27,7 @@ if (!BOT_TOKEN) {
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// ------------------- PERSISTENT STORAGE -------------------
+// ------------------- PERSISTENT STORAGE (SAFE MIGRATION) -------------------
 const DB_FILE = path.join(__dirname, 'users.json');
 let userSessions = {};
 
@@ -33,11 +35,24 @@ function loadSessions() {
   try {
     if (fs.existsSync(DB_FILE)) {
       const rawData = fs.readFileSync(DB_FILE, 'utf8');
-      userSessions = JSON.parse(rawData);
+      const parsed = JSON.parse(rawData);
+      
+      // Ensure absolute data integrity for existing customers (safeguarding balances & order history)
+      userSessions = {};
+      for (const [userId, userData] of Object.entries(parsed)) {
+        userSessions[userId] = {
+          balance: typeof userData.balance === 'number' ? userData.balance : 0,
+          state: userData.state || 'AWAITING_COUNTRY',
+          country: userData.country || null,
+          orders: Array.isArray(userData.orders) ? userData.orders : [],
+          transactions: Array.isArray(userData.transactions) ? userData.transactions : []
+        };
+      }
     } else {
       userSessions = {};
     }
   } catch (err) {
+    console.error("Error loading users.json, starting safe fallback:", err.message);
     userSessions = {};
   }
 }
@@ -54,9 +69,18 @@ loadSessions();
 
 function getUserSession(userId) {
   if (!userSessions[userId]) {
-    userSessions[userId] = { balance: 0, state: 'AWAITING_COUNTRY' };
+    userSessions[userId] = { 
+      balance: 0, 
+      state: 'AWAITING_COUNTRY', 
+      country: null,
+      orders: [],
+      transactions: []
+    };
     saveSessions();
   }
+  if (typeof userSessions[userId].balance !== 'number') userSessions[userId].balance = 0;
+  if (!Array.isArray(userSessions[userId].orders)) userSessions[userId].orders = [];
+  if (!Array.isArray(userSessions[userId].transactions)) userSessions[userId].transactions = [];
   return userSessions[userId];
 }
 
@@ -73,15 +97,12 @@ const robustAxiosConfig = {
 const USD_TO_NGN_RATE = 1500; 
 
 // ------------------- PRICING CALCULATION LOGIC -------------------
-function calculateFinalPrice(rawUsdPrice) {
-  const baseCostNgn = rawUsdPrice * USD_TO_NGN_RATE;
+function calculateFinalPrice(rawPrice, isAlreadyNgn = false) {
+  const baseCostNgn = isAlreadyNgn ? rawPrice : (rawPrice * USD_TO_NGN_RATE);
   
-  // If base cost in NGN is below 3,500, add a flat 3,000 profit margin
   if (baseCostNgn < 3500) {
     return Math.ceil(baseCostNgn + 3000);
-  } 
-  // If base cost is 3,500 or above, apply a 100% markup (double the base cost)
-  else {
+  } else {
     return Math.ceil(baseCostNgn * 2);
   }
 }
@@ -112,7 +133,7 @@ async function initializePaystackPayment(email, amountNgn, userId) {
   }
 }
 
-// ------------------- JUICYSMS API INTEGRATION -------------------
+// ------------------- MULTI-API SMS PROVIDER INTEGRATION -------------------
 const JUICYSMS_COUNTRIES = [
   { id: 'NL', name: 'Netherlands (NL)', short: 'nl' },
   { id: 'UK', name: 'United Kingdom (UK)', short: 'uk' },
@@ -120,115 +141,217 @@ const JUICYSMS_COUNTRIES = [
   { id: 'DE', name: 'Germany (DE)', short: 'de' }
 ];
 
-async function getJuicySmsCountries() {
-  return JUICYSMS_COUNTRIES;
-}
+const PLUSVERIFY_COUNTRIES = [
+  { id: 'us', name: 'United States (US)', short: 'us' },
+  { id: 'ng', name: 'Nigeria (NG)', short: 'ng' }
+];
 
 async function getJuicySmsServices(countryId) {
   try {
     const params = { country: countryId || 'NL' };
-    if (JUICYSMS_API_KEY) {
-      params.key = JUICYSMS_API_KEY.trim();
-    }
+    if (JUICYSMS_API_KEY) params.key = JUICYSMS_API_KEY.trim();
 
-    const res = await axios.get(`${JUICYSMS_BASE_URL}/services`, {
-      ...robustAxiosConfig,
-      params: params
-    });
-
+    const res = await axios.get(`${JUICYSMS_BASE_URL}/services`, { ...robustAxiosConfig, params });
     let data = res.data;
     if (data && data.services) data = data.services;
 
     if (Array.isArray(data)) {
-      return data.map(item => {
-        const rawPrice = parseFloat(item.price || item.cost || 0);
-        return {
-          service_id: item.id || item.serviceId || item.code || '',
-          service_name: item.title || item.name || item.service_id || '',
-          stock: parseInt(item.count || item.stock || item.quantity || 10, 10),
-          price: rawPrice,
-          server_id: countryId
-        };
-      }).filter(s => s.service_id);
+      return data.map(item => ({
+        service_id: item.id || item.serviceId || item.code || '',
+        service_name: item.title || item.name || item.service_id || '',
+        stock: parseInt(item.count || item.stock || item.quantity || 10, 10),
+        price: parseFloat(item.price || item.cost || 0),
+        is_ngn: false,
+        server_id: countryId
+      })).filter(s => s.service_id);
     }
     return [];
   } catch (err) {
-    console.error("Error fetching JuicySMS services:", err.message);
+    return [];
+  }
+}
+
+/**
+ * Integrated strictly following PlusVerify documentation requirements:
+ * GET services.php?api_key=KEY
+ */
+async function getPlusVerifyServices() {
+  try {
+    const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
+    if (!cleanApiKey) return [];
+
+    const res = await axios.get(`${PLUSVERIFY_BASE_URL}/services.php`, {
+      ...robustAxiosConfig,
+      params: { api_key: cleanApiKey }
+    });
+
+    const data = res.data;
+    if (data && data.success && Array.isArray(data.otp_services)) {
+      return data.otp_services.map(item => ({
+        service_id: item.id || '',
+        service_name: item.name || item.id || '',
+        stock: 100, // Default stock availability for native plusverify items
+        price: parseFloat(item.price || 0),
+        is_ngn: true
+      })).filter(s => s.service_id);
+    }
+    return [];
+  } catch (err) {
     return [];
   }
 }
 
 async function fetchCombinedServices(country) {
   const results = [];
-  const juicyData = await getJuicySmsServices(country.id);
   
-  if (Array.isArray(juicyData)) {
-    juicyData.forEach(s => {
+  // Fetch from JuicySMS if country matches Juicy format
+  const juicyMatch = JUICYSMS_COUNTRIES.find(c => c.id.toLowerCase() === country.id.toLowerCase());
+  if (juicyMatch) {
+    const juicyData = await getJuicySmsServices(juicyMatch.id);
+    if (Array.isArray(juicyData)) {
+      juicyData.forEach(s => {
+        results.push({
+          provider: 'juicysms',
+          service_id: s.service_id,
+          service_name: s.service_name,
+          operator_id: juicyMatch.id,
+          server_name: `${juicyMatch.name} (JuicySMS)`,
+          stock: s.stock || 10,
+          price: s.price,
+          is_ngn: false
+        });
+      });
+    }
+  }
+
+  // Fetch from PlusVerify if country matches PlusVerify format or universally
+  const plusData = await getPlusVerifyServices();
+  if (Array.isArray(plusData)) {
+    plusData.forEach(s => {
       results.push({
-        provider: 'juicysms',
+        provider: 'plusverify',
         service_id: s.service_id,
         service_name: s.service_name,
-        operator_id: country.id,
-        server_name: country.name,
-        stock: s.stock || 10,
-        price: parseFloat(s.price || 0)
+        operator_id: country.id.toLowerCase(),
+        server_name: `${country.name} (PlusVerify)`,
+        stock: s.stock || 100,
+        price: s.price,
+        is_ngn: true
       });
     });
   }
+
   return results;
 }
 
-async function executeJuicyPurchase(serviceId, countryId) {
-  try {
-    const cleanApiKey = JUICYSMS_API_KEY ? JUICYSMS_API_KEY.trim() : '';
-    const res = await axios.get(`${JUICYSMS_BASE_URL}/makeorder`, {
-      ...robustAxiosConfig,
-      params: { key: cleanApiKey, serviceId: serviceId, country: countryId }
-    });
-
-    const respText = typeof res.data === 'string' ? res.data.trim() : JSON.stringify(res.data);
-    
-    if (respText.startsWith('ORDER_ID_')) {
-      const parts = respText.split('_');
-      const orderId = parts[2];
-      const phoneNumber = parts.slice(4).join('_');
-      return { success: true, data: { order_id: orderId, number: phoneNumber } };
+/**
+ * Execute order adhering precisely to PlusVerify otp.php / JuicySMS patterns
+ */
+async function executeOrder(provider, serviceId, countryId) {
+  if (provider === 'plusverify') {
+    try {
+      const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
+      // PlusVerify POST/GET otp.php endpoint as per official docs
+      const res = await axios.post(`${PLUSVERIFY_BASE_URL}/otp.php`, null, {
+        ...robustAxiosConfig,
+        params: { api_key: cleanApiKey, service_id: serviceId, country_id: countryId }
+      });
+      const data = res.data;
+      if (data && data.success && data.order_id && data.phone_number) {
+        return { 
+          success: true, 
+          data: { 
+            order_id: String(data.order_id), 
+            number: String(data.phone_number),
+            charge: parseFloat(data.charge || 0)
+          } 
+        };
+      }
+      return { success: false, message: data?.message || 'Stock unavailable or insufficient balance on PlusVerify.' };
+    } catch (err) {
+      return { success: false, message: 'PlusVerify request failed.' };
     }
-    return { success: false, message: respText || 'Server stock unavailable or insufficient balance.' };
-  } catch (err) {
-    return { success: false, message: 'Request failed.' };
+  } else {
+    // JuicySMS Handler
+    try {
+      const cleanApiKey = JUICYSMS_API_KEY ? JUICYSMS_API_KEY.trim() : '';
+      const res = await axios.get(`${JUICYSMS_BASE_URL}/makeorder`, {
+        ...robustAxiosConfig,
+        params: { key: cleanApiKey, serviceId: serviceId, country: countryId }
+      });
+      const respText = typeof res.data === 'string' ? res.data.trim() : JSON.stringify(res.data);
+      if (respText.startsWith('ORDER_ID_')) {
+        const parts = respText.split('_');
+        return { success: true, data: { order_id: parts[2], number: parts.slice(4).join('_') } };
+      }
+      return { success: false, message: respText || 'Stock unavailable or insufficient balance on JuicySMS.' };
+    } catch (err) {
+      return { success: false, message: 'JuicySMS request failed.' };
+    }
   }
 }
 
-async function checkJuicySmsCode(orderId) {
-  try {
-    const cleanApiKey = JUICYSMS_API_KEY ? JUICYSMS_API_KEY.trim() : '';
-    const res = await axios.get(`${JUICYSMS_BASE_URL}/getsms`, {
-      ...robustAxiosConfig,
-      params: { key: cleanApiKey, orderId: orderId }
-    });
-    
-    const respText = typeof res.data === 'string' ? res.data.trim() : JSON.stringify(res.data);
-
-    if (respText.startsWith('SUCCESS_')) {
-      const code = respText.replace('SUCCESS_', '');
-      return { success: true, data: { code: code } };
+/**
+ * Polling SMS code adhering to PlusVerify status.php / JuicySMS getsms patterns
+ */
+async function checkSmsCode(provider, orderId) {
+  if (provider === 'plusverify') {
+    try {
+      const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
+      const res = await axios.post(`${PLUSVERIFY_BASE_URL}/status.php`, null, {
+        ...robustAxiosConfig,
+        params: { api_key: cleanApiKey, order_id: orderId }
+      });
+      const data = res.data;
+      if (data && data.success && data.sms_code) {
+        return { success: true, data: { code: String(data.sms_code) } };
+      }
+      return { success: false };
+    } catch (err) {
+      return { success: false };
     }
-    return { success: false };
-  } catch (err) {
-    return { success: false };
+  } else {
+    try {
+      const cleanApiKey = JUICYSMS_API_KEY ? JUICYSMS_API_KEY.trim() : '';
+      const res = await axios.get(`${JUICYSMS_BASE_URL}/getsms`, {
+        ...robustAxiosConfig,
+        params: { key: cleanApiKey, orderId: orderId }
+      });
+      const respText = typeof res.data === 'string' ? res.data.trim() : JSON.stringify(res.data);
+      if (respText.startsWith('SUCCESS_')) {
+        return { success: true, data: { code: respText.replace('SUCCESS_', '') } };
+      }
+      return { success: false };
+    } catch (err) {
+      return { success: false };
+    }
   }
 }
 
-async function cancelJuicyOrder(orderId) {
-  try {
-    const cleanApiKey = JUICYSMS_API_KEY ? JUICYSMS_API_KEY.trim() : '';
-    await axios.get(`${JUICYSMS_BASE_URL}/cancelorder`, {
-      ...robustAxiosConfig,
-      params: { key: cleanApiKey, orderId: orderId }
-    });
-  } catch (err) {
-    console.error("Cancel order error:", err.message);
+/**
+ * Cancel order adhering to PlusVerify update_status.php (status=8) / JuicySMS cancelorder
+ */
+async function cancelOrder(provider, orderId) {
+  if (provider === 'plusverify') {
+    try {
+      const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
+      await axios.post(`${PLUSVERIFY_BASE_URL}/update_status.php`, null, {
+        ...robustAxiosConfig,
+        params: { api_key: cleanApiKey, order_id: orderId, status: 8 }
+      });
+    } catch (err) {
+      console.error("PlusVerify cancel order error:", err.message);
+    }
+  } else {
+    try {
+      const cleanApiKey = JUICYSMS_API_KEY ? JUICYSMS_API_KEY.trim() : '';
+      await axios.get(`${JUICYSMS_BASE_URL}/cancelorder`, {
+        ...robustAxiosConfig,
+        params: { key: cleanApiKey, orderId: orderId }
+      });
+    } catch (err) {
+      console.error("JuicySMS cancel order error:", err.message);
+    }
   }
 }
 
@@ -244,7 +367,9 @@ bot.start(async (ctx) => {
     `How far boss! 👋 Welcome to *MJ SMS*! ✨\n\n` +
     `💰 *Your Balance:* ₦${(session.balance || 0).toLocaleString()}\n\n` +
     `I dey here to help you get virtual numbers fast fast! 🚀\n` +
-    `• Type a country code (e.g., _NL_, _UK_, _USA_, _DE_)\n` +
+    `• Type a country code (e.g., _US_, _NG_, _NL_, _UK_)\n` +
+    `• Type */orders* to view your order history & tracking IDs!\n` +
+    `• Type */history* to check your wallet funding records!\n` +
     `• Type */fund* to top up your wallet balance!\n` +
     `• Type *support* anytime to speak to customer care.`,
     { parse_mode: 'Markdown' }
@@ -271,12 +396,48 @@ bot.command(['fund', 'deposit', 'wallet', 'topup'], (ctx) => {
   );
 });
 
+bot.command(['orders', 'history_orders'], (ctx) => {
+  const userId = ctx.from.id;
+  const session = getUserSession(userId);
+  if (!session.orders || session.orders.length === 0) {
+    ctx.reply(`📭 You don't have any order history yet. Buy a number to see it here!`, { parse_mode: 'Markdown' });
+    return;
+  }
+
+  const recentOrders = session.orders.slice(-10).reverse().map(o => 
+    `• *Service:* ${o.serviceName}\n` +
+    `  📞 \`${o.phoneNumber}\`\n` +
+    `  🆔 *Tracking ID:* \`${o.orderId}\`\n` +
+    `  💰 *Cost:* ₦${o.price.toLocaleString()}\n` +
+    `  📊 *Status:* ${o.status}\n` +
+    `  🕒 *Date:* ${o.date}`
+  ).join('\n\n');
+
+  ctx.reply(`📦 *YOUR RECENT ORDER HISTORY*\n\n${recentOrders}`, { parse_mode: 'Markdown' });
+});
+
+bot.command(['history', 'funding_history', 'transactions'], (ctx) => {
+  const userId = ctx.from.id;
+  const session = getUserSession(userId);
+  if (!session.transactions || session.transactions.length === 0) {
+    ctx.reply(`📭 No wallet funding history found yet.`, { parse_mode: 'Markdown' });
+    return;
+  }
+
+  const recentTx = session.transactions.slice(-10).reverse().map(t =>
+    `• *Credited:* ₦${t.amount.toLocaleString()}\n` +
+    `  🕒 *Date:* ${t.date}`
+  ).join('\n\n');
+
+  ctx.reply(`💳 *WALLET FUNDING HISTORY*\n\n${recentTx}`, { parse_mode: 'Markdown' });
+});
+
 bot.command(['support', 'help', 'customercare'], (ctx) => sendCustomerSupportMessage(ctx));
 
 function sendCustomerSupportMessage(ctx) {
   ctx.reply(
     `💬 *MJ SMS CUSTOMER CARE*\n\n` +
-    `Need help with an order, wallet funding, or balance issues?\n` +
+    `Need help with an order, wallet funding, or balance issues? Provide your *Tracking ID* to support.\n` +
     `Tap the button below to message customer support on WhatsApp: 👇`,
     {
       parse_mode: 'Markdown',
@@ -294,17 +455,17 @@ bot.on('text', async (ctx) => {
   const lowerText = rawText.toLowerCase();
   const session = getUserSession(userId);
 
-  if (['support', 'customer care', 'speak to support', 'admin', 'contact', 'i want to speak with support'].some(k => lowerText.includes(k))) {
+  if (['support', 'customer care', 'speak to support', 'admin', 'contact'].some(k => lowerText.includes(k))) {
     sendCustomerSupportMessage(ctx);
     return;
   }
 
-  if (lowerText.includes('balance') || lowerText.includes('bal') || lowerText === 'my balance' || lowerText === "what's my balance" || lowerText === "what's my current balance") {
+  if (lowerText.includes('balance') || lowerText.includes('bal') || lowerText === 'my balance') {
     ctx.reply(`Boss your current balance na ₦${(session.balance || 0).toLocaleString()} ✨`, { parse_mode: 'Markdown' });
     return;
   }
 
-  if (['fund', 'deposit', 'wallet', 'topup', 'top up', 'i want to fund my wallet', 'fund my account', 'fund account', 'i wan fund my account'].some(k => lowerText.includes(k))) {
+  if (['fund', 'deposit', 'wallet', 'topup', 'top up'].some(k => lowerText.includes(k))) {
     session.state = 'AWAITING_DEPOSIT_AMOUNT';
     saveSessions();
     ctx.reply(
@@ -320,7 +481,7 @@ bot.on('text', async (ctx) => {
     session.state = 'AWAITING_COUNTRY';
     session.country = null;
     saveSessions();
-    ctx.reply(`No p boss! Which country you wan check now? (Type *NL*, *UK*, *USA*, or *DE*)`, { parse_mode: 'Markdown' });
+    ctx.reply(`No p boss! Which country you wan check now? (Type *US*, *NG*, *NL*, *UK*, *USA*, or *DE*)`, { parse_mode: 'Markdown' });
     return;
   }
 
@@ -350,11 +511,11 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  const countries = await getJuicySmsCountries();
+  const allSupportedCountries = [...JUICYSMS_COUNTRIES, ...PLUSVERIFY_COUNTRIES];
 
   const getNormalizedCountry = (input) => {
     const cleanInput = input.toLowerCase().trim();
-    return countries.find(c => {
+    return allSupportedCountries.find(c => {
       const cName = String(c.name).toLowerCase();
       const cId = String(c.id).toLowerCase();
       const cShort = String(c.short || '').toLowerCase();
@@ -364,14 +525,15 @@ bot.on('text', async (ctx) => {
              cleanInput.includes(cName) || 
              cId === cleanInput || 
              cShort === cleanInput ||
-             (cleanInput.includes('usa') && cId === 'USA') ||
-             (cleanInput.includes('uk') && cId === 'UK') ||
-             (cleanInput.includes('nl') && cId === 'NL') ||
-             (cleanInput.includes('de') && cId === 'DE');
+             (cleanInput.includes('usa') && cId === 'us') ||
+             (cleanInput.includes('uk') && cId === 'uk') ||
+             (cleanInput.includes('nl') && cId === 'nl') ||
+             (cleanInput.includes('de') && cId === 'de') ||
+             (cleanInput.includes('ng') && cId === 'ng');
     });
   };
 
-  if (countries.length > 0) {
+  if (allSupportedCountries.length > 0) {
     const words = lowerText.split(/\s+/);
     let matchedCountry = null;
     let serviceQueryWords = [];
@@ -416,7 +578,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  ctx.reply(`Please state your country code first (e.g., type *NL* or *NL WhatsApp*).`, { parse_mode: 'Markdown' });
+  ctx.reply(`Please state your country code first (e.g., type *US* or *US WhatsApp*).`, { parse_mode: 'Markdown' });
 });
 
 async function processServiceSelection(ctx, session, serviceQuery) {
@@ -441,8 +603,8 @@ async function processServiceSelection(ctx, session, serviceQuery) {
   }
 
   const buttons = filtered.map((srv) => {
-    const finalPrice = calculateFinalPrice(srv.price);
-    const cbData = `buy|${session.country.id}|${srv.service_id}`;
+    const finalPrice = calculateFinalPrice(srv.price, srv.is_ngn);
+    const cbData = `buy|${srv.provider}|${session.country.id}|${srv.service_id}`;
     return [Markup.button.callback(`🖥️ ${srv.server_name} (${srv.stock} left) — ₦${finalPrice.toLocaleString()}`, cbData)];
   });
 
@@ -455,17 +617,18 @@ async function processServiceSelection(ctx, session, serviceQuery) {
 }
 
 // ------------------- BUTTON HANDLERS -------------------
-bot.action(/^buy\|(.+)\|(.+)$/, async (ctx) => {
+bot.action(/^buy\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
   ctx.answerCbQuery();
   const userId = ctx.from.id;
   const session = getUserSession(userId);
-  const countryId = ctx.match[1];
-  const serviceId = ctx.match[2];
+  const provider = ctx.match[1];
+  const countryId = ctx.match[2];
+  const serviceId = ctx.match[3];
 
   const availableServers = await fetchCombinedServices({ id: countryId, name: countryId });
-  const targetService = availableServers.find(s => String(s.service_id) === String(serviceId));
+  const targetService = availableServers.find(s => String(s.provider) === String(provider) && String(s.service_id) === String(serviceId));
   
-  const calculatedNgnPrice = targetService ? calculateFinalPrice(targetService.price) : 0;
+  const calculatedNgnPrice = targetService ? calculateFinalPrice(targetService.price, targetService.is_ngn) : 0;
 
   if (calculatedNgnPrice > 0 && session.balance < calculatedNgnPrice) {
     ctx.reply(
@@ -479,20 +642,33 @@ bot.action(/^buy\|(.+)\|(.+)$/, async (ctx) => {
 
   ctx.reply(`Processing your number purchase... Please wait ⏳`);
 
-  const response = await executeJuicyPurchase(serviceId, countryId);
+  const response = await executeOrder(provider, serviceId, countryId);
 
   if (response.success && response.data) {
     if (calculatedNgnPrice > 0) {
       session.balance = Math.max(0, session.balance - calculatedNgnPrice);
-      saveSessions();
     }
 
     const orderId = response.data.order_id;
     const phoneNumber = response.data.number;
+    const serviceName = targetService ? targetService.service_name : serviceId;
+
+    const orderRecord = {
+      orderId: orderId,
+      provider: provider,
+      serviceName: serviceName,
+      phoneNumber: phoneNumber,
+      price: calculatedNgnPrice,
+      status: 'Pending Code',
+      date: new Date().toLocaleString()
+    };
+    session.orders.push(orderRecord);
+    saveSessions();
 
     ctx.reply(
       `🎉 *NUMBER PURCHASED SUCCESSFULLY!*\n\n` +
       `📞 *Phone Number:* \`${phoneNumber}\`\n` +
+      `🆔 *Tracking ID:* \`${orderId}\` _(Save this in case of complaints!)_\n` +
       `💰 *Charged:* ₦${calculatedNgnPrice.toLocaleString()}\n` +
       `💳 *New Balance:* ₦${session.balance.toLocaleString()}\n\n` +
       `👉 Copy the number above into your app.\n` +
@@ -505,23 +681,36 @@ bot.action(/^buy\|(.+)\|(.+)$/, async (ctx) => {
 
     const intervalId = setInterval(async () => {
       pollCount++;
-      const checkRes = await checkJuicySmsCode(orderId);
+      const checkRes = await checkSmsCode(provider, orderId);
 
       if (checkRes.success && checkRes.data && checkRes.data.code) {
         clearInterval(intervalId);
+        
+        const foundOrder = session.orders.find(o => o.orderId === orderId);
+        if (foundOrder) {
+          foundOrder.status = `Completed (Code: ${checkRes.data.code})`;
+          saveSessions();
+        }
+
         ctx.reply(
           `🔥🔥 *SMS CODE RECEIVED!* 🔥🔥\n\n` +
           `📞 *Number:* \`${phoneNumber}\`\n` +
+          `🆔 *Tracking ID:* \`${orderId}\`\n` +
           `🔑 *Verification Code:* \`${checkRes.data.code}\`\n\n` +
           `Thank you for using *MJ SMS*! ✨`,
           { parse_mode: 'Markdown' }
         );
       } else if (pollCount >= maxPolls) {
         clearInterval(intervalId);
-        await cancelJuicyOrder(orderId);
+        await cancelOrder(provider, orderId);
         if (calculatedNgnPrice > 0) {
           session.balance += calculatedNgnPrice;
-          saveSessions();
+          
+          const foundOrder = session.orders.find(o => o.orderId === orderId);
+          if (foundOrder) {
+            foundOrder.status = 'Canceled & Refunded (Timeout)';
+            saveSessions();
+          }
         }
         ctx.reply(`⏰ *Time Out:* Code no enter after 10 minutes. Order canceled and ₦${calculatedNgnPrice.toLocaleString()} refunded to your balance!`);
       }
@@ -539,7 +728,7 @@ bot.action('reset_flow', (ctx) => {
   session.state = 'AWAITING_COUNTRY';
   session.country = null;
   saveSessions();
-  ctx.reply(`No p boss! Which country you wan check now? (Type *NL*, *UK*, *USA*, or *DE*)`);
+  ctx.reply(`No p boss! Which country you wan check now? (Type *US*, *NG*, *NL*, *UK* or *DE*)`);
 });
 
 // ------------------- WEBHOOKS & SERVER START -------------------
@@ -556,6 +745,11 @@ app.post('/webhook/paystack', async (req, res) => {
     if (userId) {
       const session = getUserSession(userId);
       session.balance = (session.balance || 0) + amountPaidNgn;
+      
+      session.transactions.push({
+        amount: amountPaidNgn,
+        date: new Date().toLocaleString()
+      });
       saveSessions();
 
       try {
