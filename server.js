@@ -8,7 +8,6 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const SERVER_URL = process.env.RENDER_EXTERNAL_URL;
 const JUICYSMS_API_KEY = process.env.JUICYSMS_API_KEY;
 const SMSOTPSTORES_API_KEY = process.env.SMSOTPSTORES_API_KEY;
 const AUTHPADI_API_KEY = process.env.AUTHPADI_API_KEY;
@@ -693,9 +692,16 @@ bot.action(/^buy\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
 
 app.get('/', (req, res) => res.send('MJ SMS Bot Active!'));
 
-app.listen(PORT, async () => {
+app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
-  if (SERVER_URL) {
-    try { await bot.telegram.setWebhook(`${SERVER_URL}/webhook/telegram`); } catch (e) {}
-  }
 });
+
+// Launch bot using polling for immediate stability
+bot.launch().then(() => {
+  console.log("Bot is live and polling for messages...");
+}).catch((err) => {
+  console.error("Failed to launch bot:", err);
+});
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
