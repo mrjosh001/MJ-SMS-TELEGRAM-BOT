@@ -22,6 +22,21 @@ const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const LOGSDOMAIN_BASE_URL = 'https://logsdomain.com/api/v1';
 const ALLSMSVERIFY_BASE_URL = 'https://allsmsverify.com/stubs/handler_api.php';
 
+// ALLSMSVERIFY / SMS-ACTIVATE COUNTRY ID MAPPER
+const ALLSMSVERIFY_COUNTRY_MAP = {
+  'ru': 0, 'ua': 1, 'kz': 2, 'cn': 3, 'ph': 4, 'mm': 5, 'id': 6, 'my': 7,
+  'ke': 8, 'tz': 9, 'vn': 10, 'kg': 11, 'us': 12, 'il': 13, 'hk': 14, 'pl': 15,
+  'gb': 16, 'ng': 19, 'in': 22, 'br': 27, 'ca': 36, 'de': 43, 'fr': 78
+};
+
+function getAllSmsCountryId(shortCode) {
+  if (!shortCode) return 12; // default USA
+  const cleanCode = String(shortCode).toLowerCase().trim();
+  return ALLSMSVERIFY_COUNTRY_MAP[cleanCode] !== undefined 
+    ? ALLSMSVERIFY_COUNTRY_MAP[cleanCode] 
+    : cleanCode;
+}
+
 if (!BOT_TOKEN) {
   console.error("FATAL ERROR: BOT_TOKEN environment variable is missing!");
   process.exit(1);
@@ -174,15 +189,11 @@ async function getLogsDomainServices(countryId) {
 
 // ------------------- ALLSMSVERIFY INTEGRATION -------------------
 
-async function getAllSmsVerifyServices(countryShortCode, countryId) {
+async function getAllSmsVerifyServices(countryShortCode) {
   const cleanApiKey = SECOND_SMS_API_KEY ? SECOND_SMS_API_KEY.trim() : null;
-  if (!cleanApiKey) {
-    console.log("AllSMSVerify: SECOND_SMS_API_KEY missing");
-    return [];
-  }
+  if (!cleanApiKey) return [];
 
-  // Use numeric Country ID to satisfy handler_api.php stub requirements (e.g. 12 for USA)
-  const numericCountry = countryId || (countryShortCode?.toLowerCase() === 'us' ? 12 : 0);
+  const targetCountry = getAllSmsCountryId(countryShortCode);
 
   try {
     const res = await axios.get(ALLSMSVERIFY_BASE_URL, {
@@ -190,24 +201,14 @@ async function getAllSmsVerifyServices(countryShortCode, countryId) {
       params: {
         action: 'getServices',
         api_key: cleanApiKey,
-        country: numericCountry
+        country: targetCountry
       }
     });
 
     const data = res.data;
     const respString = String(data).trim();
 
-    if (respString.includes('BAD_KEY')) {
-      console.error("AllSMSVerify Error: BAD_KEY returned from provider! Check SECOND_SMS_API_KEY in Render.");
-      return [];
-    }
-
-    if (respString.includes('BAD_COUNTRY')) {
-      console.error(`AllSMSVerify Error: BAD_COUNTRY returned for Country ID '${numericCountry}'`);
-      return [];
-    }
-
-    if (respString.includes('<!DOCTYPE html>') || respString.includes('404')) {
+    if (respString.includes('BAD_KEY') || respString.includes('BAD_COUNTRY') || respString.includes('<!DOCTYPE html>')) {
       return [];
     }
 
@@ -239,7 +240,7 @@ async function getAllSmsVerifyServices(countryShortCode, countryId) {
 async function fetchCombinedServices(country) {
   const results = [];
 
-  // LogsDomain
+  // 1. LogsDomain
   const logsData = await getLogsDomainServices(country.id);
   if (Array.isArray(logsData)) {
     logsData.forEach(s => {
@@ -270,8 +271,8 @@ async function fetchCombinedServices(country) {
     });
   }
 
-  // AllSMSVerify (Passes numeric country ID)
-  const allSmsData = await getAllSmsVerifyServices(country.short, country.id);
+  // 2. AllSMSVerify
+  const allSmsData = await getAllSmsVerifyServices(country.short);
   if (Array.isArray(allSmsData)) {
     allSmsData.forEach(s => {
       const serviceName = s.service_name || s.name || s.title || s.service || '';
@@ -312,7 +313,7 @@ async function executePurchase(provider, countryId, countryShort, serviceId, ope
   if (provider === 'a' || provider === 'allsmsverify') {
     try {
       const cleanApiKey = SECOND_SMS_API_KEY ? SECOND_SMS_API_KEY.trim() : '';
-      const numericCountry = countryId || (countryShort?.toLowerCase() === 'us' ? 12 : 0);
+      const targetCountry = getAllSmsCountryId(countryShort);
 
       const res = await axios.get(ALLSMSVERIFY_BASE_URL, {
         ...robustAxiosConfig,
@@ -320,7 +321,7 @@ async function executePurchase(provider, countryId, countryShort, serviceId, ope
           action: 'getNumber',
           api_key: cleanApiKey,
           service: serviceId,
-          country: numericCountry
+          country: targetCountry
         }
       });
 
@@ -425,7 +426,8 @@ bot.start((ctx) => {
     `💰 *Your Balance:* ₦${balance.toLocaleString()}\n\n` +
     `I dey here to help you get virtual numbers fast fast! 🚀\n` +
     `• Type a country name (e.g., _United States_, _Nigeria_)\n` +
-    `• Or type */fund* to top up your wallet balance!`,
+    `• Type */fund* to top up your wallet balance!\n` +
+    `• Type *support* anytime to speak to customer care.`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -444,6 +446,24 @@ bot.command(['fund', 'deposit', 'wallet', 'balance'], (ctx) => {
   );
 });
 
+bot.command(['support', 'help', 'customercare'], (ctx) => {
+  sendCustomerSupportMessage(ctx);
+});
+
+function sendCustomerSupportMessage(ctx) {
+  ctx.reply(
+    `💬 *MJ SMS CUSTOMER CARE*\n\n` +
+    `Need help with an order, wallet funding, or custom numbers?\n` +
+    `Tap the button below to reach our support on WhatsApp: 👇`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.url('💬 Chat Customer Care on WhatsApp', 'https://wa.me/qr/XM6ORO7UCYTXI1')]
+      ])
+    }
+  );
+}
+
 // ------------------- TEXT MESSAGE HANDLER -------------------
 
 bot.on('text', async (ctx) => {
@@ -453,7 +473,13 @@ bot.on('text', async (ctx) => {
 
   const session = getUserSession(userId);
 
-  // A. Catch plain "balance", "wallet"
+  // A. Catch Support / Customer Care Keywords
+  if (['support', 'customer care', 'speak to support', 'help', 'admin', 'contact'].some(k => lowerText.includes(k))) {
+    sendCustomerSupportMessage(ctx);
+    return;
+  }
+
+  // B. Catch plain "balance", "wallet"
   if (['balance', 'wallet', 'my balance', 'check balance'].includes(lowerText)) {
     const bal = session.balance || 0;
     ctx.reply(
@@ -464,7 +490,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // B. Catch plain "fund", "deposit", "topup"
+  // C. Catch plain "fund", "deposit", "topup"
   if (['fund', 'deposit', 'topup', 'top up'].includes(lowerText)) {
     session.state = 'AWAITING_DEPOSIT_AMOUNT';
     saveSessions();
@@ -477,7 +503,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // C. Catch "fund 1000" or "deposit 5000"
+  // D. Catch "fund 1000" or "deposit 5000"
   const fundMatch = lowerText.match(/^(?:fund|deposit|topup)\s+(\d+)$/i);
   if (fundMatch) {
     const amount = parseInt(fundMatch[1]);
@@ -510,7 +536,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // D. Deposit Amount Input Handler
+  // E. Deposit Amount Input Handler
   if (session.state === 'AWAITING_DEPOSIT_AMOUNT') {
     const amount = parseInt(rawText.replace(/[^0-9]/g, ''));
     if (isNaN(amount) || amount < 100) {
@@ -542,7 +568,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // E. Detect "Which one dey available?" Intent
+  // F. Detect "Which one dey available?" Intent
   const isAvailableQuery = [
     'available', 'which one', 'what is available', 'list', 'show', 'any number', 'which app'
   ].some(keyword => lowerText.includes(keyword));
@@ -578,7 +604,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // F. Standard Greetings
+  // G. Standard Greetings
   if (['hi', 'hello', 'hey', 'awfa', 'howfar', 'how far', 'xup'].some(g => lowerText.includes(g))) {
     ctx.reply(
       `How far my boss! 😊 My name na *Elsa*, welcome to *MJ SMS*!\n` +
@@ -592,7 +618,7 @@ bot.on('text', async (ctx) => {
 
   const countries = await getCountries();
 
-  // G. Multi-word Input Detection ("USA WhatsApp")
+  // H. Multi-word Input Detection ("USA WhatsApp")
   if (countries.length > 0) {
     const words = lowerText.split(/\s+/);
     let matchedCountry = null;
@@ -622,7 +648,7 @@ bot.on('text', async (ctx) => {
     }
   }
 
-  // H. Country Selection Logic
+  // I. Country Selection Logic
   if (session.state === 'AWAITING_COUNTRY' || session.state === 'IDLE') {
     ctx.reply(`Hold on boss, make I check available countries... 🔎`);
     
@@ -648,7 +674,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // I. Service Selection Logic
+  // J. Service Selection Logic
   if (session.state === 'AWAITING_SERVICE') {
     const newCountryMatch = countries.find(c => 
       c.name.toLowerCase() === lowerText || 
@@ -801,7 +827,7 @@ app.post('/webhook/paystack', async (req, res) => {
   res.sendStatus(200);
 });
 
-app.get('/', (req, res) => res.send('MJ SMS Bot (Elsa) with Persistent Balances & Paystack is Active!'));
+app.get('/', (req, res) => res.send('MJ SMS Bot (Elsa) is Active!'));
 
 app.listen(PORT, async () => {
   console.log(`Server listening on port ${PORT}`);
