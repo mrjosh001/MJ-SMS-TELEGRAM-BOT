@@ -10,8 +10,10 @@ const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SERVER_URL = process.env.RENDER_EXTERNAL_URL;
 const SMS_API_KEY = process.env.SMS_API_KEY;
+const SECOND_SMS_API_KEY = process.env.SECOND_SMS_API_KEY;
 
-const BASE_URL = 'https://logsdomain.com/api/v1';
+const LOGSDOMAIN_BASE_URL = 'https://logsdomain.com/api/v1';
+const ALLSMSVERIFY_BASE_URL = 'https://allsmsverify.com/api';
 
 if (!BOT_TOKEN) {
   console.error("FATAL ERROR: BOT_TOKEN is missing!");
@@ -20,15 +22,6 @@ if (!BOT_TOKEN) {
 
 const bot = new Telegraf(BOT_TOKEN);
 const userSessions = {};
-
-// Axios instance pre-configured for logsdomain.com API
-const api = axios.create({
-  baseURL: BASE_URL,
-  headers: {
-    'Accept': 'application/json',
-    'Authorization': `Bearer ${SMS_API_KEY}`
-  }
-});
 
 // ------------------- DYNAMIC PROFIT MARGIN CONFIG -------------------
 const DEFAULT_MARGIN = 1.4;
@@ -58,78 +51,165 @@ function calculateRetailPrice(serviceName, providerPriceNgn) {
 // ------------------- API INTEGRATION FUNCTIONS -------------------
 
 async function getCountries() {
+  if (!SMS_API_KEY) return [];
   try {
-    const res = await api.get('/numbers/countries');
-    return res.data.success ? res.data.data : [];
+    const res = await axios.get(`${LOGSDOMAIN_BASE_URL}/numbers/countries`, {
+      headers: { 'Authorization': `Bearer ${SMS_API_KEY}`, 'Accept': 'application/json' }
+    });
+    return res.data?.success ? res.data.data : [];
   } catch (err) {
     console.error("Error fetching countries:", err.response?.data || err.message);
     return [];
   }
 }
 
-// Updated getServices: logs raw provider response and handles array/object data shapes
-async function getServices(countryId) {
+async function getLogsDomainServices(countryId) {
+  if (!SMS_API_KEY) return [];
   try {
-    const res = await api.get(`/numbers/services?country_id=${countryId}`);
-    
-    // 🔍 THIS WILL PRINT THE EXACT API RESPONSE IN RENDER LOGS
-    console.log("LOGSDOMAIN SERVICES RAW RESPONSE:", JSON.stringify(res.data, null, 2));
-
-    if (!res.data || !res.data.data) {
-      return [];
-    }
-
-    // Handle array or object return formats
-    const servicesData = Array.isArray(res.data.data) 
-      ? res.data.data 
-      : Object.values(res.data.data);
-
-    return servicesData;
+    const res = await axios.get(`${LOGSDOMAIN_BASE_URL}/numbers/services?country_id=${countryId}`, {
+      headers: { 'Authorization': `Bearer ${SMS_API_KEY}`, 'Accept': 'application/json' }
+    });
+    if (!res.data || !res.data.data) return [];
+    return Array.isArray(res.data.data) ? res.data.data : Object.values(res.data.data);
   } catch (err) {
-    console.error("Error fetching services:", err.response?.data || err.message);
+    console.error("LogsDomain Services Error:", err.response?.data || err.message);
     return [];
   }
 }
 
-async function purchaseNumber(countryId, serviceId, operatorId = null) {
+async function getAllSmsVerifyServices(countryShortCode) {
+  if (!SECOND_SMS_API_KEY) return [];
   try {
-    const idempotencyKey = `mj-order-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    const payload = {
-      country_id: parseInt(countryId),
-      service_id: parseInt(serviceId),
-      idempotency_key: idempotencyKey
-    };
-    if (operatorId) payload.operator_id = operatorId;
-
-    const res = await api.post('/numbers/orders', payload);
-    return res.data;
+    const res = await axios.get(`${ALLSMSVERIFY_BASE_URL}/services`, {
+      params: { api_key: SECOND_SMS_API_KEY, country: countryShortCode },
+      headers: { 'Accept': 'application/json' }
+    });
+    return res.data?.success ? res.data.data : (Array.isArray(res.data) ? res.data : []);
   } catch (err) {
-    console.error("Error purchasing number:", err.response?.data || err.message);
-    return err.response?.data || { success: false, message: 'Purchase failed.' };
+    console.error("Allsmsverify Services Error:", err.response?.data || err.message);
+    return [];
   }
 }
 
-async function checkSmsCode(orderId) {
+async function fetchCombinedServices(country) {
+  const results = [];
+
+  // LogsDomain
+  const logsData = await getLogsDomainServices(country.id);
+  if (Array.isArray(logsData)) {
+    logsData.forEach(s => {
+      let ops = s.operators && s.operators.length ? s.operators : [{
+        id: 'default',
+        name: s.operator_name || 'Server 1 (Logs)',
+        available_quantity: s.available_quantity || 0,
+        price: s.price
+      }];
+
+      ops.forEach(op => {
+        if ((op.available_quantity || op.count || 0) > 0) {
+          results.push({
+            provider: 'logsdomain',
+            service_id: s.service_id,
+            service_name: s.service_name,
+            operator_id: op.id === 'default' ? null : op.id,
+            server_name: op.name || 'Server 1',
+            stock: op.available_quantity || op.count || 0,
+            price: parseFloat(op.price || s.price || 0)
+          });
+        }
+      });
+    });
+  }
+
+  // Allsmsverify
+  const allSmsData = await getAllSmsVerifyServices(country.short);
+  if (Array.isArray(allSmsData)) {
+    allSmsData.forEach(s => {
+      const stock = s.stock || s.available_quantity || s.count || 0;
+      if (stock > 0) {
+        results.push({
+          provider: 'allsmsverify',
+          service_id: s.service_id || s.code || s.name,
+          service_name: s.service_name || s.name,
+          operator_id: s.operator_id || null,
+          server_name: s.server_name || s.operator_name || 'Server (AllSMS)',
+          stock: stock,
+          price: parseFloat(s.price || 0)
+        });
+      }
+    });
+  }
+
+  return results;
+}
+
+// Order execution
+async function executePurchase(provider, countryId, countryShort, serviceId, operatorId) {
+  if (provider === 'a' || provider === 'allsmsverify') {
+    try {
+      const res = await axios.post(`${ALLSMSVERIFY_BASE_URL}/order`, {
+        api_key: SECOND_SMS_API_KEY,
+        country: countryShort,
+        service: serviceId,
+        operator: operatorId
+      });
+      return res.data;
+    } catch (err) {
+      return { success: false, message: err.response?.data?.message || 'Allsmsverify purchase failed.' };
+    }
+  } else {
+    try {
+      const payload = {
+        country_id: parseInt(countryId),
+        service_id: parseInt(serviceId),
+        idempotency_key: `mj-order-${Date.now()}`
+      };
+      if (operatorId && operatorId !== '0') payload.operator_id = operatorId;
+
+      const res = await axios.post(`${LOGSDOMAIN_BASE_URL}/numbers/orders`, payload, {
+        headers: { 'Authorization': `Bearer ${SMS_API_KEY}` }
+      });
+      return res.data;
+    } catch (err) {
+      return err.response?.data || { success: false, message: 'Logsdomain purchase failed.' };
+    }
+  }
+}
+
+async function checkSmsCode(provider, orderId) {
   try {
-    const res = await api.post(`/numbers/orders/${orderId}/check`);
-    return res.data;
+    if (provider === 'a' || provider === 'allsmsverify') {
+      const res = await axios.get(`${ALLSMSVERIFY_BASE_URL}/check`, {
+        params: { api_key: SECOND_SMS_API_KEY, order_id: orderId }
+      });
+      return res.data;
+    } else {
+      const res = await axios.post(`${LOGSDOMAIN_BASE_URL}/numbers/orders/${orderId}/check`, {}, {
+        headers: { 'Authorization': `Bearer ${SMS_API_KEY}` }
+      });
+      return res.data;
+    }
   } catch (err) {
     return { success: false };
   }
 }
 
-async function cancelOrder(orderId) {
+async function cancelOrder(provider, orderId) {
   try {
-    const res = await api.post(`/numbers/orders/${orderId}/cancel`);
-    return res.data;
+    if (provider === 'a' || provider === 'allsmsverify') {
+      await axios.post(`${ALLSMSVERIFY_BASE_URL}/cancel`, { api_key: SECOND_SMS_API_KEY, order_id: orderId });
+    } else {
+      await axios.post(`${LOGSDOMAIN_BASE_URL}/numbers/orders/${orderId}/cancel`, {}, {
+        headers: { 'Authorization': `Bearer ${SMS_API_KEY}` }
+      });
+    }
   } catch (err) {
-    return { success: false };
+    console.error("Cancel order error:", err.message);
   }
 }
 
 // ------------------- ELSA CONVERSATIONAL BOT FLOW -------------------
 
-// Start command
 bot.start((ctx) => {
   const userId = ctx.from.id;
   userSessions[userId] = { state: 'AWAITING_COUNTRY' };
@@ -143,7 +223,6 @@ bot.start((ctx) => {
   );
 });
 
-// Incoming text messages handler
 bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
   const rawText = ctx.message.text.trim();
@@ -152,7 +231,6 @@ bot.on('text', async (ctx) => {
   if (!userSessions[userId]) userSessions[userId] = { state: 'AWAITING_COUNTRY' };
   const session = userSessions[userId];
 
-  // Friendly greetings
   if (['hi', 'hello', 'hey', 'awfa', 'howfar', 'how far', 'xup'].some(g => lowerText.includes(g))) {
     ctx.reply(
       `How far my boss! 😊 My name na *Elsa*, welcome to *MJ SMS*!\n` +
@@ -188,13 +266,12 @@ bot.on('text', async (ctx) => {
     if (matchedCountry && matchedServiceQuery) {
       session.country = matchedCountry;
       session.state = 'AWAITING_SERVICE';
-      ctx.reply(`Oya wait make I check available servers and price for *${matchedServiceQuery}* (${matchedCountry.name})... 🔎`, { parse_mode: 'Markdown' });
+      ctx.reply(`Oya wait make Elsa check available servers for *${matchedServiceQuery}* (${matchedCountry.name})... 🔎`, { parse_mode: 'Markdown' });
       await processServiceSelection(ctx, session, matchedServiceQuery);
       return;
     }
   }
 
-  // Step 1: Process Country Input
   if (session.state === 'AWAITING_COUNTRY' || session.state === 'IDLE') {
     ctx.reply(`Hold on boss, make I check available countries... 🔎`);
     
@@ -219,9 +296,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // Step 2: Process Service Input
   if (session.state === 'AWAITING_SERVICE') {
-    // Check if user typed a new country name instead
     const newCountryMatch = countries.find(c => 
       c.name.toLowerCase() === lowerText || 
       c.short.toLowerCase() === lowerText ||
@@ -234,67 +309,37 @@ bot.on('text', async (ctx) => {
       return;
     }
 
-    ctx.reply(`Oya wait make I check available servers for *${rawText}* (${session.country.name})... 🔎`, { parse_mode: 'Markdown' });
+    ctx.reply(`Oya wait make Elsa check available servers for *${rawText}* (${session.country.name})... 🔎`, { parse_mode: 'Markdown' });
     await processServiceSelection(ctx, session, rawText);
   }
 });
 
-// Helper function to extract and render available Servers/Operators
 async function processServiceSelection(ctx, session, serviceQuery) {
   const lowerQuery = serviceQuery.toLowerCase();
-  const services = await getServices(session.country.id);
+  const availableServers = await fetchCombinedServices(session.country);
 
-  if (!services.length) {
-    ctx.reply(`No services found for *${session.country.name}* right now. Try another country!`, { parse_mode: 'Markdown' });
-    session.state = 'AWAITING_COUNTRY';
+  const filtered = availableServers.filter(s => s.service_name.toLowerCase().includes(lowerQuery));
+
+  if (filtered.length === 0) {
+    ctx.reply(`Eya! Stock for *${serviceQuery}* (${session.country.name}) don finish across all servers! 💔\nTry another app or country.`, { parse_mode: 'Markdown' });
     return;
   }
 
-  const matchedService = services.find(s => s.service_name.toLowerCase().includes(lowerQuery));
+  const buttons = filtered.map((srv) => {
+    const finalPrice = calculateRetailPrice(srv.service_name, srv.price);
+    const pCode = srv.provider === 'allsmsverify' ? 'a' : 'l';
+    const opCode = srv.operator_id || '0';
+    
+    // Short string format to keep callback data strictly under 64 bytes
+    const cbData = `b|${pCode}|${session.country.id}|${srv.service_id}|${opCode}`;
 
-  if (!matchedService) {
-    ctx.reply(`I no see *${serviceQuery}* under ${session.country.name}. Try typing another app like _WhatsApp_ or _Telegram_.`);
-    return;
-  }
-
-  session.selectedService = matchedService;
-
-  // Extract operators/servers array if returned by logsdomain API
-  let serverList = [];
-  if (matchedService.operators && Array.isArray(matchedService.operators) && matchedService.operators.length > 0) {
-    serverList = matchedService.operators;
-  } else {
-    // Standard single server fallback
-    serverList = [{
-      id: 'default',
-      name: matchedService.operator_name || 'Standard Server',
-      available_quantity: matchedService.available_quantity || 0,
-      price: matchedService.price
-    }];
-  }
-
-  // Filter servers that have available stock
-  const activeServers = serverList.filter(op => (op.available_quantity || op.count || 0) > 0);
-
-  if (activeServers.length === 0) {
-    ctx.reply(`Eya! Stock for *${matchedService.service_name}* (${session.country.name}) don finish across all servers! 💔\nTry another app or country.`, { parse_mode: 'Markdown' });
-    return;
-  }
-
-  // Generate dynamic buttons for each server option
-  const buttons = activeServers.map(srv => {
-    const srvCost = parseFloat(srv.price || matchedService.price);
-    const finalPrice = calculateRetailPrice(matchedService.service_name, srvCost);
-    const stockCount = srv.available_quantity || srv.count || 0;
-    const srvName = srv.name || srv.operator_name || 'Server';
-
-    return [Markup.button.callback(`🖥️ ${srvName} (${stockCount} left) — ₦${finalPrice}`, `srv_${session.country.id}_${matchedService.service_id}_${srv.id}`)];
+    return [Markup.button.callback(`🖥️ ${srv.server_name} (${srv.stock} left) — ₦${finalPrice}`, cbData)];
   });
 
   buttons.push([Markup.button.callback('🔄 Choose Another Country', 'reset_flow')]);
 
   ctx.reply(
-    `Ehen boss! For *${matchedService.service_name}* (${session.country.name}), see the available servers below:\n\n` +
+    `Ehen boss! For *${serviceQuery}* (${session.country.name}), see the available servers below:\n\n` +
     `Which server or route you wan use buy the number? Tap option below:`,
     { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
   );
@@ -302,38 +347,39 @@ async function processServiceSelection(ctx, session, serviceQuery) {
 
 // ------------------- SERVER BUTTON CALLBACK -------------------
 
-bot.action(/^srv_(\d+)_(\d+)_(.+)$/, async (ctx) => {
+bot.action(/^b\|(.+)\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
   ctx.answerCbQuery();
-  const countryId = ctx.match[1];
-  const serviceId = ctx.match[2];
-  const operatorId = ctx.match[3] === 'default' ? null : ctx.match[3];
+  const pCode = ctx.match[1]; // 'a' or 'l'
+  const countryId = ctx.match[2];
+  const serviceId = ctx.match[3];
+  const operatorId = ctx.match[4] === '0' ? null : ctx.match[4];
+
+  const provider = pCode === 'a' ? 'allsmsverify' : 'logsdomain';
 
   ctx.reply(`Processing your number purchase... Please wait ⏳`);
 
-  const response = await purchaseNumber(countryId, serviceId, operatorId);
+  const countryShort = userSessions[ctx.from.id]?.country?.short || 'us';
+  const response = await executePurchase(provider, countryId, countryShort, serviceId, operatorId);
 
-  if (response.success && response.data) {
-    const order = response.data;
-    const orderId = order.order_id;
-    const phoneNumber = order.number;
+  if (response.success && (response.data || response.number)) {
+    const orderData = response.data || response;
+    const orderId = orderData.order_id || orderData.id;
+    const phoneNumber = orderData.number || orderData.phone;
 
     ctx.reply(
       `🎉 *NUMBER PURCHASED SUCCESSFULLY!*\n\n` +
-      `📞 *Phone Number:* \`${phoneNumber}\`\n` +
-      `📱 *Service:* ${order.service_name}\n` +
-      `🌍 *Country:* ${order.country_name}\n\n` +
+      `📞 *Phone Number:* \`${phoneNumber}\`\n\n` +
       `👉 Copy the number above and enter it into your app.\n` +
       `⏳ Elsa is waiting for your SMS code... (I go send am here automatically as e enter)`,
       { parse_mode: 'Markdown' }
     );
 
-    // Poll for incoming SMS Code (up to 10 mins)
     let pollCount = 0;
     const maxPolls = 80;
 
     const intervalId = setInterval(async () => {
       pollCount++;
-      const checkRes = await checkSmsCode(orderId);
+      const checkRes = await checkSmsCode(provider, orderId);
 
       if (checkRes.success && checkRes.data && checkRes.data.code) {
         clearInterval(intervalId);
@@ -346,8 +392,8 @@ bot.action(/^srv_(\d+)_(\d+)_(.+)$/, async (ctx) => {
         );
       } else if (pollCount >= maxPolls) {
         clearInterval(intervalId);
-        await cancelOrder(orderId);
-        ctx.reply(`⏰ *Time Out:* Code no enter after 10 minutes. Order don cancel & money don refund!`);
+        await cancelOrder(provider, orderId);
+        ctx.reply(`⏰ *Time Out:* Code no enter after 10 minutes. Order don cancel automatically!`);
       }
     }, 7000);
 
