@@ -481,7 +481,9 @@ async function cancelOrder(provider, orderId) {
 
 bot.command('servers', async (ctx) => {
   const adminId = String(ctx.from.id);
-  if (adminId !== ADMIN_TELEGRAM_ID) return ctx.reply(`❌ Unauthorized.`);
+  if (adminId !== ADMIN_TELEGRAM_ID) {
+    return ctx.reply(`❌ Unauthorized. Your ID is ${adminId}, but expected ${ADMIN_TELEGRAM_ID}.`);
+  }
 
   ctx.reply(`Checking all servers status & balances... ⏳`);
   let statusReport = `🖥️ *BACKEND SERVER STATUS REPORT*\n\n`;
@@ -758,7 +760,6 @@ app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
 
-// Clear potential lingering webhooks before launching polling to prevent unresponsiveness
 bot.telegram.deleteWebhook({ drop_pending_updates: true }).then(() => {
   bot.launch().then(() => {
     console.log("Bot is live and polling for messages...");
