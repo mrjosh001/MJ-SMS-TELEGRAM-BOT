@@ -59,7 +59,7 @@ const SERVICE_PRICING_RULES = {
 
 // Calculates final retail price in NGN
 function calculateRetailPrice(serviceName, providerPriceNgn) {
-  const serviceKey = serviceName.toLowerCase();
+  const serviceKey = (serviceName || '').toLowerCase();
   const rule = SERVICE_PRICING_RULES[serviceKey];
 
   let calculatedPrice = providerPriceNgn * DEFAULT_MARGIN;
@@ -80,7 +80,7 @@ function calculateRetailPrice(serviceName, providerPriceNgn) {
 async function getCountries() {
   try {
     const res = await api.get('/numbers/countries');
-    return res.data.success ? res.data.data : [];
+    return res.data && res.data.success ? res.data.data : [];
   } catch (err) {
     console.error("Error fetching countries:", err.response?.data || err.message);
     return [];
@@ -91,7 +91,7 @@ async function getCountries() {
 async function getServices(countryId) {
   try {
     const res = await api.get(`/numbers/services?country_id=${countryId}`);
-    return res.data.success ? res.data.data : [];
+    return res.data && res.data.success ? res.data.data : [];
   } catch (err) {
     console.error("Error fetching services:", err.response?.data || err.message);
     return [];
@@ -151,7 +151,7 @@ bot.start((ctx) => {
   );
 });
 
-// Main conversational message handler in Pidgin
+// Main conversational message handler in Pidgin with smart one-liner support
 bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
   const rawText = ctx.message.text.trim();
@@ -170,19 +170,57 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // STEP 1: Process Country
+  // ⚡ SMART ONE-LINER CHECK (e.g. "USA WhatsApp", "Nigeria Telegram", "Sudan Facebook")
+  const countries = await getCountries();
+  if (countries.length > 0) {
+    const words = lowerText.split(/\s+/);
+    
+    // Check if user provided both a country AND a service in one message
+    let matchedCountry = null;
+    let matchedServiceQuery = null;
+
+    // Find country in words
+    for (const word of words) {
+      const foundCountry = countries.find(c => 
+        c.name.toLowerCase() === word || 
+        c.short.toLowerCase() === word ||
+        (word === 'usa' && c.short.toLowerCase() === 'us') ||
+        (word === 'uk' && c.short.toLowerCase() === 'gb')
+      );
+
+      if (foundCountry) {
+        matchedCountry = foundCountry;
+        // Remaining words form the service query
+        matchedServiceQuery = words.filter(w => w !== word).join(' ');
+        break;
+      }
+    }
+
+    // If both Country and Service were typed together in one sentence
+    if (matchedCountry && matchedServiceQuery) {
+      session.country = matchedCountry;
+      session.state = 'AWAITING_SERVICE';
+      
+      ctx.reply(`Oya wait make I check live price and stock for *${matchedServiceQuery}* (${matchedCountry.name})... 🔎`, { parse_mode: 'Markdown' });
+      await processServiceSelection(ctx, session, matchedServiceQuery);
+      return;
+    }
+  }
+
+  // STEP 1: Process Country Selection
   if (session.state === 'AWAITING_COUNTRY' || session.state === 'IDLE') {
     ctx.reply(`Hold on boss, make I check available countries... 🔎`);
-    const countries = await getCountries();
 
-    if (!countries.length) {
+    if (!countries || !countries.length) {
       ctx.reply(`Eya! Network issue dey to fetch countries right now. Try typing the country name again.`);
       return;
     }
 
     const matchedCountry = countries.find(c => 
       c.name.toLowerCase().includes(lowerText) || 
-      c.short.toLowerCase() === lowerText
+      c.short.toLowerCase() === lowerText ||
+      (lowerText === 'usa' && c.short.toLowerCase() === 'us') ||
+      (lowerText === 'uk' && c.short.toLowerCase() === 'gb')
     );
 
     if (matchedCountry) {
@@ -204,54 +242,75 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // STEP 2: Process Service & Calculate Price with Profit Margin
+  // STEP 2: Process Service Selection
   if (session.state === 'AWAITING_SERVICE') {
-    ctx.reply(`Oya wait make I check live price and stock for *${rawText}* (${session.country.name})... 🔎`, { parse_mode: 'Markdown' });
+    // Check if user is trying to switch country instead while in service state
+    const newCountryMatch = (await getCountries()).find(c => 
+      c.name.toLowerCase() === lowerText || 
+      c.short.toLowerCase() === lowerText ||
+      (lowerText === 'usa' && c.short.toLowerCase() === 'us')
+    );
 
-    const services = await getServices(session.country.id);
-
-    if (!services.length) {
-      ctx.reply(`No services found for *${session.country.name}* right now. Try typing another country!`, { parse_mode: 'Markdown' });
-      session.state = 'AWAITING_COUNTRY';
+    if (newCountryMatch) {
+      session.country = newCountryMatch;
+      ctx.reply(
+        `Switched country to *${newCountryMatch.name}* 👌\n\nWhich app or service you wan verify?`,
+        { parse_mode: 'Markdown' }
+      );
       return;
     }
 
-    const matchedService = services.find(s => 
-      s.service_name.toLowerCase().includes(lowerText)
-    );
-
-    if (matchedService) {
-      if (matchedService.available_quantity < 1) {
-        ctx.reply(`Eya! Stock for *${matchedService.service_name}* (${session.country.name}) don finish for market! 💔\nTry type another app name or country.`, { parse_mode: 'Markdown' });
-        return;
-      }
-
-      const rawProviderPrice = parseFloat(matchedService.price);
-      const finalRetailPrice = calculateRetailPrice(matchedService.service_name, rawProviderPrice);
-
-      session.selectedService = matchedService;
-      session.finalPrice = finalRetailPrice;
-
-      const actionButtons = Markup.inlineKeyboard([
-        [Markup.button.callback(`💳 Buy Number (₦${finalRetailPrice})`, `buy_${session.country.id}_${matchedService.service_id}`)],
-        [Markup.button.callback('🔄 Choose Another Country', 'reset_flow')]
-      ]);
-
-      ctx.reply(
-        `Omo sharp! Line dey available! 🔥\n\n` +
-        `📌 *Country:* ${session.country.name}\n` +
-        `📌 *App:* ${matchedService.service_name}\n` +
-        `📊 *Success Rate:* ${matchedService.success_rate}%\n` +
-        `📦 *In Stock:* ${matchedService.available_quantity} numbers\n` +
-        `💰 *Price:* ₦${finalRetailPrice}\n\n` +
-        `Tap button below to buy this number now:`,
-        { parse_mode: 'Markdown', ...actionButtons }
-      );
-    } else {
-      ctx.reply(`I no see *${rawText}* under ${session.country.name}. Try typing another app name like _WhatsApp_, _Telegram_, or _Facebook_.`);
-    }
+    ctx.reply(`Oya wait make I check live price and stock for *${rawText}* (${session.country.name})... 🔎`, { parse_mode: 'Markdown' });
+    await processServiceSelection(ctx, session, rawText);
   }
 });
+
+// Helper function to query services and display available stock/pricing
+async function processServiceSelection(ctx, session, serviceQuery) {
+  const lowerQuery = serviceQuery.toLowerCase();
+  const services = await getServices(session.country.id);
+
+  if (!services.length) {
+    ctx.reply(`No services found for *${session.country.name}* right now. Try typing another country!`, { parse_mode: 'Markdown' });
+    session.state = 'AWAITING_COUNTRY';
+    return;
+  }
+
+  const matchedService = services.find(s => 
+    s.service_name.toLowerCase().includes(lowerQuery)
+  );
+
+  if (matchedService) {
+    if (matchedService.available_quantity < 1) {
+      ctx.reply(`Eya! Stock for *${matchedService.service_name}* (${session.country.name}) don finish for market! 💔\nTry type another app name or country.`, { parse_mode: 'Markdown' });
+      return;
+    }
+
+    const rawProviderPrice = parseFloat(matchedService.price);
+    const finalRetailPrice = calculateRetailPrice(matchedService.service_name, rawProviderPrice);
+
+    session.selectedService = matchedService;
+    session.finalPrice = finalRetailPrice;
+
+    const actionButtons = Markup.inlineKeyboard([
+      [Markup.button.callback(`💳 Buy Number (₦${finalRetailPrice})`, `buy_${session.country.id}_${matchedService.service_id}`)],
+      [Markup.button.callback('🔄 Choose Another Country', 'reset_flow')]
+    ]);
+
+    ctx.reply(
+      `Omo sharp! Line dey available! 🔥\n\n` +
+      `📌 *Country:* ${session.country.name}\n` +
+      `📌 *App:* ${matchedService.service_name}\n` +
+      `📊 *Success Rate:* ${matchedService.success_rate}%\n` +
+      `📦 *In Stock:* ${matchedService.available_quantity} numbers\n` +
+      `💰 *Price:* ₦${finalRetailPrice}\n\n` +
+      `Tap button below to buy this number now:`,
+      { parse_mode: 'Markdown', ...actionButtons }
+    );
+  } else {
+    ctx.reply(`I no see *${serviceQuery}* under ${session.country.name}. Try typing another app name like _WhatsApp_, _Telegram_, or _Facebook_.`);
+  }
+}
 
 // ------------------- BUTTON ACTIONS & ORDER PROCESSING -------------------
 
