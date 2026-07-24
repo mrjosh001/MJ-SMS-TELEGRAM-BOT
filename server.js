@@ -4,21 +4,23 @@ const axios = require('axios');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const { GoogleGenAI } = require('@google/genai');
 
 const app = express();
 
-// Express JSON Middleware (Critical for receiving Paystack webhooks)
+// Express JSON Middleware for Paystack Webhooks & Requests
 app.use(express.json());
 
-// Environment variables provided by Render
+// Environment Variables
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SERVER_URL = process.env.RENDER_EXTERNAL_URL;
 const SMS_API_KEY = process.env.SMS_API_KEY;
 const SECOND_SMS_API_KEY = process.env.SECOND_SMS_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// Provider Base Endpoints
+// Provider Endpoints
 const LOGSDOMAIN_BASE_URL = 'https://logsdomain.com/api/v1';
 const ALLSMSVERIFY_BASE_URL = 'https://allsmsverify.com/stubs/handler_api.php';
 
@@ -28,12 +30,12 @@ if (!BOT_TOKEN) {
 }
 
 const bot = new Telegraf(BOT_TOKEN);
+const ai = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
 
 // ------------------- PERSISTENT BALANCE STORAGE -------------------
 const DB_FILE = path.join(__dirname, 'users.json');
 let userSessions = {};
 
-// Load user sessions/balances from disk on startup
 function loadSessions() {
   try {
     if (fs.existsSync(DB_FILE)) {
@@ -49,7 +51,6 @@ function loadSessions() {
   }
 }
 
-// Save user sessions/balances to disk whenever updated
 function saveSessions() {
   try {
     fs.writeFileSync(DB_FILE, JSON.stringify(userSessions, null, 2), 'utf8');
@@ -58,10 +59,9 @@ function saveSessions() {
   }
 }
 
-// Initialize sessions on server startup
 loadSessions();
 
-// Custom HTTPS agent to prevent TLS drops
+// Custom HTTPS Agent to prevent connection dropouts
 const agent = new https.Agent({
   keepAlive: true,
   rejectUnauthorized: false
@@ -87,7 +87,7 @@ const SERVICE_PRICING_RULES = {
 };
 
 function calculateRetailPrice(serviceName, providerPriceNgn) {
-  const serviceKey = serviceName.toLowerCase();
+  const serviceKey = String(serviceName).toLowerCase();
   const rule = SERVICE_PRICING_RULES[serviceKey];
 
   let calculatedPrice = providerPriceNgn * DEFAULT_MARGIN;
@@ -99,6 +99,15 @@ function calculateRetailPrice(serviceName, providerPriceNgn) {
   }
 
   return Math.ceil(Math.max(calculatedPrice, minPrice));
+}
+
+// Helper to manage session state safely without overwriting balance
+function getUserSession(userId) {
+  if (!userSessions[userId]) {
+    userSessions[userId] = { balance: 0, state: 'AWAITING_COUNTRY' };
+    saveSessions();
+  }
+  return userSessions[userId];
 }
 
 // ------------------- PAYSTACK INTEGRATION -------------------
@@ -113,15 +122,11 @@ async function initializePaystackPayment(email, amountNgn, userId) {
       'https://api.paystack.co/transaction/initialize',
       {
         email: email,
-        amount: Math.round(amountNgn * 100), // Convert NGN to Kobo
+        amount: Math.round(amountNgn * 100),
         metadata: {
           telegram_id: String(userId),
           custom_fields: [
-            {
-              display_name: "Telegram User ID",
-              variable_name: "telegram_id",
-              value: String(userId)
-            }
+            { display_name: "Telegram User ID", variable_name: "telegram_id", value: String(userId) }
           ]
         }
       },
@@ -203,7 +208,6 @@ async function getAllSmsVerifyServices(countryShortCode, countryName) {
   const serverMap = await getAllSmsServerMap();
   let targetServerId = null;
 
-  // Try matching server ID by country name or short code from handler_api.php
   if (serverMap && typeof serverMap === 'object') {
     for (const [serverId, info] of Object.entries(serverMap)) {
       const sName = (info.name || info.title || info.country || '').toLowerCase();
@@ -218,7 +222,6 @@ async function getAllSmsVerifyServices(countryShortCode, countryName) {
     }
   }
 
-  // Fallback to default server 1 if not mapped
   if (!targetServerId) targetServerId = 1;
 
   try {
@@ -334,6 +337,39 @@ function matchesServiceQuery(serviceName, query) {
   return false;
 }
 
+// ------------------- GEMINI AI COMPLAINT & CONVERSATION ENGINE -------------------
+
+async function handleAIResponse(userMessage, session) {
+  if (!ai) return null;
+  try {
+    const prompt = `You are Elsa, the warm, polite, and helpful Nigerian AI customer assistant for "MJ SMS" (a Telegram bot providing virtual numbers for SMS verification).
+
+User Message: "${userMessage}"
+User Current Saved Balance: ₦${session.balance || 0}
+Customer Support WhatsApp Link: https://wa.me/qr/XM6ORO7UCYTXI1
+
+Your Instructions:
+- Speak naturally in polite, warm Nigerian English / light Pidgin. Be empathetic and respectful.
+- If the user is asking about a balance discrepancy, balance change, missing funds, or making a complaint:
+  1. Acknowledge their concern immediately with zero defensiveness.
+  2. Clearly mention that their balance recorded on the system right now is ₦${session.balance || 0}.
+  3. Reassure them that if there's any payment delay or mistake, customer care will rectify it promptly.
+  4. Invite them to click the support button below to message admin on WhatsApp directly with their payment receipt or proof.
+- Keep your response brief, friendly, and clear (max 3 short sentences).
+- Do NOT output raw bot commands.`;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
+    });
+
+    return response.text;
+  } catch (err) {
+    console.error("Gemini AI Processing Error:", err.message);
+    return null;
+  }
+}
+
 // ------------------- PURCHASE & POLLING EXECUTION -------------------
 
 async function executePurchase(provider, countryId, countryShort, serviceId, operatorId) {
@@ -428,15 +464,6 @@ async function cancelOrder(provider, orderId) {
   }
 }
 
-// Helper to ensure session exists without overwriting stored balance
-function getUserSession(userId) {
-  if (!userSessions[userId]) {
-    userSessions[userId] = { balance: 0, state: 'AWAITING_COUNTRY' };
-    saveSessions();
-  }
-  return userSessions[userId];
-}
-
 // ------------------- ELSA BOT COMMANDS & FLOWS -------------------
 
 bot.start((ctx) => {
@@ -445,12 +472,9 @@ bot.start((ctx) => {
   session.state = 'AWAITING_COUNTRY';
   saveSessions();
 
-  const balance = session.balance || 0;
-
   ctx.reply(
-    `How far boss! 👋 My name is *Elsa*. Welcome to *MJ SMS*! ✨\n` +
-    `Have a happy day today! 😊\n\n` +
-    `💰 *Your Balance:* ₦${balance.toLocaleString()}\n\n` +
+    `How far boss! 👋 My name is *Elsa*. Welcome to *MJ SMS*! ✨\n\n` +
+    `💰 *Your Balance:* ₦${(session.balance || 0).toLocaleString()}\n\n` +
     `I dey here to help you get virtual numbers fast fast! 🚀\n` +
     `• Type a country name (e.g., _United States_, _Nigeria_)\n` +
     `• Type */fund* to top up your wallet balance!\n` +
@@ -473,9 +497,7 @@ bot.command(['fund', 'deposit', 'wallet', 'balance'], (ctx) => {
   );
 });
 
-bot.command(['support', 'help', 'customercare'], (ctx) => {
-  sendCustomerSupportMessage(ctx);
-});
+bot.command(['support', 'help', 'customercare'], (ctx) => sendCustomerSupportMessage(ctx));
 
 function sendCustomerSupportMessage(ctx) {
   ctx.reply(
@@ -500,26 +522,13 @@ bot.on('text', async (ctx) => {
 
   const session = getUserSession(userId);
 
-  // A. Support / Customer Care Trigger
-  if (['support', 'customer care', 'speak to support', 'help', 'admin', 'contact'].some(k => lowerText.includes(k))) {
+  // A. Support Keywords Trigger
+  if (['support', 'customer care', 'speak to support', 'admin', 'contact'].some(k => lowerText.includes(k))) {
     sendCustomerSupportMessage(ctx);
     return;
   }
 
-  // B. Balance Checks or Sentences about Balance
-  if (lowerText.includes('balance') || lowerText.includes('wallet')) {
-    const bal = session.balance || 0;
-    ctx.reply(
-      `💰 *YOUR WALLET BALANCE:* ₦${bal.toLocaleString()}\n\n` +
-      `To top up your wallet, type */fund* or reply with an amount like *fund 1000*.`,
-      { parse_mode: 'Markdown' }
-    );
-    session.state = 'AWAITING_COUNTRY';
-    saveSessions();
-    return;
-  }
-
-  // C. Catch plain "fund", "deposit", "topup"
+  // B. Exact Deposit/Fund Keywords
   if (['fund', 'deposit', 'topup', 'top up'].includes(lowerText)) {
     session.state = 'AWAITING_DEPOSIT_AMOUNT';
     saveSessions();
@@ -532,7 +541,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // D. Catch "fund 1000" or "deposit 5000"
+  // C. Fund Command with inline amount (e.g., "fund 1000")
   const fundMatch = lowerText.match(/^(?:fund|deposit|topup)\s+(\d+)$/i);
   if (fundMatch) {
     const amount = parseInt(fundMatch[1]);
@@ -542,8 +551,7 @@ bot.on('text', async (ctx) => {
     }
 
     ctx.reply(`Generating your Paystack payment link... ⏳`);
-    const userEmail = `${userId}@mjsms.com`;
-    const payment = await initializePaystackPayment(userEmail, amount, userId);
+    const payment = await initializePaystackPayment(`${userId}@mjsms.com`, amount, userId);
 
     if (payment.status && payment.data?.authorization_url) {
       session.state = 'IDLE';
@@ -565,7 +573,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // E. Deposit Amount Input Handler
+  // D. Pending Deposit Amount Input
   if (session.state === 'AWAITING_DEPOSIT_AMOUNT') {
     const amount = parseInt(rawText.replace(/[^0-9]/g, ''));
     if (isNaN(amount) || amount < 100) {
@@ -574,8 +582,7 @@ bot.on('text', async (ctx) => {
     }
 
     ctx.reply(`Generating your Paystack payment link... ⏳`);
-    const userEmail = `${userId}@mjsms.com`;
-    const payment = await initializePaystackPayment(userEmail, amount, userId);
+    const payment = await initializePaystackPayment(`${userId}@mjsms.com`, amount, userId);
 
     if (payment.status && payment.data?.authorization_url) {
       session.state = 'IDLE';
@@ -597,10 +604,27 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // F. Detect "Which one dey available?" Intent
-  const isAvailableQuery = [
-    'available', 'which one', 'what is available', 'list', 'show', 'any number', 'which app'
-  ].some(keyword => lowerText.includes(keyword));
+  // E. Detect Natural Sentences & Complaints (routed to Gemini AI)
+  const isDirectOrderIntent = ['whatsapp', 'telegram', 'facebook', 'usa', 'nigeria', 'uk', 'us', 'gb'].some(k => lowerText.includes(k));
+  
+  if (!isDirectOrderIntent && (lowerText.includes('balance') || lowerText.includes('change') || lowerText.includes('why') || lowerText.includes('my previous') || rawText.length > 5)) {
+    const aiResponseText = await handleAIResponse(rawText, session);
+    if (aiResponseText) {
+      ctx.reply(aiResponseText, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.url('💬 Chat Customer Care on WhatsApp', 'https://wa.me/qr/XM6ORO7UCYTXI1')]
+        ])
+      });
+      // Reset state back to clean country waiting state
+      session.state = 'AWAITING_COUNTRY';
+      saveSessions();
+      return;
+    }
+  }
+
+  // F. Service Query Intent ("Which one dey available?")
+  const isAvailableQuery = ['available', 'which one', 'what is available', 'list', 'show', 'which app'].some(k => lowerText.includes(k));
 
   if (isAvailableQuery) {
     if (!session.country) {
@@ -611,7 +635,6 @@ bot.on('text', async (ctx) => {
     }
 
     ctx.reply(`Checking all available services for *${session.country.name}*... 🔎`, { parse_mode: 'Markdown' });
-
     const available = await fetchCombinedServices(session.country);
 
     if (!available || available.length === 0) {
@@ -647,7 +670,7 @@ bot.on('text', async (ctx) => {
 
   const countries = await getCountries();
 
-  // H. Multi-word Input Detection ("USA WhatsApp")
+  // H. Combined Input Handling ("USA WhatsApp")
   if (countries.length > 0) {
     const words = lowerText.split(/\s+/);
     let matchedCountry = null;
@@ -679,8 +702,6 @@ bot.on('text', async (ctx) => {
 
   // I. Country Selection Logic
   if (session.state === 'AWAITING_COUNTRY' || session.state === 'IDLE') {
-    ctx.reply(`Hold on boss, make I check available countries... 🔎`);
-    
     const matchedCountry = countries.find(c => 
       c.name.toLowerCase().includes(lowerText) || 
       c.short.toLowerCase() === lowerText ||
@@ -725,7 +746,6 @@ bot.on('text', async (ctx) => {
 
 async function processServiceSelection(ctx, session, serviceQuery) {
   const availableServers = await fetchCombinedServices(session.country);
-
   const filtered = availableServers.filter(s => matchesServiceQuery(s.service_name, serviceQuery));
 
   if (filtered.length === 0) {
@@ -836,7 +856,7 @@ app.post('/webhook/paystack', async (req, res) => {
     if (userId) {
       const session = getUserSession(userId);
       session.balance = (session.balance || 0) + amountPaidNgn;
-      saveSessions(); // Write updated balance to disk immediately
+      saveSessions();
 
       try {
         await bot.telegram.sendMessage(
@@ -848,7 +868,7 @@ app.post('/webhook/paystack', async (req, res) => {
           { parse_mode: 'Markdown' }
         );
       } catch (err) {
-        console.error("Failed to notify user:", err.message);
+        console.error("Failed to notify user via Telegram:", err.message);
       }
     }
   }
@@ -868,5 +888,8 @@ app.listen(PORT, async () => {
     } catch (err) {
       console.error("Webhook error:", err.message);
     }
+  }
+});
+
   }
 });
