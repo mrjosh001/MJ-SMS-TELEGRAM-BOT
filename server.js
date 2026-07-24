@@ -141,26 +141,31 @@ async function getAllSmsVerifyServices(countryId) {
   try {
     const res = await axios.get(ALLSMSVERIFY_BASE_URL, {
       ...robustAxiosConfig,
-      params: { action: 'getServices', api_key: cleanApiKey, country: countryId || 1 }
+      params: { action: 'getServicesList', api_key: cleanApiKey, country: countryId || 1 }
     });
 
-    const data = res.data;
-    if (data && typeof data === 'object' && !Array.isArray(data)) {
-      return Object.entries(data).map(([key, item]) => {
-        if (typeof item === 'object' && item !== null) {
-          return {
-            service_id: key,
-            service_name: item.name || item.title || key,
-            stock: item.count || item.stock || 10,
-            price: item.cost || item.price || 0,
-            server_id: countryId || '1'
-          };
-        }
-        return null;
-      }).filter(Boolean);
+    let data = res.data;
+    if (data && data.data) data = data.data;
+
+    if (data && typeof data === 'object') {
+      const items = Array.isArray(data) ? data : Object.entries(data).map(([key, item]) => ({ id: key, ...item }));
+      return items.map(item => {
+        const serviceId = item.id || item.service_id || item.service || '';
+        const serviceName = item.name || item.title || item.service_name || serviceId;
+        const stock = parseInt(item.count || item.stock || item.quantity || 10, 10);
+        const price = parseFloat(item.cost || item.price || item.retail_price || 0);
+        return {
+          service_id: serviceId,
+          service_name: String(serviceName),
+          stock: isNaN(stock) ? 10 : stock,
+          price: isNaN(price) ? 0 : price,
+          server_id: countryId || '1'
+        };
+      }).filter(s => s.service_id);
     }
     return [];
   } catch (err) {
+    console.error("Error fetching services:", err.message);
     return [];
   }
 }
@@ -171,12 +176,12 @@ async function fetchCombinedServices(country) {
   
   if (Array.isArray(allSmsData)) {
     allSmsData.forEach(s => {
-      const serviceName = s.service_name || s.name || '';
+      const serviceName = s.service_name || '';
       const stock = s.stock || 0;
       if (stock > 0) {
         results.push({
           provider: 'allsmsverify',
-          service_id: s.service_id || serviceName,
+          service_id: s.service_id,
           service_name: serviceName,
           operator_id: country.id,
           server_name: country.name || 'Server',
@@ -257,7 +262,13 @@ bot.start(async (ctx) => {
   );
 });
 
-bot.command(['fund', 'deposit', 'wallet', 'balance'], (ctx) => {
+bot.command(['balance', 'bal'], (ctx) => {
+  const userId = ctx.from.id;
+  const session = getUserSession(userId);
+  ctx.reply(`Boss your current balance na ₦${(session.balance || 0).toLocaleString()} ✨`, { parse_mode: 'Markdown' });
+});
+
+bot.command(['fund', 'deposit', 'wallet', 'topup'], (ctx) => {
   const userId = ctx.from.id;
   const session = getUserSession(userId);
   session.state = 'AWAITING_DEPOSIT_AMOUNT';
@@ -300,8 +311,14 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // 2. Fund / Wallet triggers
-  if (['fund', 'deposit', 'wallet', 'balance', 'topup', 'top up', 'what\'s my balance', 'i want to fund my wallet'].some(k => lowerText.includes(k))) {
+  // 2. Balance triggers (Strictly balance checking only)
+  if (['balance', 'bal', "what's my balance", 'my balance'].includes(lowerText)) {
+    ctx.reply(`Boss your current balance na ₦${(session.balance || 0).toLocaleString()} ✨`, { parse_mode: 'Markdown' });
+    return;
+  }
+
+  // 3. Fund / Wallet deposit triggers
+  if (['fund', 'deposit', 'wallet', 'topup', 'top up', 'i want to fund my wallet', 'fund my account', 'fund account'].some(k => lowerText.includes(k))) {
     session.state = 'AWAITING_DEPOSIT_AMOUNT';
     saveSessions();
     ctx.reply(
@@ -313,7 +330,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // 3. Reset country flow triggers
+  // 4. Reset country flow triggers
   if (['/start', 'change country', 'countries', 'back'].some(k => lowerText.includes(k))) {
     session.state = 'AWAITING_COUNTRY';
     session.country = null;
@@ -368,7 +385,7 @@ bot.on('text', async (ctx) => {
     });
   };
 
-  // 4. Combined Input Handling ("Usa WhatsApp")
+  // 5. Combined Input Handling ("Usa WhatsApp")
   if (countries.length > 0) {
     const words = lowerText.split(/\s+/);
     let matchedCountry = null;
@@ -395,7 +412,7 @@ bot.on('text', async (ctx) => {
     }
   }
 
-  // 5. Single Country Input ("United States", "Usa")
+  // 6. Single Country Input ("United States", "Usa")
   const matchedCountryDirect = getNormalizedCountry(lowerText);
   if (matchedCountryDirect) {
     session.country = matchedCountryDirect;
@@ -409,7 +426,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // 6. Service Query when state is already AWAITING_SERVICE
+  // 7. Service Query when state is already AWAITING_SERVICE
   if (session.state === 'AWAITING_SERVICE' && session.country) {
     ctx.reply(`Oya wait make we check available servers for *${rawText}* (${session.country.name})... 🔎`, { parse_mode: 'Markdown' });
     await processServiceSelection(ctx, session, rawText);
@@ -430,10 +447,10 @@ async function processServiceSelection(ctx, session, serviceQuery) {
   });
 
   if (filtered.length === 0) {
-    const topServices = availableServers.slice(0, 10).map(s => `• ${s.service_name} (${s.stock} left)`).join('\n');
+    const topServices = availableServers.slice(0, 15).map(s => `• ${s.service_name} (${s.stock} left)`).join('\n');
     ctx.reply(
       `Eya! No stock found for *${serviceQuery}* right now. 💔\n\n` +
-      `Here are some available services on this server:\n${topServices || 'None available'}\n\n` +
+      `Here are available services on this server:\n${topServices || 'None available'}\n\n` +
       `Type another app name or type *change country* to switch.`,
       { parse_mode: 'Markdown' }
     );
