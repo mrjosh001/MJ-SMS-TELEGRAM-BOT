@@ -18,7 +18,6 @@ const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const SUPABASE_REST_URL = process.env.SUPABASE_REST_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
-// Your authorized admin Telegram ID
 const ADMIN_TELEGRAM_ID = '7466363018';
 
 if (!BOT_TOKEN) {
@@ -133,12 +132,6 @@ async function updateOrderStatusInDb(orderId, newStatus) {
   } catch (err) {}
 }
 
-async function addTransactionToDb(userId, amount, date) {
-  const session = await getUserSession(userId);
-  session.transactions.push({ amount, date });
-  await saveUserSession(userId, session);
-}
-
 const USD_TO_NGN_RATE = 1500; 
 
 function calculateFinalPrice(rawPrice, isAlreadyNgn = false) {
@@ -181,11 +174,9 @@ const COMMON_SERVICE_SYNONYMS = {
   'snapchat': ['snapchat', 'snap']
 };
 
-// Dynamic country fetchers for all providers
 async function fetchAllCountries() {
   const countryMap = new Map();
 
-  // 1. AuthPadi & AllSMSVerify dynamic countries
   for (const [providerName, baseUrl, apiKey] of [
     ['Server Three (AuthPadi)', AUTHPADI_BASE_URL, AUTHPADI_API_KEY],
     ['Server Four (AllSMSVerify)', ALLSMSVERIFY_BASE_URL, ALLSMSVERIFY_API_KEY]
@@ -198,7 +189,6 @@ async function fetchAllCountries() {
         });
         const data = res.data;
         if (data && typeof data === 'object') {
-          // Some APIs return country list as object { id: {name, ...} } or array
           const list = Array.isArray(data) ? data : Object.keys(data).map(k => ({ id: k, ...data[k] }));
           list.forEach(c => {
             const id = String(c.id || c.country_id || c.code || '');
@@ -212,7 +202,6 @@ async function fetchAllCountries() {
     }
   }
 
-  // Fallback default major countries if API doesn't return full list instantly
   const defaults = [
     { id: 'us', name: 'United States (US)' },
     { id: 'ng', name: 'Nigeria (NG)' },
@@ -349,7 +338,6 @@ async function fetchCombinedServices(country) {
   return results;
 }
 
-// Order execution, status, and cancellation handlers remain fully robust...
 async function executeOrder(provider, serviceId, countryId) {
   try {
     if (provider === 'allsmsverify') {
@@ -454,33 +442,28 @@ async function cancelOrder(provider, orderId) {
   } catch (err) {}
 }
 
-// New Admin Command to check active servers and balances from backend
 bot.command('servers', async (ctx) => {
   const adminId = String(ctx.from.id);
   if (adminId !== ADMIN_TELEGRAM_ID) return ctx.reply(`❌ Unauthorized.`);
 
-  ctx.reply(`Checking backend server status & balances... ⏳`);
+  ctx.reply(`Checking all servers (1 to 4) status & balances... ⏳`);
   let statusReport = `🖥️ *BACKEND SERVER STATUS REPORT*\n\n`;
 
-  // Server One (JuicySMS)
   try {
     const res = await axios.get(`${JUICYSMS_BASE_URL}/balance`, { ...robustAxiosConfig, params: { key: JUICYSMS_API_KEY } });
     statusReport += `• *Server One (JuicySMS):* ✅ ONLINE (Bal: ${res.data?.balance || 'Active'})\n`;
   } catch (e) { statusReport += `• *Server One (JuicySMS):* ❌ OFFLINE\n`; }
 
-  // Server Two (SMSOTPStores)
   try {
     const res = await axios.get(`${SMSOTPSTORES_BASE_URL}/api.php`, { ...robustAxiosConfig, params: { api_key: SMSOTPSTORES_API_KEY, action: 'balance' } });
     statusReport += `• *Server Two (SMSOTPStores):* ✅ ONLINE (Bal: ${res.data?.balance || 'Active'})\n`;
   } catch (e) { statusReport += `• *Server Two (SMSOTPStores):* ❌ OFFLINE\n`; }
 
-  // Server Three (AuthPadi)
   try {
     const res = await axios.get(`${AUTHPADI_BASE_URL}/stubs/handler_api.php`, { ...robustAxiosConfig, params: { api_key: AUTHPADI_API_KEY, action: 'getBalance' } });
     statusReport += `• *Server Three (AuthPadi):* ✅ ONLINE (${res.data || 'Active'})\n`;
   } catch (e) { statusReport += `• *Server Three (AuthPadi):* ❌ OFFLINE\n`; }
 
-  // Server Four (AllSMSVerify)
   try {
     const res = await axios.get(`${ALLSMSVERIFY_BASE_URL}/stubs/handler_api.php`, { ...robustAxiosConfig, params: { api_key: ALLSMSVERIFY_API_KEY, action: 'getBalance' } });
     statusReport += `• *Server Four (AllSMSVerify):* ✅ ONLINE (${res.data || 'Active'})\n`;
@@ -494,7 +477,7 @@ bot.start(async (ctx) => {
   const session = await getUserSession(userId);
   session.state = 'AWAITING_COUNTRY';
   await saveUserSession(userId, session);
-  ctx.reply(`Oya boss! Welcome to *MJ SMS*! Just type any country and app naturally (e.g., *Germany WhatsApp* or *India Telegram*). ✨`, { parse_mode: 'Markdown' });
+  ctx.reply(`Oya boss! Welcome to *MJ SMS*! Type any country and app naturally (e.g., *Germany WhatsApp* or *India Telegram*). ✨`, { parse_mode: 'Markdown' });
 });
 
 bot.command(['balance', 'bal'], async (ctx) => {
@@ -514,10 +497,6 @@ bot.command('orders', async (ctx) => {
   if (!session.orders || session.orders.length === 0) return ctx.reply(`📭 No order history yet.`);
   const history = session.orders.slice(-10).reverse().map(o => `• ${o.serviceName} | \`${o.phoneNumber}\` | ₦${o.price} | ${o.status}`).join('\n');
   ctx.reply(`📦 *YOUR ORDERS*\n\n${history}`, { parse_mode: 'Markdown' });
-});
-
-bot.command('privacy', (ctx) => {
-  ctx.reply(`🔒 *MJ SMS Privacy Policy:* Your data is secure and encrypted via Supabase and Paystack.`);
 });
 
 bot.on('text', async (ctx) => {
@@ -544,10 +523,8 @@ bot.on('text', async (ctx) => {
     return ctx.reply(`❌ Payment link error.`);
   }
 
-  // Fetch all countries dynamically from APIs
   const allCountries = await fetchAllCountries();
 
-  // Match country from text dynamically
   let matchedCountry = null;
   let serviceQueryWords = [];
   const words = lowerText.split(/\s+/);
@@ -573,7 +550,6 @@ bot.on('text', async (ctx) => {
     return await promptServerSelection(ctx, session);
   }
 
-  // Reverse match fallback
   for (let i = 0; i < words.length; i++) {
     const potentialCountry = words.slice(i).join(' ');
     const found = allCountries.find(c => String(c.name).toLowerCase().includes(potentialCountry) || String(c.id).toLowerCase() === potentialCountry);
@@ -606,7 +582,7 @@ bot.on('text', async (ctx) => {
 });
 
 async function promptServerSelection(ctx, session) {
-  ctx.reply(`Fetching live stock across all servers... ⏳`);
+  ctx.reply(`Fetching live stock across Servers 1-4... ⏳`);
   const availableServers = await fetchCombinedServices(session.country);
   const q = (session.selectedServiceQuery || '').toLowerCase().trim();
 
