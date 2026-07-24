@@ -13,14 +13,10 @@ const SERVER_URL = process.env.RENDER_EXTERNAL_URL;
 const JUICYSMS_API_KEY = process.env.JUICYSMS_API_KEY || process.env.SECOND_SMS_API_KEY;
 const PLUSVERIFY_API_KEY = process.env.PLUSVERIFY_API_KEY || process.env.PLUS_VERIFY_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
-const DATABASE_URL = process.env.DATABASE_URL; // e.g. postgresql://postgres:pass@db.xyz.supabase.co:5432/postgres
+const DATABASE_URL = process.env.DATABASE_URL;
 
-// Parse Supabase REST URL & Service Key from DATABASE_URL if available, or use direct REST variables
 let SUPABASE_REST_URL = process.env.SUPABASE_REST_URL;
-let SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-
 if (DATABASE_URL && !SUPABASE_REST_URL) {
-  // Extract project ref from postgresql://postgres:pass@db.REF.supabase.co:5432/postgres
   const match = DATABASE_URL.match(/@db\.([a-z0-9]+)\.supabase\.co/);
   if (match && match[1]) {
     SUPABASE_REST_URL = `https://${match[1]}.supabase.co/rest/v1`;
@@ -36,7 +32,6 @@ const bot = new Telegraf(BOT_TOKEN);
 
 // ------------------- SUPABASE REST API STORAGE HELPERS -------------------
 async function getSupabaseHeaders() {
-  // If service key is not explicitly provided, we can look for it or use standard anon/service key from env
   const apiKey = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY || '';
   return {
     'apikey': apiKey,
@@ -56,7 +51,6 @@ async function getUserSession(userId) {
     
     let user;
     if (!userRes.data || userRes.data.length === 0) {
-      // Create user
       const newUserData = { user_id: userId, balance: 0, state: 'AWAITING_COUNTRY', country: null, selected_service_query: null, chosen_provider: null };
       await axios.post(`${SUPABASE_REST_URL}/users`, newUserData, { headers });
       user = newUserData;
@@ -67,10 +61,17 @@ async function getUserSession(userId) {
     const ordersRes = await axios.get(`${SUPABASE_REST_URL}/orders?user_id=eq.${userId}&select=*`, { headers });
     const txRes = await axios.get(`${SUPABASE_REST_URL}/transactions?user_id=eq.${userId}&select=*`, { headers });
 
+    // Normalize country stored in db back to an object if it's a string
+    let parsedCountry = user.country;
+    if (typeof parsedCountry === 'string') {
+      const allSupportedCountries = [...JUICYSMS_COUNTRIES, ...PLUSVERIFY_COUNTRIES];
+      parsedCountry = allSupportedCountries.find(c => c.id.toLowerCase() === parsedCountry.toLowerCase()) || { id: parsedCountry, name: parsedCountry };
+    }
+
     return {
       balance: parseFloat(user.balance || 0),
       state: user.state || 'AWAITING_COUNTRY',
-      country: user.country || null,
+      country: parsedCountry || null,
       selectedServiceQuery: user.selected_service_query || null,
       chosenProvider: user.chosen_provider || null,
       orders: (ordersRes.data || []).map(o => ({
@@ -97,10 +98,11 @@ async function saveUserSession(userId, session) {
   if (!SUPABASE_REST_URL) return;
   try {
     const headers = await getSupabaseHeaders();
+    const countryToSave = session.country && typeof session.country === 'object' ? session.country.id : session.country;
     await axios.patch(`${SUPABASE_REST_URL}/users?user_id=eq.${userId}`, {
       balance: session.balance,
       state: session.state,
-      country: session.country,
+      country: countryToSave,
       selected_service_query: session.selectedServiceQuery,
       chosen_provider: session.chosenProvider
     }, { headers });
@@ -166,7 +168,6 @@ const robustAxiosConfig = {
 
 const USD_TO_NGN_RATE = 1500; 
 
-// ------------------- PRICING CALCULATION LOGIC -------------------
 function calculateFinalPrice(rawPrice, isAlreadyNgn = false) {
   const baseCostNgn = isAlreadyNgn ? rawPrice : (rawPrice * USD_TO_NGN_RATE);
   if (baseCostNgn < 3500) {
@@ -176,7 +177,6 @@ function calculateFinalPrice(rawPrice, isAlreadyNgn = false) {
   }
 }
 
-// ------------------- PAYSTACK INTEGRATION -------------------
 async function initializePaystackPayment(email, amountNgn, userId) {
   if (!PAYSTACK_SECRET_KEY) {
     return { status: false, message: "Paystack secret key is missing." };
@@ -202,7 +202,6 @@ async function initializePaystackPayment(email, amountNgn, userId) {
   }
 }
 
-// ------------------- MULTI-API SMS PROVIDER INTEGRATION -------------------
 const JUICYSMS_COUNTRIES = [
   { id: 'NL', name: 'Netherlands (NL)', short: 'nl' },
   { id: 'UK', name: 'United Kingdom (UK)', short: 'uk' },
@@ -304,8 +303,10 @@ async function getPlusVerifyPrice(serviceId, countryId) {
 
 async function fetchCombinedServices(country) {
   const results = [];
-  
-  const juicyMatch = JUICYSMS_COUNTRIES.find(c => c.id.toLowerCase() === country.id.toLowerCase());
+  const countryObj = typeof country === 'string' ? { id: country, name: country } : country;
+  if (!countryObj || !countryObj.id) return results;
+
+  const juicyMatch = JUICYSMS_COUNTRIES.find(c => c.id.toLowerCase() === countryObj.id.toLowerCase());
   if (juicyMatch) {
     const juicyData = await getJuicySmsServices(juicyMatch.id);
     if (Array.isArray(juicyData)) {
@@ -316,7 +317,7 @@ async function fetchCombinedServices(country) {
           service_name: s.service_name,
           operator_id: juicyMatch.id,
           server_label: 'Server One',
-          server_name: `${country.name} (Server One)`,
+          server_name: `${countryObj.name} (Server One)`,
           stock: s.stock || 10,
           price: s.price,
           is_ngn: false
@@ -326,21 +327,21 @@ async function fetchCombinedServices(country) {
   }
 
   const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
-  const plusMatch = PLUSVERIFY_COUNTRIES.find(c => c.id.toLowerCase() === country.id.toLowerCase());
+  const plusMatch = PLUSVERIFY_COUNTRIES.find(c => c.id.toLowerCase() === countryObj.id.toLowerCase());
   
   if (cleanApiKey && plusMatch) {
     const plusData = await getPlusVerifyServices();
     if (Array.isArray(plusData)) {
       for (const s of plusData) {
-        const livePrice = await getPlusVerifyPrice(s.service_id, country.id.toLowerCase());
+        const livePrice = await getPlusVerifyPrice(s.service_id, countryObj.id.toLowerCase());
         if (livePrice !== null) {
           results.push({
             provider: 'plusverify',
             service_id: s.service_id,
             service_name: s.service_name,
-            operator_id: country.id.toLowerCase(),
+            operator_id: countryObj.id.toLowerCase(),
             server_label: 'Server Two',
-            server_name: `${country.name} (Server Two)`,
+            server_name: `${countryObj.name} (Server Two)`,
             stock: 100,
             price: livePrice,
             is_ngn: true
@@ -461,7 +462,6 @@ async function cancelOrder(provider, orderId) {
   }
 }
 
-// ------------------- BOT COMMANDS -------------------
 bot.start(async (ctx) => {
   const userId = ctx.from.id;
   const session = await getUserSession(userId);
@@ -556,7 +556,6 @@ function sendCustomerSupportMessage(ctx) {
   );
 }
 
-// ------------------- TEXT ROUTING ENGINE -------------------
 bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
   const rawText = ctx.message.text.trim();
@@ -693,11 +692,10 @@ bot.on('text', async (ctx) => {
   ctx.reply(`Please state your country code first (e.g., type *US* or *US WhatsApp*).`, { parse_mode: 'Markdown' });
 });
 
-// ------------------- FLOW: ASK SERVER FIRST, THEN PRICE -------------------
 async function promptServerSelection(ctx, session) {
   ctx.reply(`Checking available servers and stock... ⏳`);
   const availableServers = await fetchCombinedServices(session.country);
-  const q = session.selectedServiceQuery.toLowerCase().trim();
+  const q = (session.selectedServiceQuery || '').toLowerCase().trim();
   
   const filtered = availableServers.filter(s => {
     const sName = String(s.service_name || '').toLowerCase();
@@ -726,14 +724,17 @@ async function promptServerSelection(ctx, session) {
     }
   });
 
+  const countryName = typeof session.country === 'object' ? session.country.name : session.country;
+  const countryId = typeof session.country === 'object' ? session.country.id : session.country;
+
   const serverButtons = [];
   uniqueServersMap.forEach((srv, label) => {
-    serverButtons.push([Markup.button.callback(`🖥️ ${label} (${session.country.name})`, `server|${srv.provider}|${session.country.id}`)]);
+    serverButtons.push([Markup.button.callback(`🖥️ ${label} (${countryName})`, `server|${srv.provider}|${countryId}`)]);
   });
   serverButtons.push([Markup.button.callback('🔄 Choose Another Country', 'reset_flow')]);
 
   ctx.reply(
-    `Oya boss! You selected *${session.selectedServiceQuery}* for *${session.country.name}*.\n\n` +
+    `Oya boss! You selected *${session.selectedServiceQuery}* for *${countryName}*.\n\n` +
     `Please select your preferred server below: 👇`,
     { parse_mode: 'Markdown', ...Markup.inlineKeyboard(serverButtons) }
   );
@@ -763,9 +764,11 @@ bot.action(/^server\|(.+)\|(.+)$/, async (ctx) => {
     return;
   }
 
+  const countryIdCode = typeof session.country === 'object' ? session.country.id : countryId;
+
   const buttons = filtered.map((srv) => {
     const finalPrice = calculateFinalPrice(srv.price, srv.is_ngn);
-    const cbData = `buy|${srv.provider}|${session.country.id}|${srv.service_id}`;
+    const cbData = `buy|${srv.provider}|${countryIdCode}|${srv.service_id}`;
     return [Markup.button.callback(`💰 ${srv.server_label} Price: ₦${finalPrice.toLocaleString()} (${srv.stock} left)`, cbData)];
   });
 
@@ -791,7 +794,6 @@ bot.action('back_to_servers', async (ctx) => {
   }
 });
 
-// ------------------- BUTTON HANDLERS FOR BUYING -------------------
 bot.action(/^buy\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
   ctx.answerCbQuery();
   const userId = ctx.from.id;
@@ -901,7 +903,6 @@ bot.action('reset_flow', async (ctx) => {
   ctx.reply(`No p boss! Which country you wan check now? (Type *US*, *NG*, *NL*, *UK* or *DE*)`);
 });
 
-// ------------------- WEBHOOKS & SERVER START -------------------
 const TELEGRAM_WEBHOOK_PATH = `/webhook/telegram`;
 app.use(bot.webhookCallback(TELEGRAM_WEBHOOK_PATH));
 
