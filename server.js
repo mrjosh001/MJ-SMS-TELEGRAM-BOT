@@ -9,8 +9,8 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SERVER_URL = process.env.RENDER_EXTERNAL_URL;
-const JUICYSMS_API_KEY = process.env.JUICYSMS_API_KEY || process.env.SECOND_SMS_API_KEY;
-const PLUSVERIFY_API_KEY = process.env.PLUSVERIFY_API_KEY || process.env.PLUS_VERIFY_API_KEY;
+const JUICYSMS_API_KEY = process.env.JUICYSMS_API_KEY;
+const SMSOTPSTORES_API_KEY = process.env.SMSOTPSTORES_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 
 const SUPABASE_REST_URL = process.env.SUPABASE_REST_URL;
@@ -179,13 +179,14 @@ const JUICYSMS_COUNTRIES = [
   { id: 'DE', name: 'Germany (DE)', short: 'de' }
 ];
 
-const PLUSVERIFY_COUNTRIES = [
+const SMSOTPSTORES_COUNTRIES = [
   { id: 'us', name: 'United States (US)', short: 'us' },
-  { id: 'ng', name: 'Nigeria (NG)', short: 'ng' }
+  { id: 'ng', name: 'Nigeria (NG)', short: 'ng' },
+  { id: 'uk', name: 'United Kingdom (UK)', short: 'uk' }
 ];
 
 const JUICYSMS_BASE_URL = 'https://juicysms.com/api';
-const PLUSVERIFY_BASE_URL = 'https://plusverify.com.ng/api/v1';
+const SMSOTPSTORES_BASE_URL = 'https://smsotpstores.com';
 
 async function getJuicySmsServices(countryId) {
   try {
@@ -202,8 +203,7 @@ async function getJuicySmsServices(countryId) {
         service_name: item.title || item.name || item.service_id || '',
         stock: parseInt(item.count || item.stock || item.quantity || 10, 10),
         price: parseFloat(item.price || item.cost || 0),
-        is_ngn: false,
-        server_id: countryId
+        is_ngn: false
       })).filter(s => s.service_id);
     }
     return [];
@@ -212,62 +212,33 @@ async function getJuicySmsServices(countryId) {
   }
 }
 
-async function getPlusVerifyServices() {
+async function getSmsOtpStoresServices(countryId) {
   try {
-    const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
+    const cleanApiKey = SMSOTPSTORES_API_KEY ? SMSOTPSTORES_API_KEY.trim() : '';
     if (!cleanApiKey) return [];
 
-    const res = await axios.post(`${PLUSVERIFY_BASE_URL}/services.php`, {
-      api_key: cleanApiKey
-    }, {
+    const res = await axios.get(`${SMSOTPSTORES_BASE_URL}/api.php`, {
       ...robustAxiosConfig,
-      headers: { ...robustAxiosConfig.headers, 'Content-Type': 'application/json' }
+      params: { api_key: cleanApiKey, action: 'services', country: countryId }
     });
 
     const data = res.data;
-    let servicesList = [];
-    if (data && (data.success === true || data.status === 'success') && Array.isArray(data.services || data.otp_services)) {
-      servicesList = data.services || data.otp_services;
+    let list = [];
+    if (data && Array.isArray(data.services)) {
+      list = data.services;
     } else if (Array.isArray(data)) {
-      servicesList = data;
+      list = data;
     }
 
-    if (servicesList.length > 0) {
-      return servicesList.map(item => ({
-        service_id: item.id || item.service_id || item.code || '',
-        service_name: item.name || item.title || item.service_name || item.id || '',
-        stock: 100,
-        price: parseFloat(item.price || 0),
-        is_ngn: true
-      })).filter(s => s.service_id);
-    }
-    return [];
+    return list.map(item => ({
+      service_id: item.id || item.service_id || item.code || '',
+      service_name: item.name || item.title || item.service_name || '',
+      stock: parseInt(item.stock || item.count || 100, 10),
+      price: parseFloat(item.price || 0),
+      is_ngn: true
+    })).filter(s => s.service_id);
   } catch (err) {
     return [];
-  }
-}
-
-async function getPlusVerifyPrice(serviceId, countryId) {
-  try {
-    const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
-    if (!cleanApiKey) return null;
-
-    const res = await axios.post(`${PLUSVERIFY_BASE_URL}/price.php`, {
-      api_key: cleanApiKey,
-      service_id: serviceId,
-      country_id: countryId
-    }, {
-      ...robustAxiosConfig,
-      headers: { ...robustAxiosConfig.headers, 'Content-Type': 'application/json' }
-    });
-
-    const data = res.data;
-    if (data && (data.success === true || data.status === 'success') && typeof data.price !== 'undefined') {
-      return parseFloat(data.price);
-    }
-    return null;
-  } catch (err) {
-    return null;
   }
 }
 
@@ -276,8 +247,9 @@ async function fetchCombinedServices(country) {
   const countryObj = typeof country === 'string' ? { id: country, name: country } : country;
   if (!countryObj || !countryObj.id) return results;
 
+  // Server One: JuicySMS
   const juicyMatch = JUICYSMS_COUNTRIES.find(c => c.id.toLowerCase() === countryObj.id.toLowerCase());
-  if (juicyMatch) {
+  if (juicyMatch && JUICYSMS_API_KEY) {
     const juicyData = await getJuicySmsServices(juicyMatch.id);
     if (Array.isArray(juicyData)) {
       juicyData.forEach(s => {
@@ -285,9 +257,7 @@ async function fetchCombinedServices(country) {
           provider: 'juicysms',
           service_id: s.service_id,
           service_name: s.service_name,
-          operator_id: juicyMatch.id,
-          server_label: 'Server One',
-          server_name: `${countryObj.name} (Server One)`,
+          server_label: 'Server One (Juicy)',
           stock: s.stock || 10,
           price: s.price,
           is_ngn: false
@@ -296,28 +266,22 @@ async function fetchCombinedServices(country) {
     }
   }
 
-  const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
-  const plusMatch = PLUSVERIFY_COUNTRIES.find(c => c.id.toLowerCase() === countryObj.id.toLowerCase());
-  
-  if (cleanApiKey && plusMatch) {
-    const plusData = await getPlusVerifyServices();
-    if (Array.isArray(plusData)) {
-      for (const s of plusData) {
-        const livePrice = await getPlusVerifyPrice(s.service_id, countryObj.id.toLowerCase());
-        if (livePrice !== null) {
-          results.push({
-            provider: 'plusverify',
-            service_id: s.service_id,
-            service_name: s.service_name,
-            operator_id: countryObj.id.toLowerCase(),
-            server_label: 'Server Two',
-            server_name: `${countryObj.name} (Server Two)`,
-            stock: 100,
-            price: livePrice,
-            is_ngn: true
-          });
-        }
-      }
+  // Server Two: smsotpstores
+  const storeMatch = SMSOTPSTORES_COUNTRIES.find(c => c.id.toLowerCase() === countryObj.id.toLowerCase());
+  if (storeMatch && SMSOTPSTORES_API_KEY) {
+    const storeData = await getSmsOtpStoresServices(storeMatch.id);
+    if (Array.isArray(storeData)) {
+      storeData.forEach(s => {
+        results.push({
+          provider: 'smsotpstores',
+          service_id: s.service_id,
+          service_name: s.service_name,
+          server_label: 'Server Two (OTPStores)',
+          stock: s.stock || 100,
+          price: s.price,
+          is_ngn: true
+        });
+      });
     }
   }
 
@@ -325,31 +289,26 @@ async function fetchCombinedServices(country) {
 }
 
 async function executeOrder(provider, serviceId, countryId) {
-  if (provider === 'plusverify') {
+  if (provider === 'smsotpstores') {
     try {
-      const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
-      const res = await axios.post(`${PLUSVERIFY_BASE_URL}/otp.php`, {
-        api_key: cleanApiKey,
-        service_id: serviceId,
-        country_id: countryId
-      }, {
+      const cleanApiKey = SMSOTPSTORES_API_KEY ? SMSOTPSTORES_API_KEY.trim() : '';
+      const res = await axios.get(`${SMSOTPSTORES_BASE_URL}/api.php`, {
         ...robustAxiosConfig,
-        headers: { ...robustAxiosConfig.headers, 'Content-Type': 'application/json' }
+        params: { api_key: cleanApiKey, action: 'order', service_id: serviceId, country: countryId }
       });
       const data = res.data;
-      if (data && (data.success === true || data.status === 'success') && (data.order_id || data.id) && (data.phone_number || data.number)) {
+      if (data && (data.success || data.status === 'success' || data.order_id)) {
         return { 
           success: true, 
           data: { 
             order_id: String(data.order_id || data.id), 
-            number: String(data.phone_number || data.number),
-            charge: parseFloat(data.charge || data.price || 0)
+            number: String(data.phone_number || data.number) 
           } 
         };
       }
-      return { success: false, message: data?.message || 'Stock unavailable or insufficient balance on PlusVerify.' };
+      return { success: false, message: data?.message || 'Stock unavailable or insufficient balance on smsotpstores.' };
     } catch (err) {
-      return { success: false, message: 'PlusVerify request failed.' };
+      return { success: false, message: 'smsotpstores request failed.' };
     }
   } else {
     try {
@@ -371,19 +330,16 @@ async function executeOrder(provider, serviceId, countryId) {
 }
 
 async function checkSmsCode(provider, orderId) {
-  if (provider === 'plusverify') {
+  if (provider === 'smsotpstores') {
     try {
-      const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
-      const res = await axios.post(`${PLUSVERIFY_BASE_URL}/status.php`, {
-        api_key: cleanApiKey,
-        order_id: orderId
-      }, {
+      const cleanApiKey = SMSOTPSTORES_API_KEY ? SMSOTPSTORES_API_KEY.trim() : '';
+      const res = await axios.get(`${SMSOTPSTORES_BASE_URL}/api.php`, {
         ...robustAxiosConfig,
-        headers: { ...robustAxiosConfig.headers, 'Content-Type': 'application/json' }
+        params: { api_key: cleanApiKey, action: 'status', order_id: orderId }
       });
       const data = res.data;
-      if (data && (data.success === true || data.status === 'success' || data.status === 'COMPLETED' || data.sms_code)) {
-        const code = data.sms_code || data.code || data.otp;
+      if (data && (data.code || data.sms_code || data.status === 'completed')) {
+        const code = data.code || data.sms_code || data.otp;
         if (code) return { success: true, data: { code: String(code) } };
       }
       return { success: false };
@@ -409,16 +365,12 @@ async function checkSmsCode(provider, orderId) {
 }
 
 async function cancelOrder(provider, orderId) {
-  if (provider === 'plusverify') {
+  if (provider === 'smsotpstores') {
     try {
-      const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
-      await axios.post(`${PLUSVERIFY_BASE_URL}/update_status.php`, {
-        api_key: cleanApiKey,
-        order_id: orderId,
-        status: 8
-      }, {
+      const cleanApiKey = SMSOTPSTORES_API_KEY ? SMSOTPSTORES_API_KEY.trim() : '';
+      await axios.get(`${SMSOTPSTORES_BASE_URL}/api.php`, {
         ...robustAxiosConfig,
-        headers: { ...robustAxiosConfig.headers, 'Content-Type': 'application/json' }
+        params: { api_key: cleanApiKey, action: 'cancel', order_id: orderId }
       });
     } catch (err) {}
   } else {
@@ -560,7 +512,7 @@ bot.on('text', async (ctx) => {
     session.selectedServiceQuery = null;
     session.chosenProvider = null;
     await saveUserSession(userId, session);
-    ctx.reply(`No p boss! Which country you wan check now? (Type *US*, *NG*, *NL*, *UK*, *USA*, or *DE*)`, { parse_mode: 'Markdown' });
+    ctx.reply(`No p boss! Which country you wan check now? (Type *US*, *NG*, *NL*, *UK*, or *DE*)`, { parse_mode: 'Markdown' });
     return;
   }
 
@@ -590,7 +542,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  const allSupportedCountries = [...JUICYSMS_COUNTRIES, ...PLUSVERIFY_COUNTRIES];
+  const allSupportedCountries = [...JUICYSMS_COUNTRIES, ...SMSOTPSTORES_COUNTRIES];
 
   const getNormalizedCountry = (input) => {
     const cleanInput = input.toLowerCase().trim();
@@ -739,7 +691,7 @@ bot.action(/^server\|(.+)\|(.+)$/, async (ctx) => {
   const buttons = filtered.map((srv) => {
     const finalPrice = calculateFinalPrice(srv.price, srv.is_ngn);
     const cbData = `buy|${srv.provider}|${countryIdCode}|${srv.service_id}`;
-    return [Markup.button.callback(`💰 ${srv.server_label} Price: ₦${finalPrice.toLocaleString()} (${srv.stock} left)`, cbData)];
+    return [Markup.button.callback(`💰 ${srv.server_label} (${srv.service_name}) - ₦${finalPrice.toLocaleString()} (${srv.stock} left)`, cbData)];
   });
 
   buttons.push([Markup.button.callback('⬅️ Back to Servers', 'back_to_servers')]);
