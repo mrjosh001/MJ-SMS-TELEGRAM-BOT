@@ -2,8 +2,7 @@ const express = require('express');
 const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
 const https = require('https');
-const fs = require('fs');
-const path = require('path');
+const { Pool } = require('pg');
 
 const app = express();
 app.use(express.json());
@@ -15,6 +14,7 @@ const SERVER_URL = process.env.RENDER_EXTERNAL_URL;
 const JUICYSMS_API_KEY = process.env.JUICYSMS_API_KEY || process.env.SECOND_SMS_API_KEY;
 const PLUSVERIFY_API_KEY = process.env.PLUSVERIFY_API_KEY || process.env.PLUS_VERIFY_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
+const DATABASE_URL = process.env.DATABASE_URL;
 
 // API Base URLs
 const JUICYSMS_BASE_URL = 'https://juicysms.com/api';
@@ -27,60 +27,127 @@ if (!BOT_TOKEN) {
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// ------------------- PERSISTENT STORAGE (SAFE MIGRATION) -------------------
-const DB_FILE = path.join(__dirname, 'users.json');
-let userSessions = {};
+// ------------------- SUPABASE / POSTGRESQL DATABASE SETUP -------------------
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL ? { rejectUnauthorized: false } : false
+});
 
-function loadSessions() {
+async function initDatabase() {
+  if (!DATABASE_URL) {
+    console.error("FATAL ERROR: DATABASE_URL environment variable is missing!");
+    process.exit(1);
+  }
   try {
-    if (fs.existsSync(DB_FILE)) {
-      const rawData = fs.readFileSync(DB_FILE, 'utf8');
-      const parsed = JSON.parse(rawData);
-      
-      userSessions = {};
-      for (const [userId, userData] of Object.entries(parsed)) {
-        userSessions[userId] = {
-          balance: typeof userData.balance === 'number' ? userData.balance : 0,
-          state: userData.state || 'AWAITING_COUNTRY',
-          country: userData.country || null,
-          orders: Array.isArray(userData.orders) ? userData.orders : [],
-          transactions: Array.isArray(userData.transactions) ? userData.transactions : []
-        };
-      }
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        user_id BIGINT PRIMARY KEY,
+        balance NUMERIC DEFAULT 0,
+        state TEXT DEFAULT 'AWAITING_COUNTRY',
+        country JSONB DEFAULT NULL,
+        selected_service_query TEXT DEFAULT NULL,
+        chosen_provider TEXT DEFAULT NULL
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS orders (
+        id SERIAL PRIMARY KEY,
+        user_id BIGINT REFERENCES users(user_id),
+        order_id TEXT,
+        provider TEXT,
+        service_name TEXT,
+        phone_number TEXT,
+        price NUMERIC,
+        status TEXT,
+        date TEXT
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS transactions (
+        id SERIAL PRIMARY KEY,
+        user_id BIGINT REFERENCES users(user_id),
+        amount NUMERIC,
+        date TEXT
+      );
+    `);
+    console.log("Database tables successfully initialized.");
+  } catch (err) {
+    console.error("Error initializing database tables:", err.message);
+  }
+}
+
+initDatabase();
+
+async function getUserSession(userId) {
+  try {
+    let userRes = await pool.query('SELECT * FROM users WHERE user_id = $1', [userId]);
+    let user;
+    if (userRes.rows.length === 0) {
+      await pool.query(
+        'INSERT INTO users (user_id, balance, state, country, selected_service_query, chosen_provider) VALUES ($1, $2, $3, $4, $5, $6)',
+        [userId, 0, 'AWAITING_COUNTRY', null, null, null]
+      );
+      user = { user_id: userId, balance: 0, state: 'AWAITING_COUNTRY', country: null, selected_service_query: null, chosen_provider: null };
     } else {
-      userSessions = {};
+      user = userRes.rows[0];
     }
-  } catch (err) {
-    console.error("Error loading users.json, starting safe fallback:", err.message);
-    userSessions = {};
-  }
-}
 
-function saveSessions() {
-  try {
-    fs.writeFileSync(DB_FILE, JSON.stringify(userSessions, null, 2), 'utf8');
-  } catch (err) {
-    console.error("Error saving users.json:", err.message);
-  }
-}
+    const ordersRes = await pool.query('SELECT order_id AS "orderId", provider, service_name AS "serviceName", phone_number AS "phoneNumber", price, status, date FROM orders WHERE user_id = $1', [userId]);
+    const txRes = await pool.query('SELECT amount, date FROM transactions WHERE user_id = $1', [userId]);
 
-loadSessions();
-
-function getUserSession(userId) {
-  if (!userSessions[userId]) {
-    userSessions[userId] = { 
-      balance: 0, 
-      state: 'AWAITING_COUNTRY', 
-      country: null,
-      orders: [],
-      transactions: []
+    return {
+      balance: parseFloat(user.balance || 0),
+      state: user.state || 'AWAITING_COUNTRY',
+      country: user.country || null,
+      selectedServiceQuery: user.selected_service_query || null,
+      chosenProvider: user.chosen_provider || null,
+      orders: ordersRes.rows,
+      transactions: txRes.rows
     };
-    saveSessions();
+  } catch (err) {
+    console.error("Error getting user session from DB:", err.message);
+    return { balance: 0, state: 'AWAITING_COUNTRY', country: null, orders: [], transactions: [] };
   }
-  if (typeof userSessions[userId].balance !== 'number') userSessions[userId].balance = 0;
-  if (!Array.isArray(userSessions[userId].orders)) userSessions[userId].orders = [];
-  if (!Array.isArray(userSessions[userId].transactions)) userSessions[userId].transactions = [];
-  return userSessions[userId];
+}
+
+async function saveUserSession(userId, session) {
+  try {
+    await pool.query(
+      `UPDATE users SET balance = $1, state = $2, country = $3, selected_service_query = $4, chosen_provider = $5 WHERE user_id = $6`,
+      [session.balance, session.state, session.country ? JSON.stringify(session.country) : null, session.selectedServiceQuery, session.chosenProvider, userId]
+    );
+  } catch (err) {
+    console.error("Error saving user session to DB:", err.message);
+  }
+}
+
+async function addOrderToDb(userId, orderRecord) {
+  try {
+    await pool.query(
+      `INSERT INTO orders (user_id, order_id, provider, service_name, phone_number, price, status, date) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [userId, orderRecord.orderId, orderRecord.provider, orderRecord.serviceName, orderRecord.phoneNumber, orderRecord.price, orderRecord.status, orderRecord.date]
+    );
+  } catch (err) {
+    console.error("Error adding order to DB:", err.message);
+  }
+}
+
+async function updateOrderStatusInDb(orderId, newStatus) {
+  try {
+    await pool.query(`UPDATE orders SET status = $1 WHERE order_id = $2`, [newStatus, orderId]);
+  } catch (err) {
+    console.error("Error updating order status in DB:", err.message);
+  }
+}
+
+async function addTransactionToDb(userId, amount, date) {
+  try {
+    await pool.query(`INSERT INTO transactions (user_id, amount, date) VALUES ($1, $2, $3)`, [userId, amount, date]);
+  } catch (err) {
+    console.error("Error adding transaction to DB:", err.message);
+  }
 }
 
 const agent = new https.Agent({ keepAlive: true, rejectUnauthorized: false });
@@ -170,22 +237,23 @@ async function getJuicySmsServices(countryId) {
   }
 }
 
+// Fixed PlusVerify services payload & endpoint handling
 async function getPlusVerifyServices() {
   try {
     const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
-    if (!cleanApiKey) {
-      return [];
-    }
+    if (!cleanApiKey) return [];
 
-    const res = await axios.get(`${PLUSVERIFY_BASE_URL}/services.php`, {
+    const res = await axios.post(`${PLUSVERIFY_BASE_URL}/services.php`, {
+      api_key: cleanApiKey
+    }, {
       ...robustAxiosConfig,
-      params: { api_key: cleanApiKey }
+      headers: { ...robustAxiosConfig.headers, 'Content-Type': 'application/json' }
     });
 
     const data = res.data;
     let servicesList = [];
-    if (data && data.success && Array.isArray(data.otp_services)) {
-      servicesList = data.otp_services;
+    if (data && (data.success === true || data.status === 'success') && Array.isArray(data.services || data.otp_services)) {
+      servicesList = data.services || data.otp_services;
     } else if (Array.isArray(data)) {
       servicesList = data;
     }
@@ -216,10 +284,7 @@ async function getPlusVerifyPrice(serviceId, countryId) {
       country_id: countryId
     }, {
       ...robustAxiosConfig,
-      headers: {
-        ...robustAxiosConfig.headers,
-        'Content-Type': 'application/json'
-      }
+      headers: { ...robustAxiosConfig.headers, 'Content-Type': 'application/json' }
     });
 
     const data = res.data;
@@ -235,7 +300,6 @@ async function getPlusVerifyPrice(serviceId, countryId) {
 async function fetchCombinedServices(country) {
   const results = [];
   
-  // Provider 1: JuicySMS mapped to Server One
   const juicyMatch = JUICYSMS_COUNTRIES.find(c => c.id.toLowerCase() === country.id.toLowerCase());
   if (juicyMatch) {
     const juicyData = await getJuicySmsServices(juicyMatch.id);
@@ -256,9 +320,10 @@ async function fetchCombinedServices(country) {
     }
   }
 
-  // Provider 2: PlusVerify mapped to Server Two (Only checked if API key is present)
   const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
-  if (cleanApiKey) {
+  const plusMatch = PLUSVERIFY_COUNTRIES.find(c => c.id.toLowerCase() === country.id.toLowerCase());
+  
+  if (cleanApiKey && plusMatch) {
     const plusData = await getPlusVerifyServices();
     if (Array.isArray(plusData)) {
       for (const s of plusData) {
@@ -293,19 +358,16 @@ async function executeOrder(provider, serviceId, countryId) {
         country_id: countryId
       }, {
         ...robustAxiosConfig,
-        headers: {
-          ...robustAxiosConfig.headers,
-          'Content-Type': 'application/json'
-        }
+        headers: { ...robustAxiosConfig.headers, 'Content-Type': 'application/json' }
       });
       const data = res.data;
-      if (data && (data.success === true || data.status === 'success') && data.order_id && data.phone_number) {
+      if (data && (data.success === true || data.status === 'success') && (data.order_id || data.id) && (data.phone_number || data.number)) {
         return { 
           success: true, 
           data: { 
-            order_id: String(data.order_id), 
-            number: String(data.phone_number),
-            charge: parseFloat(data.charge || 0)
+            order_id: String(data.order_id || data.id), 
+            number: String(data.phone_number || data.number),
+            charge: parseFloat(data.charge || data.price || 0)
           } 
         };
       }
@@ -341,14 +403,12 @@ async function checkSmsCode(provider, orderId) {
         order_id: orderId
       }, {
         ...robustAxiosConfig,
-        headers: {
-          ...robustAxiosConfig.headers,
-          'Content-Type': 'application/json'
-        }
+        headers: { ...robustAxiosConfig.headers, 'Content-Type': 'application/json' }
       });
       const data = res.data;
-      if (data && (data.success === true || data.status === 'success' || data.status === 'COMPLETED') && data.sms_code) {
-        return { success: true, data: { code: String(data.sms_code) } };
+      if (data && (data.success === true || data.status === 'success' || data.status === 'COMPLETED' || data.sms_code)) {
+        const code = data.sms_code || data.code || data.otp;
+        if (code) return { success: true, data: { code: String(code) } };
       }
       return { success: false };
     } catch (err) {
@@ -382,10 +442,7 @@ async function cancelOrder(provider, orderId) {
         status: 8
       }, {
         ...robustAxiosConfig,
-        headers: {
-          ...robustAxiosConfig.headers,
-          'Content-Type': 'application/json'
-        }
+        headers: { ...robustAxiosConfig.headers, 'Content-Type': 'application/json' }
       });
     } catch (err) {}
   } else {
@@ -402,11 +459,12 @@ async function cancelOrder(provider, orderId) {
 // ------------------- BOT COMMANDS -------------------
 bot.start(async (ctx) => {
   const userId = ctx.from.id;
-  const session = getUserSession(userId);
+  const session = await getUserSession(userId);
   session.state = 'AWAITING_COUNTRY';
   session.country = null;
   session.selectedServiceQuery = null;
-  saveSessions();
+  session.chosenProvider = null;
+  await saveUserSession(userId, session);
 
   ctx.reply(
     `How far boss! 👋 Welcome to *MJ SMS*! ✨\n\n` +
@@ -421,17 +479,17 @@ bot.start(async (ctx) => {
   );
 });
 
-bot.command(['balance', 'bal'], (ctx) => {
+bot.command(['balance', 'bal'], async (ctx) => {
   const userId = ctx.from.id;
-  const session = getUserSession(userId);
+  const session = await getUserSession(userId);
   ctx.reply(`Boss your current balance na ₦${(session.balance || 0).toLocaleString()} ✨`, { parse_mode: 'Markdown' });
 });
 
-bot.command(['fund', 'deposit', 'wallet', 'topup'], (ctx) => {
+bot.command(['fund', 'deposit', 'wallet', 'topup'], async (ctx) => {
   const userId = ctx.from.id;
-  const session = getUserSession(userId);
+  const session = await getUserSession(userId);
   session.state = 'AWAITING_DEPOSIT_AMOUNT';
-  saveSessions();
+  await saveUserSession(userId, session);
 
   ctx.reply(
     `💳 *MJ SMS WALLET TOP-UP*\n\n` +
@@ -441,9 +499,9 @@ bot.command(['fund', 'deposit', 'wallet', 'topup'], (ctx) => {
   );
 });
 
-bot.command(['orders', 'history_orders'], (ctx) => {
+bot.command(['orders', 'history_orders'], async (ctx) => {
   const userId = ctx.from.id;
-  const session = getUserSession(userId);
+  const session = await getUserSession(userId);
   if (!session.orders || session.orders.length === 0) {
     ctx.reply(`📭 You don't have any order history yet. Buy a number to see it here!`, { parse_mode: 'Markdown' });
     return;
@@ -461,9 +519,9 @@ bot.command(['orders', 'history_orders'], (ctx) => {
   ctx.reply(`📦 *YOUR RECENT ORDER HISTORY*\n\n${recentOrders}`, { parse_mode: 'Markdown' });
 });
 
-bot.command(['history', 'funding_history', 'transactions'], (ctx) => {
+bot.command(['history', 'funding_history', 'transactions'], async (ctx) => {
   const userId = ctx.from.id;
-  const session = getUserSession(userId);
+  const session = await getUserSession(userId);
   if (!session.transactions || session.transactions.length === 0) {
     ctx.reply(`📭 No wallet funding history found yet.`, { parse_mode: 'Markdown' });
     return;
@@ -498,7 +556,7 @@ bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
   const rawText = ctx.message.text.trim();
   const lowerText = rawText.toLowerCase();
-  const session = getUserSession(userId);
+  const session = await getUserSession(userId);
 
   if (['support', 'customer care', 'speak to support', 'admin', 'contact'].some(k => lowerText.includes(k))) {
     sendCustomerSupportMessage(ctx);
@@ -512,7 +570,7 @@ bot.on('text', async (ctx) => {
 
   if (['fund', 'deposit', 'wallet', 'topup', 'top up'].some(k => lowerText.includes(k))) {
     session.state = 'AWAITING_DEPOSIT_AMOUNT';
-    saveSessions();
+    await saveUserSession(userId, session);
     ctx.reply(
       `💳 *MJ SMS WALLET TOP-UP*\n\n` +
       `💰 *Current Balance:* ₦${(session.balance || 0).toLocaleString()}\n\n` +
@@ -526,7 +584,8 @@ bot.on('text', async (ctx) => {
     session.state = 'AWAITING_COUNTRY';
     session.country = null;
     session.selectedServiceQuery = null;
-    saveSessions();
+    session.chosenProvider = null;
+    await saveUserSession(userId, session);
     ctx.reply(`No p boss! Which country you wan check now? (Type *US*, *NG*, *NL*, *UK*, *USA*, or *DE*)`, { parse_mode: 'Markdown' });
     return;
   }
@@ -541,7 +600,7 @@ bot.on('text', async (ctx) => {
     const payment = await initializePaystackPayment(`${userId}@mjsms.com`, amount, userId);
     if (payment.status && payment.data?.authorization_url) {
       session.state = 'IDLE';
-      saveSessions();
+      await saveUserSession(userId, session);
       ctx.reply(
         `💳 *PAYSTACK PAYMENT LINK READY*\n\n` +
         `Amount: *₦${amount.toLocaleString()}*\n\n` +
@@ -599,7 +658,7 @@ bot.on('text', async (ctx) => {
       session.country = matchedCountry;
       session.selectedServiceQuery = serviceQuery;
       session.state = 'AWAITING_SERVER_SELECTION';
-      saveSessions();
+      await saveUserSession(userId, session);
       await promptServerSelection(ctx, session);
       return;
     }
@@ -609,7 +668,7 @@ bot.on('text', async (ctx) => {
   if (matchedCountryDirect) {
     session.country = matchedCountryDirect;
     session.state = 'AWAITING_SERVICE';
-    saveSessions();
+    await saveUserSession(userId, session);
     ctx.reply(
       `Ehen! You select *${matchedCountryDirect.name}* 👌\n\n` +
       `Which app or service you wan verify? (e.g., _WhatsApp_, _Telegram_, _Google_)`,
@@ -621,7 +680,7 @@ bot.on('text', async (ctx) => {
   if (session.state === 'AWAITING_SERVICE' && session.country) {
     session.selectedServiceQuery = rawText;
     session.state = 'AWAITING_SERVER_SELECTION';
-    saveSessions();
+    await saveUserSession(userId, session);
     await promptServerSelection(ctx, session);
     return;
   }
@@ -643,7 +702,8 @@ async function promptServerSelection(ctx, session) {
 
   if (filtered.length === 0) {
     session.state = 'AWAITING_SERVICE';
-    saveSessions();
+    const userId = ctx.from.id;
+    await saveUserSession(userId, session);
     const topServices = availableServers.slice(0, 15).map(s => `• ${s.service_name}`).join('\n');
     ctx.reply(
       `Eya! No stock found for *${session.selectedServiceQuery}* right now. 💔\n\n` +
@@ -677,12 +737,12 @@ async function promptServerSelection(ctx, session) {
 bot.action(/^server\|(.+)\|(.+)$/, async (ctx) => {
   ctx.answerCbQuery();
   const userId = ctx.from.id;
-  const session = getUserSession(userId);
+  const session = await getUserSession(userId);
   const provider = ctx.match[1];
   const countryId = ctx.match[2];
 
   session.chosenProvider = provider;
-  saveSessions();
+  await saveUserSession(userId, session);
 
   const availableServers = await fetchCombinedServices(session.country);
   const q = (session.selectedServiceQuery || '').toLowerCase().trim();
@@ -707,7 +767,7 @@ bot.action(/^server\|(.+)\|(.+)$/, async (ctx) => {
   buttons.push([Markup.button.callback('⬅️ Back to Servers', 'back_to_servers')]);
 
   session.state = 'AWAITING_PRICE_SELECTION';
-  saveSessions();
+  await saveUserSession(userId, session);
 
   ctx.reply(
     `Ehen boss! See pricing for *${session.selectedServiceQuery}* on your chosen server:\n\nTap option below to buy:`,
@@ -718,7 +778,7 @@ bot.action(/^server\|(.+)\|(.+)$/, async (ctx) => {
 bot.action('back_to_servers', async (ctx) => {
   ctx.answerCbQuery();
   const userId = ctx.from.id;
-  const session = getUserSession(userId);
+  const session = await getUserSession(userId);
   if (session.country && session.selectedServiceQuery) {
     await promptServerSelection(ctx, session);
   } else {
@@ -730,7 +790,7 @@ bot.action('back_to_servers', async (ctx) => {
 bot.action(/^buy\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
   ctx.answerCbQuery();
   const userId = ctx.from.id;
-  const session = getUserSession(userId);
+  const session = await getUserSession(userId);
   const provider = ctx.match[1];
   const countryId = ctx.match[2];
   const serviceId = ctx.match[3];
@@ -772,8 +832,9 @@ bot.action(/^buy\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
       status: 'Pending Code',
       date: new Date().toLocaleString()
     };
-    session.orders.push(orderRecord);
-    saveSessions();
+    
+    await addOrderToDb(userId, orderRecord);
+    await saveUserSession(userId, session);
 
     ctx.reply(
       `🎉 *NUMBER PURCHASED SUCCESSFULLY!*\n\n` +
@@ -795,12 +856,7 @@ bot.action(/^buy\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
 
       if (checkRes.success && checkRes.data && checkRes.data.code) {
         clearInterval(intervalId);
-        
-        const foundOrder = session.orders.find(o => o.orderId === orderId);
-        if (foundOrder) {
-          foundOrder.status = `Completed (Code: ${checkRes.data.code})`;
-          saveSessions();
-        }
+        await updateOrderStatusInDb(orderId, `Completed (Code: ${checkRes.data.code})`);
 
         ctx.reply(
           `🔥🔥 *SMS CODE RECEIVED!* 🔥🔥\n\n` +
@@ -814,13 +870,10 @@ bot.action(/^buy\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
         clearInterval(intervalId);
         await cancelOrder(provider, orderId);
         if (calculatedNgnPrice > 0) {
-          session.balance += calculatedNgnPrice;
-          
-          const foundOrder = session.orders.find(o => o.orderId === orderId);
-          if (foundOrder) {
-            foundOrder.status = 'Canceled & Refunded (Timeout)';
-            saveSessions();
-          }
+          const freshSession = await getUserSession(userId);
+          freshSession.balance += calculatedNgnPrice;
+          await saveUserSession(userId, freshSession);
+          await updateOrderStatusInDb(orderId, 'Canceled & Refunded (Timeout)');
         }
         ctx.reply(`⏰ *Time Out:* Code no enter after 10 minutes. Order canceled and ₦${calculatedNgnPrice.toLocaleString()} returned to your balance!`);
       }
@@ -831,14 +884,15 @@ bot.action(/^buy\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
   }
 });
 
-bot.action('reset_flow', (ctx) => {
+bot.action('reset_flow', async (ctx) => {
   ctx.answerCbQuery();
   const userId = ctx.from.id;
-  const session = getUserSession(userId);
+  const session = await getUserSession(userId);
   session.state = 'AWAITING_COUNTRY';
   session.country = null;
   session.selectedServiceQuery = null;
-  saveSessions();
+  session.chosenProvider = null;
+  await saveUserSession(userId, session);
   ctx.reply(`No p boss! Which country you wan check now? (Type *US*, *NG*, *NL*, *UK* or *DE*)`);
 });
 
@@ -854,14 +908,12 @@ app.post('/webhook/paystack', async (req, res) => {
     const amountPaidNgn = data.amount / 100;
 
     if (userId) {
-      const session = getUserSession(userId);
+      const session = await getUserSession(userId);
       session.balance = (session.balance || 0) + amountPaidNgn;
+      await saveUserSession(userId, session);
       
-      session.transactions.push({
-        amount: amountPaidNgn,
-        date: new Date().toLocaleString()
-      });
-      saveSessions();
+      const dateStr = new Date().toLocaleString();
+      await addTransactionToDb(userId, amountPaidNgn, dateStr);
 
       try {
         await bot.telegram.sendMessage(
