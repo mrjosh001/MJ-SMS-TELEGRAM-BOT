@@ -7,11 +7,9 @@ const path = require('path');
 const { GoogleGenAI } = require('@google/genai');
 
 const app = express();
-
-// Express JSON Middleware for Paystack Webhooks & Requests
 app.use(express.json());
 
-// Environment Variables
+// ------------------- ENVIRONMENT VARIABLES -------------------
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SERVER_URL = process.env.RENDER_EXTERNAL_URL;
@@ -41,7 +39,7 @@ function loadSessions() {
     if (fs.existsSync(DB_FILE)) {
       const rawData = fs.readFileSync(DB_FILE, 'utf8');
       userSessions = JSON.parse(rawData);
-      console.log(`Loaded ${Object.keys(userSessions).length} user balances from storage.`);
+      console.log(`Loaded ${Object.keys(userSessions).length} user sessions from storage.`);
     } else {
       userSessions = {};
     }
@@ -61,24 +59,27 @@ function saveSessions() {
 
 loadSessions();
 
-// Custom HTTPS Agent to prevent connection dropouts
-const agent = new https.Agent({
-  keepAlive: true,
-  rejectUnauthorized: false
-});
+function getUserSession(userId) {
+  if (!userSessions[userId]) {
+    userSessions[userId] = { balance: 0, state: 'AWAITING_COUNTRY' };
+    saveSessions();
+  }
+  return userSessions[userId];
+}
 
+// Custom HTTPS Agent to prevent dropouts
+const agent = new https.Agent({ keepAlive: true, rejectUnauthorized: false });
 const robustAxiosConfig = {
   timeout: 15000,
   httpsAgent: agent,
   headers: {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     'Accept': 'application/json, text/plain, */*'
   }
 };
 
 // ------------------- DYNAMIC PROFIT MARGIN CONFIG -------------------
 const DEFAULT_MARGIN = 1.4;
-
 const SERVICE_PRICING_RULES = {
   'whatsapp': { minPrice: 6000, multiplier: 1.8 },
   'telegram': { minPrice: 3500, multiplier: 1.6 },
@@ -89,7 +90,6 @@ const SERVICE_PRICING_RULES = {
 function calculateRetailPrice(serviceName, providerPriceNgn) {
   const serviceKey = String(serviceName).toLowerCase();
   const rule = SERVICE_PRICING_RULES[serviceKey];
-
   let calculatedPrice = providerPriceNgn * DEFAULT_MARGIN;
   let minPrice = 0;
 
@@ -97,24 +97,12 @@ function calculateRetailPrice(serviceName, providerPriceNgn) {
     calculatedPrice = providerPriceNgn * (rule.multiplier || DEFAULT_MARGIN);
     minPrice = rule.minPrice || 0;
   }
-
   return Math.ceil(Math.max(calculatedPrice, minPrice));
 }
 
-// Helper to manage session state safely without overwriting balance
-function getUserSession(userId) {
-  if (!userSessions[userId]) {
-    userSessions[userId] = { balance: 0, state: 'AWAITING_COUNTRY' };
-    saveSessions();
-  }
-  return userSessions[userId];
-}
-
 // ------------------- PAYSTACK INTEGRATION -------------------
-
 async function initializePaystackPayment(email, amountNgn, userId) {
   if (!PAYSTACK_SECRET_KEY) {
-    console.error("PAYSTACK_SECRET_KEY is missing in Render Environment Variables.");
     return { status: false, message: "Paystack secret key is missing." };
   }
   try {
@@ -123,12 +111,7 @@ async function initializePaystackPayment(email, amountNgn, userId) {
       {
         email: email,
         amount: Math.round(amountNgn * 100),
-        metadata: {
-          telegram_id: String(userId),
-          custom_fields: [
-            { display_name: "Telegram User ID", variable_name: "telegram_id", value: String(userId) }
-          ]
-        }
+        metadata: { telegram_id: String(userId) }
       },
       {
         headers: {
@@ -144,8 +127,7 @@ async function initializePaystackPayment(email, amountNgn, userId) {
   }
 }
 
-// ------------------- LOGSDOMAIN INTEGRATION -------------------
-
+// ------------------- API PROVIDERS INTEGRATION -------------------
 async function getCountries() {
   const cleanKey = SMS_API_KEY ? SMS_API_KEY.trim() : null;
   if (!cleanKey) return [];
@@ -156,7 +138,6 @@ async function getCountries() {
     });
     return res.data?.success ? res.data.data : [];
   } catch (err) {
-    console.error("Error fetching countries:", err.response?.data || err.message);
     return [];
   }
 }
@@ -172,111 +153,49 @@ async function getLogsDomainServices(countryId) {
     if (!res.data || !res.data.data) return [];
     return Array.isArray(res.data.data) ? res.data.data : Object.values(res.data.data);
   } catch (err) {
-    console.error("LogsDomain Services Error:", err.response?.data || err.message);
     return [];
   }
-}
-
-// ------------------- ALLSMSVERIFY INTEGRATION -------------------
-
-let allSmsServerMapCache = null;
-
-async function getAllSmsServerMap() {
-  if (allSmsServerMapCache) return allSmsServerMapCache;
-  const cleanApiKey = SECOND_SMS_API_KEY ? SECOND_SMS_API_KEY.trim() : null;
-  if (!cleanApiKey) return {};
-
-  try {
-    const res = await axios.get(ALLSMSVERIFY_BASE_URL, {
-      ...robustAxiosConfig,
-      params: { action: 'getCountries', api_key: cleanApiKey }
-    });
-    if (res.data && typeof res.data === 'object') {
-      allSmsServerMapCache = res.data;
-      return allSmsServerMapCache;
-    }
-  } catch (err) {
-    console.error("Error fetching AllSMSVerify countries map:", err.message);
-  }
-  return {};
 }
 
 async function getAllSmsVerifyServices(countryShortCode, countryName) {
   const cleanApiKey = SECOND_SMS_API_KEY ? SECOND_SMS_API_KEY.trim() : null;
   if (!cleanApiKey) return [];
 
-  const serverMap = await getAllSmsServerMap();
-  let targetServerId = null;
-
-  if (serverMap && typeof serverMap === 'object') {
-    for (const [serverId, info] of Object.entries(serverMap)) {
-      const sName = (info.name || info.title || info.country || '').toLowerCase();
-      const sCode = (info.code || info.short || '').toLowerCase();
-      if (
-        (countryName && sName.includes(countryName.toLowerCase())) ||
-        (countryShortCode && sCode === countryShortCode.toLowerCase())
-      ) {
-        targetServerId = serverId;
-        break;
-      }
-    }
-  }
-
-  if (!targetServerId) targetServerId = 1;
-
   try {
     const res = await axios.get(ALLSMSVERIFY_BASE_URL, {
       ...robustAxiosConfig,
-      params: {
-        action: 'getServices',
-        api_key: cleanApiKey,
-        country: targetServerId
-      }
+      params: { action: 'getServices', api_key: cleanApiKey, country: 1 }
     });
 
     const data = res.data;
-    const respString = String(data).trim();
-
-    if (respString.includes('BAD_KEY') || respString.includes('BAD_COUNTRY') || respString.includes('<!DOCTYPE html>')) {
-      return [];
-    }
-
-    if (Array.isArray(data)) return data;
-
-    if (data && typeof data === 'object') {
+    if (data && typeof data === 'object' && !Array.isArray(data)) {
       return Object.entries(data).map(([key, item]) => {
         if (typeof item === 'object') {
           return {
             service_id: key,
             service_name: item.name || item.title || key,
-            stock: item.count || item.stock || item.available || 10,
+            stock: item.count || item.stock || 10,
             price: item.cost || item.price || 0,
-            server_id: targetServerId
+            server_id: '1'
           };
         }
         return null;
       }).filter(Boolean);
     }
-
     return [];
   } catch (err) {
-    console.error("AllSMSVerify Services Error:", err.message);
     return [];
   }
 }
 
-// ------------------- COMBINED PROVIDER DISPATCHER -------------------
-
 async function fetchCombinedServices(country) {
   const results = [];
 
-  // 1. LogsDomain
   const logsData = await getLogsDomainServices(country.id);
   if (Array.isArray(logsData)) {
     logsData.forEach(s => {
       const serviceName = s.service_name || s.name || s.title || '';
       const serviceId = s.service_id || s.id || serviceName;
-
       let ops = s.operators && s.operators.length ? s.operators : [{
         id: 'default',
         name: s.operator_name || 'Server 1',
@@ -301,16 +220,15 @@ async function fetchCombinedServices(country) {
     });
   }
 
-  // 2. AllSMSVerify
   const allSmsData = await getAllSmsVerifyServices(country.short, country.name);
   if (Array.isArray(allSmsData)) {
     allSmsData.forEach(s => {
-      const serviceName = s.service_name || s.name || s.title || s.service || '';
-      const stock = s.stock || s.available_quantity || s.count || 0;
+      const serviceName = s.service_name || s.name || '';
+      const stock = s.stock || 0;
       if (stock > 0) {
         results.push({
           provider: 'allsmsverify',
-          service_id: s.service_id || s.code || serviceName,
+          service_id: s.service_id || serviceName,
           service_name: serviceName,
           operator_id: s.server_id || '1',
           server_name: s.server_name || 'Server (AllSMS)',
@@ -337,26 +255,36 @@ function matchesServiceQuery(serviceName, query) {
   return false;
 }
 
-// ------------------- GEMINI AI COMPLAINT & CONVERSATION ENGINE -------------------
-
+// ------------------- GEMINI AI WITH BUSINESS KNOWLEDGE -------------------
 async function handleAIResponse(userMessage, session) {
   if (!ai) return null;
   try {
-    const prompt = `You are Elsa, the warm, polite, and helpful Nigerian AI customer assistant for "MJ SMS" (a Telegram bot providing virtual numbers for SMS verification).
+    const prompt = `You are Elsa, the official AI customer support assistant for "MJ SMS" (a Telegram bot that sells virtual phone numbers for receiving SMS verification codes like WhatsApp, Telegram, Facebook, etc.).
 
-User Message: "${userMessage}"
-User Current Saved Balance: ₦${session.balance || 0}
-Customer Support WhatsApp Link: https://wa.me/qr/XM6ORO7UCYTXI1
+=== MJ SMS BUSINESS DESCRIPTION & SYSTEM RULES ===
+1. SERVICES:
+   - We sell virtual numbers across multiple countries (USA, UK, Nigeria, etc.) for app verifications.
+   - Prices vary depending on the country and app requested.
 
-Your Instructions:
-- Speak naturally in polite, warm Nigerian English / light Pidgin. Be empathetic and respectful.
-- If the user is asking about a balance discrepancy, balance change, missing funds, or making a complaint:
-  1. Acknowledge their concern immediately with zero defensiveness.
-  2. Clearly mention that their balance recorded on the system right now is ₦${session.balance || 0}.
-  3. Reassure them that if there's any payment delay or mistake, customer care will rectify it promptly.
-  4. Invite them to click the support button below to message admin on WhatsApp directly with their payment receipt or proof.
-- Keep your response brief, friendly, and clear (max 3 short sentences).
-- Do NOT output raw bot commands.`;
+2. WALLET & BALANCES:
+   - Users top up their balance using Paystack (/fund).
+   - Once Paystack confirms payment, funds are automatically credited to their wallet balance.
+   - Current System Record for this user's balance: ₦${session.balance || 0}.
+
+3. REFUNDS & TIMEOUTS:
+   - If a number is generated but no SMS code arrives within 10 minutes, the order cancels automatically.
+   - The user is NOT charged if no SMS code arrives.
+
+4. USER COMPLAINT RULES (STRICT):
+   - If the user asks why their balance changed, dropped, or complains about missing funds:
+     * Speak politely and calmly in warm, friendly Nigerian English or light Pidgin.
+     * Tell them directly what their recorded balance is right now (₦${session.balance || 0}).
+     * Reassure them that if there was any discrepancy or payment delay, customer care will manually audit their Paystack transaction and credit them immediately.
+     * Direct them to tap the WhatsApp Support button below to send their payment proof/receipt to support.
+   - Do NOT give generic automated standard menu responses.
+   - Directly answer their specific concern in 2 to 3 concise, friendly sentences.
+
+USER MESSAGE: "${userMessage}"`;
 
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
@@ -370,8 +298,7 @@ Your Instructions:
   }
 }
 
-// ------------------- PURCHASE & POLLING EXECUTION -------------------
-
+// ------------------- PURCHASE LOGIC -------------------
 async function executePurchase(provider, countryId, countryShort, serviceId, operatorId) {
   if (provider === 'a' || provider === 'allsmsverify') {
     try {
@@ -380,12 +307,7 @@ async function executePurchase(provider, countryId, countryShort, serviceId, ope
 
       const res = await axios.get(ALLSMSVERIFY_BASE_URL, {
         ...robustAxiosConfig,
-        params: {
-          action: 'getNumber',
-          api_key: cleanApiKey,
-          service: serviceId,
-          country: serverId
-        }
+        params: { action: 'getNumber', api_key: cleanApiKey, service: serviceId, country: serverId }
       });
 
       const respText = String(res.data).trim();
@@ -393,9 +315,9 @@ async function executePurchase(provider, countryId, countryShort, serviceId, ope
         const parts = respText.split(':');
         return { success: true, data: { order_id: parts[1], number: parts[2] } };
       }
-      return { success: false, message: respText || 'AllSMSVerify stock unavailable.' };
+      return { success: false, message: respText || 'Server stock unavailable.' };
     } catch (err) {
-      return { success: false, message: 'AllSMSVerify request failed.' };
+      return { success: false, message: 'Request failed.' };
     }
   } else {
     try {
@@ -413,7 +335,7 @@ async function executePurchase(provider, countryId, countryShort, serviceId, ope
       });
       return res.data;
     } catch (err) {
-      return err.response?.data || { success: false, message: 'Logsdomain purchase failed.' };
+      return err.response?.data || { success: false, message: 'Purchase failed.' };
     }
   }
 }
@@ -464,8 +386,7 @@ async function cancelOrder(provider, orderId) {
   }
 }
 
-// ------------------- ELSA BOT COMMANDS & FLOWS -------------------
-
+// ------------------- BOT COMMANDS -------------------
 bot.start((ctx) => {
   const userId = ctx.from.id;
   const session = getUserSession(userId);
@@ -502,8 +423,8 @@ bot.command(['support', 'help', 'customercare'], (ctx) => sendCustomerSupportMes
 function sendCustomerSupportMessage(ctx) {
   ctx.reply(
     `💬 *MJ SMS CUSTOMER CARE*\n\n` +
-    `Need help with an order, wallet funding, or custom numbers?\n` +
-    `Tap the button below to reach our support on WhatsApp: 👇`,
+    `Need help with an order, wallet funding, or balance issues?\n` +
+    `Tap the button below to message customer support on WhatsApp: 👇`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
@@ -513,22 +434,20 @@ function sendCustomerSupportMessage(ctx) {
   );
 }
 
-// ------------------- TEXT MESSAGE HANDLER -------------------
-
+// ------------------- TEXT ROUTING ENGINE -------------------
 bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
   const rawText = ctx.message.text.trim();
   const lowerText = rawText.toLowerCase();
-
   const session = getUserSession(userId);
 
-  // A. Support Keywords Trigger
+  // 1. Direct Support Keywords
   if (['support', 'customer care', 'speak to support', 'admin', 'contact'].some(k => lowerText.includes(k))) {
     sendCustomerSupportMessage(ctx);
     return;
   }
 
-  // B. Exact Deposit/Fund Keywords
+  // 2. Fund/Deposit Direct Commands
   if (['fund', 'deposit', 'topup', 'top up'].includes(lowerText)) {
     session.state = 'AWAITING_DEPOSIT_AMOUNT';
     saveSessions();
@@ -541,7 +460,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // C. Fund Command with inline amount (e.g., "fund 1000")
+  // 3. Fund with inline amount ("fund 1000")
   const fundMatch = lowerText.match(/^(?:fund|deposit|topup)\s+(\d+)$/i);
   if (fundMatch) {
     const amount = parseInt(fundMatch[1]);
@@ -549,128 +468,57 @@ bot.on('text', async (ctx) => {
       ctx.reply("Minimum deposit amount is ₦100.");
       return;
     }
-
-    ctx.reply(`Generating your Paystack payment link... ⏳`);
+    ctx.reply(`Generating payment link... ⏳`);
     const payment = await initializePaystackPayment(`${userId}@mjsms.com`, amount, userId);
-
     if (payment.status && payment.data?.authorization_url) {
       session.state = 'IDLE';
       saveSessions();
       ctx.reply(
         `💳 *PAYSTACK PAYMENT LINK READY*\n\n` +
         `Amount: *₦${amount.toLocaleString()}*\n\n` +
-        `Tap the button below to complete payment. Your wallet will be credited automatically once done! 👇`,
+        `Tap below to complete payment: 👇`,
         {
           parse_mode: 'Markdown',
-          ...Markup.inlineKeyboard([
-            [Markup.button.url('💳 Pay Now via Paystack', payment.data.authorization_url)]
-          ])
+          ...Markup.inlineKeyboard([[Markup.button.url('💳 Pay Now via Paystack', payment.data.authorization_url)]])
         }
       );
     } else {
-      ctx.reply(`❌ Could not generate payment link. Please try again.`);
+      ctx.reply(`❌ Could not generate payment link.`);
     }
     return;
   }
 
-  // D. Pending Deposit Amount Input
+  // 4. Deposit Amount Pending Input
   if (session.state === 'AWAITING_DEPOSIT_AMOUNT') {
     const amount = parseInt(rawText.replace(/[^0-9]/g, ''));
     if (isNaN(amount) || amount < 100) {
       ctx.reply(`Please enter a valid amount (minimum ₦100). E.g. *1000*`);
       return;
     }
-
-    ctx.reply(`Generating your Paystack payment link... ⏳`);
+    ctx.reply(`Generating payment link... ⏳`);
     const payment = await initializePaystackPayment(`${userId}@mjsms.com`, amount, userId);
-
     if (payment.status && payment.data?.authorization_url) {
       session.state = 'IDLE';
       saveSessions();
       ctx.reply(
         `💳 *PAYSTACK PAYMENT LINK READY*\n\n` +
         `Amount: *₦${amount.toLocaleString()}*\n\n` +
-        `Tap the button below to complete payment. Your wallet will be credited automatically once done! 👇`,
+        `Tap below to complete payment: 👇`,
         {
           parse_mode: 'Markdown',
-          ...Markup.inlineKeyboard([
-            [Markup.button.url('💳 Pay Now via Paystack', payment.data.authorization_url)]
-          ])
+          ...Markup.inlineKeyboard([[Markup.button.url('💳 Pay Now via Paystack', payment.data.authorization_url)]])
         }
       );
     } else {
-      ctx.reply(`❌ *Payment Error:* Could not generate payment link.`);
+      ctx.reply(`❌ Could not generate payment link.`);
     }
     return;
   }
 
-  // E. Detect Natural Sentences & Complaints (routed to Gemini AI)
-  const isDirectOrderIntent = ['whatsapp', 'telegram', 'facebook', 'usa', 'nigeria', 'uk', 'us', 'gb'].some(k => lowerText.includes(k));
-  
-  if (!isDirectOrderIntent && (lowerText.includes('balance') || lowerText.includes('change') || lowerText.includes('why') || lowerText.includes('my previous') || rawText.length > 5)) {
-    const aiResponseText = await handleAIResponse(rawText, session);
-    if (aiResponseText) {
-      ctx.reply(aiResponseText, {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-          [Markup.button.url('💬 Chat Customer Care on WhatsApp', 'https://wa.me/qr/XM6ORO7UCYTXI1')]
-        ])
-      });
-      // Reset state back to clean country waiting state
-      session.state = 'AWAITING_COUNTRY';
-      saveSessions();
-      return;
-    }
-  }
-
-  // F. Service Query Intent ("Which one dey available?")
-  const isAvailableQuery = ['available', 'which one', 'what is available', 'list', 'show', 'which app'].some(k => lowerText.includes(k));
-
-  if (isAvailableQuery) {
-    if (!session.country) {
-      ctx.reply(`Please tell me which country you want to check first! (e.g., _United States_, _Nigeria_)`, { parse_mode: 'Markdown' });
-      session.state = 'AWAITING_COUNTRY';
-      saveSessions();
-      return;
-    }
-
-    ctx.reply(`Checking all available services for *${session.country.name}*... 🔎`, { parse_mode: 'Markdown' });
-    const available = await fetchCombinedServices(session.country);
-
-    if (!available || available.length === 0) {
-      ctx.reply(`Eya! No services are available right now for *${session.country.name}*. Please try another country!`, { parse_mode: 'Markdown' });
-      return;
-    }
-
-    const uniqueServices = Array.from(new Set(available.map(s => s.service_name))).slice(0, 15);
-
-    let message = `Here are available services for *${session.country.name}* right now: 👇\n\n`;
-    uniqueServices.forEach((srv) => {
-      message += `• *${srv}*\n`;
-    });
-    message += `\nType the name of any app above to select a server and buy!`;
-
-    ctx.reply(message, { parse_mode: 'Markdown' });
-    session.state = 'AWAITING_SERVICE';
-    saveSessions();
-    return;
-  }
-
-  // G. Standard Greetings
-  if (['hi', 'hello', 'hey', 'awfa', 'howfar', 'how far', 'xup'].some(g => lowerText.includes(g))) {
-    ctx.reply(
-      `How far my boss! 😊 My name na *Elsa*, welcome to *MJ SMS*!\n` +
-      `Have a happy day today! ✨\n\n` +
-      `Which country virtual number you wan buy today? Just drop the country name for me.`
-    );
-    session.state = 'AWAITING_COUNTRY';
-    saveSessions();
-    return;
-  }
-
+  // 5. Check if text matches Country or Combined Order (e.g. "USA WhatsApp", "United States")
   const countries = await getCountries();
 
-  // H. Combined Input Handling ("USA WhatsApp")
+  // 5A. Combined Input Handling ("USA WhatsApp")
   if (countries.length > 0) {
     const words = lowerText.split(/\s+/);
     let matchedCountry = null;
@@ -700,48 +548,54 @@ bot.on('text', async (ctx) => {
     }
   }
 
-  // I. Country Selection Logic
-  if (session.state === 'AWAITING_COUNTRY' || session.state === 'IDLE') {
-    const matchedCountry = countries.find(c => 
-      c.name.toLowerCase().includes(lowerText) || 
-      c.short.toLowerCase() === lowerText ||
-      (lowerText === 'usa' && c.short.toLowerCase() === 'us') ||
-      (lowerText === 'uk' && c.short.toLowerCase() === 'gb')
-    );
+  // 5B. Single Country Input ("United States", "Nigeria")
+  const matchedCountryDirect = countries.find(c => 
+    c.name.toLowerCase() === lowerText || 
+    c.short.toLowerCase() === lowerText ||
+    (lowerText === 'usa' && c.short.toLowerCase() === 'us') ||
+    (lowerText === 'uk' && c.short.toLowerCase() === 'gb')
+  );
 
-    if (matchedCountry) {
-      session.country = matchedCountry;
-      session.state = 'AWAITING_SERVICE';
-      saveSessions();
-      ctx.reply(
-        `Ehen! You select *${matchedCountry.name}* 👌\n\n` +
-        `Which app or service you wan verify? (e.g. _WhatsApp_, _Telegram_, _Facebook_)`,
-        { parse_mode: 'Markdown' }
-      );
-    } else {
-      ctx.reply(`I no find "*${rawText}*" for available countries boss. Try *United States*, *United Kingdom*, or *Nigeria*!`, { parse_mode: 'Markdown' });
-    }
+  if (matchedCountryDirect) {
+    session.country = matchedCountryDirect;
+    session.state = 'AWAITING_SERVICE';
+    saveSessions();
+    ctx.reply(
+      `Ehen! You select *${matchedCountryDirect.name}* 👌\n\n` +
+      `Which app or service you wan verify? (e.g. _WhatsApp_, _Telegram_, _Facebook_)`,
+      { parse_mode: 'Markdown' }
+    );
     return;
   }
 
-  // J. Service Selection Logic
-  if (session.state === 'AWAITING_SERVICE') {
-    const newCountryMatch = countries.find(c => 
-      c.name.toLowerCase() === lowerText || 
-      c.short.toLowerCase() === lowerText ||
-      (lowerText === 'usa' && c.short.toLowerCase() === 'us')
-    );
-
-    if (newCountryMatch) {
-      session.country = newCountryMatch;
-      saveSessions();
-      ctx.reply(`Switched country to *${newCountryMatch.name}* 👌\n\nWhich app or service you wan verify?`, { parse_mode: 'Markdown' });
+  // 5C. Service Query when state is AWAITING_SERVICE
+  if (session.state === 'AWAITING_SERVICE' && session.country) {
+    const knownApps = ['whatsapp', 'telegram', 'facebook', 'bamboo', 'instagram', 'tiktok', 'twitter', 'x', 'google', 'gmail'];
+    if (knownApps.some(app => lowerText.includes(app)) || rawText.length < 20) {
+      ctx.reply(`Oya wait make Elsa check available servers for *${rawText}* (${session.country.name})... 🔎`, { parse_mode: 'Markdown' });
+      await processServiceSelection(ctx, session, rawText);
       return;
     }
-
-    ctx.reply(`Oya wait make Elsa check available servers for *${rawText}* (${session.country.name})... 🔎`, { parse_mode: 'Markdown' });
-    await processServiceSelection(ctx, session, rawText);
   }
+
+  // 6. ROUTE TO AI FOR COMPLAINTS, BALANCE QUESTIONS, AND CHATTER ONLY
+  const isComplaintOrQuestion = ['balance', 'change', 'why', 'previous', 'deduct', 'error', 'wrong', 'issue', 'missing', 'money', 'help'].some(k => lowerText.includes(k));
+
+  if (isComplaintOrQuestion || lowerText.includes('?')) {
+    const aiResponseText = await handleAIResponse(rawText, session);
+    if (aiResponseText) {
+      ctx.reply(aiResponseText, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.url('💬 Chat Customer Care on WhatsApp', 'https://wa.me/qr/XM6ORO7UCYTXI1')]
+        ])
+      });
+      return;
+    }
+  }
+
+  // Fallback default
+  ctx.reply(`Please state which country virtual number you need (e.g., _United States_, _Nigeria_).`, { parse_mode: 'Markdown' });
 });
 
 async function processServiceSelection(ctx, session, serviceQuery) {
@@ -757,7 +611,6 @@ async function processServiceSelection(ctx, session, serviceQuery) {
     const finalPrice = calculateRetailPrice(srv.service_name, srv.price);
     const pCode = srv.provider === 'allsmsverify' ? 'a' : 'l';
     const opCode = srv.operator_id || '0';
-    
     const cbData = `b|${pCode}|${session.country.id}|${srv.service_id}|${opCode}`;
 
     return [Markup.button.callback(`🖥️ ${srv.server_name} (${srv.stock} left) — ₦${finalPrice}`, cbData)];
@@ -766,14 +619,13 @@ async function processServiceSelection(ctx, session, serviceQuery) {
   buttons.push([Markup.button.callback('🔄 Choose Another Country', 'reset_flow')]);
 
   ctx.reply(
-    `Ehen boss! For *${serviceQuery}* (${session.country.name}), see the available servers below:\n\n` +
-    `Which server or route you wan use buy the number? Tap option below:`,
+    `Ehen boss! For *${serviceQuery}* (${session.country.name}), see the available options below:\n\n` +
+    `Tap option below to buy:`,
     { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
   );
 }
 
-// ------------------- BUTTON ACTIONS -------------------
-
+// ------------------- BUTTON HANDLERS -------------------
 bot.action(/^b\|(.+)\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
   ctx.answerCbQuery();
   const pCode = ctx.match[1];
@@ -797,8 +649,8 @@ bot.action(/^b\|(.+)\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
     ctx.reply(
       `🎉 *NUMBER PURCHASED SUCCESSFULLY!*\n\n` +
       `📞 *Phone Number:* \`${phoneNumber}\`\n\n` +
-      `👉 Copy the number above and enter it into your app.\n` +
-      `⏳ Elsa is waiting for your SMS code... (I go send am here automatically as e enter)`,
+      `👉 Copy the number above into your app.\n` +
+      `⏳ Elsa is waiting for your SMS code...`,
       { parse_mode: 'Markdown' }
     );
 
@@ -815,18 +667,18 @@ bot.action(/^b\|(.+)\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
           `🔥🔥 *SMS CODE RECEIVED!* 🔥🔥\n\n` +
           `📞 *Number:* \`${phoneNumber}\`\n` +
           `🔑 *Verification Code:* \`${checkRes.data.code}\`\n\n` +
-          `Thank you for using *MJ SMS*! Have a happy day! ✨`,
+          `Thank you for using *MJ SMS*! ✨`,
           { parse_mode: 'Markdown' }
         );
       } else if (pollCount >= maxPolls) {
         clearInterval(intervalId);
         await cancelOrder(provider, orderId);
-        ctx.reply(`⏰ *Time Out:* Code no enter after 10 minutes. Order don cancel automatically!`);
+        ctx.reply(`⏰ *Time Out:* Code no enter after 10 minutes. Order canceled!`);
       }
     }, 7000);
 
   } else {
-    ctx.reply(`❌ *Purchase Failed:* ${response.message || 'Server out of stock or insufficient balance.'}`);
+    ctx.reply(`❌ *Purchase Failed:* ${response.message || 'Server out of stock.'}`);
   }
 });
 
@@ -839,15 +691,12 @@ bot.action('reset_flow', (ctx) => {
   ctx.reply(`No p boss! Which country number you wan check now?`);
 });
 
-// ------------------- WEBHOOKS & EXPRESS SERVER SETUP -------------------
-
+// ------------------- WEBHOOKS & SERVER START -------------------
 const TELEGRAM_WEBHOOK_PATH = `/webhook/telegram`;
 app.use(bot.webhookCallback(TELEGRAM_WEBHOOK_PATH));
 
-// Paystack Webhook Handler
 app.post('/webhook/paystack', async (req, res) => {
   const event = req.body;
-
   if (event && event.event === 'charge.success') {
     const data = event.data;
     const userId = data.metadata?.telegram_id;
@@ -863,33 +712,28 @@ app.post('/webhook/paystack', async (req, res) => {
           userId,
           `🎉 *PAYMENT SUCCESSFUL!*\n\n` +
           `💳 *Amount Credited:* ₦${amountPaidNgn.toLocaleString()}\n` +
-          `💰 *New Wallet Balance:* ₦${session.balance.toLocaleString()}\n\n` +
-          `You can now select a country and buy virtual numbers!`,
+          `💰 *New Balance:* ₦${session.balance.toLocaleString()}\n\n` +
+          `You can now order numbers!`,
           { parse_mode: 'Markdown' }
         );
       } catch (err) {
-        console.error("Failed to notify user via Telegram:", err.message);
+        console.error("Paystack notification error:", err.message);
       }
     }
   }
-
   res.sendStatus(200);
 });
 
-app.get('/', (req, res) => res.send('MJ SMS Bot (Elsa) is Active!'));
+app.get('/', (req, res) => res.send('MJ SMS Bot (Elsa) Active!'));
 
 app.listen(PORT, async () => {
   console.log(`Server listening on port ${PORT}`);
   if (SERVER_URL) {
-    const fullWebhookUrl = `${SERVER_URL}${TELEGRAM_WEBHOOK_PATH}`;
     try {
-      await bot.telegram.setWebhook(fullWebhookUrl);
-      console.log(`Telegram Webhook set to: ${fullWebhookUrl}`);
+      await bot.telegram.setWebhook(`${SERVER_URL}${TELEGRAM_WEBHOOK_PATH}`);
+      console.log(`Webhook updated: ${SERVER_URL}${TELEGRAM_WEBHOOK_PATH}`);
     } catch (err) {
       console.error("Webhook error:", err.message);
     }
-  }
-});
-
   }
 });
