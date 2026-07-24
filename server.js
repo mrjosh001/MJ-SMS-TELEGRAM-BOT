@@ -176,13 +176,15 @@ const JUICYSMS_COUNTRIES = [
   { id: 'NL', name: 'Netherlands (NL)', short: 'nl' },
   { id: 'UK', name: 'United Kingdom (UK)', short: 'uk' },
   { id: 'USA', name: 'United States (USA)', short: 'usa' },
-  { id: 'DE', name: 'Germany (DE)', short: 'de' }
+  { id: 'DE', name: 'Germany (DE)', short: 'de' },
+  { id: 'CA', name: 'Canada (CA)', short: 'ca' }
 ];
 
 const SMSOTPSTORES_COUNTRIES = [
   { id: 'us', name: 'United States (US)', short: 'us' },
   { id: 'ng', name: 'Nigeria (NG)', short: 'ng' },
-  { id: 'uk', name: 'United Kingdom (UK)', short: 'uk' }
+  { id: 'uk', name: 'United Kingdom (UK)', short: 'uk' },
+  { id: 'ca', name: 'Canada (CA)', short: 'ca' }
 ];
 
 const JUICYSMS_BASE_URL = 'https://juicysms.com/api';
@@ -257,7 +259,7 @@ async function fetchCombinedServices(country) {
           provider: 'juicysms',
           service_id: s.service_id,
           service_name: s.service_name,
-          server_label: 'Server One (Juicy)',
+          server_label: 'Server One',
           stock: s.stock || 10,
           price: s.price,
           is_ngn: false
@@ -276,7 +278,7 @@ async function fetchCombinedServices(country) {
           provider: 'smsotpstores',
           service_id: s.service_id,
           service_name: s.service_name,
-          server_label: 'Server Two (OTPStores)',
+          server_label: 'Server Two',
           stock: s.stock || 100,
           price: s.price,
           is_ngn: true
@@ -397,7 +399,7 @@ bot.start(async (ctx) => {
     `How far boss! 👋 Welcome to *MJ SMS*! ✨\n\n` +
     `💰 *Your Balance:* ₦${(session.balance || 0).toLocaleString()}\n\n` +
     `I dey here to help you get virtual numbers fast fast! 🚀\n` +
-    `• Type a country code (e.g., _US_, _NG_, _NL_, _UK_)\n` +
+    `• Type a country code (e.g., _US_, _NG_, _NL_, _UK_, _CA_)\n` +
     `• Type */orders* to view your order history & tracking IDs!\n` +
     `• Type */history* to check your wallet funding records!\n` +
     `• Type */fund* to top up your wallet balance!\n` +
@@ -512,7 +514,7 @@ bot.on('text', async (ctx) => {
     session.selectedServiceQuery = null;
     session.chosenProvider = null;
     await saveUserSession(userId, session);
-    ctx.reply(`No p boss! Which country you wan check now? (Type *US*, *NG*, *NL*, *UK*, or *DE*)`, { parse_mode: 'Markdown' });
+    ctx.reply(`No p boss! Which country you wan check now? (Type *US*, *NG*, *NL*, *UK*, *CA*, or *DE*)`, { parse_mode: 'Markdown' });
     return;
   }
 
@@ -560,6 +562,7 @@ bot.on('text', async (ctx) => {
              (cleanInput.includes('uk') && cId === 'uk') ||
              (cleanInput.includes('nl') && cId === 'nl') ||
              (cleanInput.includes('de') && cId === 'de') ||
+             (cleanInput.includes('ca') && cId === 'ca') ||
              (cleanInput.includes('ng') && cId === 'ng');
     });
   };
@@ -651,7 +654,7 @@ async function promptServerSelection(ctx, session) {
 
   const serverButtons = [];
   uniqueServersMap.forEach((srv, label) => {
-    serverButtons.push([Markup.button.callback(`🖥️ ${label} (${countryName})`, `server|${srv.provider}|${countryId}`)]);
+    serverButtons.push([Markup.button.callback(`🖥️ ${label}`, `server|${srv.provider}|${countryId}`)]);
   });
   serverButtons.push([Markup.button.callback('🔄 Choose Another Country', 'reset_flow')]);
 
@@ -822,7 +825,7 @@ bot.action('reset_flow', async (ctx) => {
   session.selectedServiceQuery = null;
   session.chosenProvider = null;
   await saveUserSession(userId, session);
-  ctx.reply(`No p boss! Which country you wan check now? (Type *US*, *NG*, *NL*, *UK* or *DE*)`);
+  ctx.reply(`No p boss! Which country you wan check now? (Type *US*, *NG*, *NL*, *UK*, *CA* or *DE*)`);
 });
 
 const TELEGRAM_WEBHOOK_PATH = `/webhook/telegram`;
