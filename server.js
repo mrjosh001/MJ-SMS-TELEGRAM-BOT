@@ -136,13 +136,13 @@ const USD_TO_NGN_RATE = 1500;
 function calculateFinalPrice(rawPrice, isAlreadyNgn = false) {
   const numericPrice = parseFloat(rawPrice) || 0;
   const baseCostNgn = isAlreadyNgn ? numericPrice : (numericPrice * USD_TO_NGN_RATE);
-  if (baseCostNgn <= 0) return 3500; // safety fallback
+  if (baseCostNgn <= 0) return 3000;
 
   if (baseCostNgn < 3000) {
-    // If supplier cost is less than 3k, add mandatory ₦3,500 markup
-    return Math.ceil(baseCostNgn + 3500);
+    // Add a flat ₦3,000 markup if supplier cost is less than ₦3,000
+    return Math.ceil(baseCostNgn + 3000);
   } else {
-    // Otherwise, apply 80% profit margin markup (Cost * 1.8)
+    // Apply 80% profit margin markup (Cost * 1.8) for ₦3,000 and above
     return Math.ceil(baseCostNgn * 1.8);
   }
 }
@@ -200,7 +200,9 @@ const COUNTRY_ALIASES = {
   'germany': { id: 'de', name: 'Germany (DE)' },
   'de': { id: 'de', name: 'Germany (DE)' },
   'france': { id: 'fr', name: 'France (FR)' },
-  'fr': { id: 'fr', name: 'France (FR)' }
+  'fr': { id: 'fr', name: 'France (FR)' },
+  'poland': { id: 'pl', name: 'Poland (PL)' },
+  'pl': { id: 'pl', name: 'Poland (PL)' }
 };
 
 function intelligentTranslateService(rawQuery) {
@@ -582,7 +584,6 @@ async function promptServerSelection(ctx, session) {
   const availableServers = await fetchCombinedServices(session.country);
   const q = (session.selectedServiceQuery || '').toLowerCase().trim();
 
-  // STRICT filtering: Service name must precisely match the searched app (e.g., whatsapp)
   const filtered = availableServers.filter(s => {
     const sName = String(s.service_name || '').toLowerCase();
     const sId = String(s.service_id || '').toLowerCase();
@@ -618,7 +619,6 @@ bot.action(/^server\|(.+)\|(.+)$/, async (ctx) => {
   const availableServers = await fetchCombinedServices(session.country);
   const q = (session.selectedServiceQuery || '').toLowerCase().trim();
 
-  // Strict filtering per server as well
   const filtered = availableServers.filter(s => {
     const sName = String(s.service_name || '').toLowerCase();
     const sId = String(s.service_id || '').toLowerCase();
