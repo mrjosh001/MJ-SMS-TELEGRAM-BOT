@@ -12,6 +12,7 @@ const JUICYSMS_API_KEY = process.env.JUICYSMS_API_KEY;
 const SMSOTPSTORES_API_KEY = process.env.SMSOTPSTORES_API_KEY;
 const AUTHPADI_API_KEY = process.env.AUTHPADI_API_KEY;
 const ALLSMSVERIFY_API_KEY = process.env.ALLSMSVERIFY_API_KEY;
+const BEESMS_API_KEY = process.env.BEESMS_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 
 const SUPABASE_REST_URL = process.env.SUPABASE_REST_URL;
@@ -163,6 +164,7 @@ const JUICYSMS_BASE_URL = 'https://juicysms.com/api';
 const SMSOTPSTORES_BASE_URL = 'https://smsotpstores.com';
 const AUTHPADI_BASE_URL = 'https://dashboard.authpadi.com';
 const ALLSMSVERIFY_BASE_URL = 'https://allsmsverify.com';
+const BEESMS_BASE_URL = 'https://api.bee-sms.com/v1';
 
 const SERVICE_ALIASES = {
   'wa': 'whatsapp', 'whats': 'whatsapp', 'whats app': 'whatsapp', 'whatsup': 'whatsapp', 'app': 'whatsapp',
@@ -181,10 +183,10 @@ const COUNTRY_ALIASES = {
   'us': { id: 'us', name: 'United States (US)' },
   'united states': { id: 'us', name: 'United States (US)' },
   'america': { id: 'us', name: 'United States (US)' },
-  'uk': { id: 'uk', name: 'United Kingdom (UK)' },
-  'united kingdom': { id: 'uk', name: 'United Kingdom (UK)' },
-  'england': { id: 'uk', name: 'United Kingdom (UK)' },
-  'britain': { id: 'uk', name: 'United Kingdom (UK)' },
+  'uk': { id: 'gb', name: 'United Kingdom (UK)' },
+  'united kingdom': { id: 'gb', name: 'United Kingdom (UK)' },
+  'england': { id: 'gb', name: 'United Kingdom (UK)' },
+  'britain': { id: 'gb', name: 'United Kingdom (UK)' },
   'ng': { id: 'ng', name: 'Nigeria (NG)' },
   'nigeria': { id: 'ng', name: 'Nigeria (NG)' },
   'canada': { id: 'ca', name: 'Canada (CA)' },
@@ -312,44 +314,70 @@ async function getAllSmsVerifyServices(countryId) {
   } catch (err) { return []; }
 }
 
+async function getBeeSmsServices(countryId) {
+  try {
+    const cleanApiKey = BEESMS_API_KEY ? BEESMS_API_KEY.trim() : '';
+    if (!cleanApiKey) return [];
+    const res = await axios.get(`${BEESMS_BASE_URL}/otp/prices`, {
+      ...robustAxiosConfig,
+      params: { token: cleanApiKey, area: countryId }
+    });
+    const data = res.data;
+    if (data && data.code === 200 && Array.isArray(data.data)) {
+      return data.data.map(item => ({
+        service_id: String(item.service_code || ''),
+        service_name: String(item.service_name || item.service_code || ''),
+        stock: parseInt(item.qty || 100, 10),
+        // Bee SMS prices are in cents (e.g., USD cents), convert to dollars then we calculate NGN
+        price: parseFloat(item.amount || 0) / 100,
+        is_ngn: false
+      })).filter(s => s.service_id);
+    }
+    return [];
+  } catch (err) { return []; }
+}
+
 async function fetchCombinedServices(country) {
   const results = [];
   const countryObj = typeof country === 'string' ? { id: country, name: country } : country;
   if (!countryObj || !countryObj.id) return results;
   const cId = countryObj.id;
 
-  const [juicy, store, auth, allsms] = await Promise.allSettled([
+  const [juicy, store, auth, allsms, beesms] = await Promise.allSettled([
     JUICYSMS_API_KEY ? getJuicySmsServices(cId) : Promise.resolve([]),
     SMSOTPSTORES_API_KEY ? getSmsOtpStoresServices(cId) : Promise.resolve([]),
     AUTHPADI_API_KEY ? getAuthPadiServices(cId) : Promise.resolve([]),
-    ALLSMSVERIFY_API_KEY ? getAllSmsVerifyServices(cId) : Promise.resolve([])
+    ALLSMSVERIFY_API_KEY ? getAllSmsVerifyServices(cId) : Promise.resolve([]),
+    BEESMS_API_KEY ? getBeeSmsServices(cId) : Promise.resolve([])
   ]);
 
   if (juicy.status === 'fulfilled') juicy.value.forEach(s => results.push({ provider: 'juicysms', server_label: 'Server One', ...s }));
   if (store.status === 'fulfilled') store.value.forEach(s => results.push({ provider: 'smsotpstores', server_label: 'Server Two', ...s }));
   if (auth.status === 'fulfilled') auth.value.forEach(s => results.push({ provider: 'authpadi', server_label: 'Server Three', ...s }));
   if (allsms.status === 'fulfilled') allsms.value.forEach(s => results.push({ provider: 'allsmsverify', server_label: 'Server Four', ...s }));
+  if (beesms.status === 'fulfilled') beesms.value.forEach(s => results.push({ provider: 'beesms', server_label: 'Server Five', ...s }));
 
   return results;
 }
 
 async function executeOrder(provider, serviceId, countryId) {
   try {
-    if (provider === 'allsmsverify') {
-      const res = await axios.get(`${ALLSMSVERIFY_BASE_URL}/stubs/handler_api.php`, {
+    if (provider === 'beesms') {
+      const res = await axios.get(`${BEESMS_BASE_URL}/otp/purchase`, {
         ...robustAxiosConfig,
-        params: { api_key: ALLSMSVERIFY_API_KEY.trim(), action: 'getNumber', service: serviceId, country: countryId }
+        params: { token: BEESMS_API_KEY.trim(), area: countryId, service: serviceId }
       });
-      const respStr = typeof res.data === 'string' ? res.data.trim() : JSON.stringify(res.data);
-      if (respStr.startsWith('ACCESS_NUMBER')) {
-        const parts = respStr.split(':');
-        return { success: true, data: { order_id: parts[1], number: parts[2] } };
+      const data = res.data;
+      if (data && data.code === 200 && data.data) {
+        return { success: true, data: { order_id: data.data.order_id, number: `${data.data.dialing_code || ''}${data.data.mobile_number}` } };
       }
-      return { success: false, message: respStr };
-    } else if (provider === 'authpadi') {
-      const res = await axios.get(`${AUTHPADI_BASE_URL}/stubs/handler_api.php`, {
+      return { success: false, message: data?.message || 'Failed' };
+    } else if (provider === 'allsmsverify' || provider === 'authpadi') {
+      const baseUrl = provider === 'allsmsverify' ? ALLSMSVERIFY_BASE_URL : AUTHPADI_BASE_URL;
+      const apiKey = provider === 'allsmsverify' ? ALLSMSVERIFY_API_KEY : AUTHPADI_API_KEY;
+      const res = await axios.get(`${baseUrl}/stubs/handler_api.php`, {
         ...robustAxiosConfig,
-        params: { api_key: AUTHPADI_API_KEY.trim(), action: 'getNumber', service: serviceId, country: countryId }
+        params: { api_key: apiKey.trim(), action: 'getNumber', service: serviceId, country: countryId }
       });
       const respStr = typeof res.data === 'string' ? res.data.trim() : JSON.stringify(res.data);
       if (respStr.startsWith('ACCESS_NUMBER')) {
@@ -386,7 +414,16 @@ async function executeOrder(provider, serviceId, countryId) {
 
 async function checkSmsCode(provider, orderId) {
   try {
-    if (provider === 'allsmsverify' || provider === 'authpadi') {
+    if (provider === 'beesms') {
+      const res = await axios.get(`${BEESMS_BASE_URL}/otp/sms`, {
+        ...robustAxiosConfig,
+        params: { token: BEESMS_API_KEY.trim(), order: orderId }
+      });
+      const data = res.data;
+      if (data && data.code === 200 && data.data) {
+        return { success: true, data: { code: data.data } };
+      }
+    } else if (provider === 'allsmsverify' || provider === 'authpadi') {
       const baseUrl = provider === 'allsmsverify' ? ALLSMSVERIFY_BASE_URL : AUTHPADI_BASE_URL;
       const apiKey = provider === 'allsmsverify' ? ALLSMSVERIFY_API_KEY : AUTHPADI_API_KEY;
       const res = await axios.get(`${baseUrl}/stubs/handler_api.php`, {
@@ -417,7 +454,12 @@ async function checkSmsCode(provider, orderId) {
 
 async function cancelOrder(provider, orderId) {
   try {
-    if (provider === 'allsmsverify' || provider === 'authpadi') {
+    if (provider === 'beesms') {
+      await axios.get(`${BEESMS_BASE_URL}/otp/cancel`, {
+        ...robustAxiosConfig,
+        params: { token: BEESMS_API_KEY.trim(), order: orderId }
+      });
+    } else if (provider === 'allsmsverify' || provider === 'authpadi') {
       const baseUrl = provider === 'allsmsverify' ? ALLSMSVERIFY_BASE_URL : AUTHPADI_BASE_URL;
       const apiKey = provider === 'allsmsverify' ? ALLSMSVERIFY_API_KEY : AUTHPADI_API_KEY;
       await axios.get(`${baseUrl}/stubs/handler_api.php`, {
@@ -464,6 +506,12 @@ bot.command('servers', async (ctx) => {
     const res = await axios.get(`${ALLSMSVERIFY_BASE_URL}/stubs/handler_api.php`, { ...robustAxiosConfig, params: { api_key: ALLSMSVERIFY_API_KEY, action: 'getBalance' } });
     statusReport += `• *Server Four:* ✅ ONLINE (${res.data || 'Active'})\n`;
   } catch (e) { statusReport += `• *Server Four:* ❌ OFFLINE\n`; }
+
+  try {
+    const res = await axios.get(`${BEESMS_BASE_URL}/user/balance`, { ...robustAxiosConfig, params: { token: BEESMS_API_KEY } });
+    const balDollars = res.data?.data ? (res.data.data / 100).toFixed(2) : 'Active';
+    statusReport += `• *Server Five:* ✅ ONLINE ($${balDollars})\n`;
+  } catch (e) { statusReport += `• *Server Five:* ❌ OFFLINE\n`; }
 
   ctx.reply(statusReport, { parse_mode: 'Markdown' });
 });
@@ -719,4 +767,3 @@ bot.launch().then(() => {
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
