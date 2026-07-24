@@ -12,11 +12,11 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SERVER_URL = process.env.RENDER_EXTERNAL_URL;
-const SECOND_SMS_API_KEY = process.env.SECOND_SMS_API_KEY;
+const JUICYSMS_API_KEY = process.env.JUICYSMS_API_KEY || process.env.SECOND_SMS_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 
-// Provider Endpoints
-const ALLSMSVERIFY_BASE_URL = 'https://allsmsverify.com/stubs/handler_api.php';
+// JuicySMS API Base URL
+const JUICYSMS_BASE_URL = 'https://juicysms.com/api';
 
 if (!BOT_TOKEN) {
   console.error("FATAL ERROR: BOT_TOKEN environment variable is missing!");
@@ -98,132 +98,105 @@ async function initializePaystackPayment(email, amountNgn, userId) {
   }
 }
 
-// ------------------- ALLSMSVERIFY API INTEGRATION -------------------
-async function getAllSmsVerifyCountries() {
-  const cleanApiKey = SECOND_SMS_API_KEY ? SECOND_SMS_API_KEY.trim() : null;
-  if (!cleanApiKey) return [];
+// ------------------- JUICYSMS API INTEGRATION -------------------
+const JUICYSMS_COUNTRIES = [
+  { id: 'NL', name: 'Netherlands (NL)', short: 'nl' },
+  { id: 'UK', name: 'United Kingdom (UK)', short: 'uk' },
+  { id: 'USA', name: 'United States (USA)', short: 'usa' },
+  { id: 'DE', name: 'Germany (DE)', short: 'de' }
+];
 
-  try {
-    const res = await axios.get(ALLSMSVERIFY_BASE_URL, {
-      ...robustAxiosConfig,
-      params: { action: 'getCountries', api_key: cleanApiKey }
-    });
-
-    const data = res.data;
-    if (data) {
-      if (Array.isArray(data)) return data;
-      return Object.entries(data).map(([key, item]) => {
-        if (typeof item === 'object' && item !== null) {
-          return {
-            id: key,
-            name: item.name || item.title || key,
-            short: key
-          };
-        }
-        return {
-          id: key,
-          name: String(item),
-          short: key
-        };
-      });
-    }
-    return [];
-  } catch (err) {
-    console.error("Error fetching countries:", err.message);
-    return [];
-  }
+async function getJuicySmsCountries() {
+  return JUICYSMS_COUNTRIES;
 }
 
-async function getAllSmsVerifyServices(countryId) {
-  const cleanApiKey = SECOND_SMS_API_KEY ? SECOND_SMS_API_KEY.trim() : null;
-  if (!cleanApiKey) return [];
-
+async function getJuicySmsServices(countryId) {
   try {
-    const res = await axios.get(ALLSMSVERIFY_BASE_URL, {
+    const params = { country: countryId || 'NL' };
+    if (JUICYSMS_API_KEY) {
+      params.key = JUICYSMS_API_KEY.trim();
+    }
+
+    const res = await axios.get(`${JUICYSMS_BASE_URL}/services`, {
       ...robustAxiosConfig,
-      params: { action: 'getServicesList', api_key: cleanApiKey, country: countryId || 1 }
+      params: params
     });
 
     let data = res.data;
-    if (data && data.data) data = data.data;
+    if (data && data.services) data = data.services;
 
-    if (data && typeof data === 'object') {
-      const items = Array.isArray(data) ? data : Object.entries(data).map(([key, item]) => ({ id: key, ...item }));
-      return items.map(item => {
-        const serviceId = item.id || item.service_id || item.service || '';
-        const serviceName = item.name || item.title || item.service_name || serviceId;
-        const stock = parseInt(item.count || item.stock || item.quantity || 10, 10);
-        const price = parseFloat(item.cost || item.price || item.retail_price || 0);
-        return {
-          service_id: serviceId,
-          service_name: String(serviceName),
-          stock: isNaN(stock) ? 10 : stock,
-          price: isNaN(price) ? 0 : price,
-          server_id: countryId || '1'
-        };
-      }).filter(s => s.service_id);
+    if (Array.isArray(data)) {
+      return data.map(item => ({
+        service_id: item.id || item.serviceId || item.code || '',
+        service_name: item.title || item.name || item.service_id || '',
+        stock: parseInt(item.count || item.stock || item.quantity || 10, 10),
+        price: parseFloat(item.price || item.cost || 0),
+        server_id: countryId
+      })).filter(s => s.service_id);
     }
     return [];
   } catch (err) {
-    console.error("Error fetching services:", err.message);
+    console.error("Error fetching JuicySMS services:", err.message);
     return [];
   }
 }
 
 async function fetchCombinedServices(country) {
   const results = [];
-  const allSmsData = await getAllSmsVerifyServices(country.id);
+  const juicyData = await getJuicySmsServices(country.id);
   
-  if (Array.isArray(allSmsData)) {
-    allSmsData.forEach(s => {
-      const serviceName = s.service_name || '';
-      const stock = s.stock || 0;
-      if (stock > 0) {
-        results.push({
-          provider: 'allsmsverify',
-          service_id: s.service_id,
-          service_name: serviceName,
-          operator_id: country.id,
-          server_name: country.name || 'Server',
-          stock: stock,
-          price: parseFloat(s.price || 0)
-        });
-      }
+  if (Array.isArray(juicyData)) {
+    juicyData.forEach(s => {
+      results.push({
+        provider: 'juicysms',
+        service_id: s.service_id,
+        service_name: s.service_name,
+        operator_id: country.id,
+        server_name: country.name,
+        stock: s.stock || 10,
+        price: parseFloat(s.price || 0)
+      });
     });
   }
   return results;
 }
 
-// ------------------- PURCHASE & STATUS LOGIC (ALLSMSVERIFY) -------------------
-async function executePurchase(serviceId, countryId) {
+async function executeJuicyPurchase(serviceId, countryId) {
   try {
-    const cleanApiKey = SECOND_SMS_API_KEY ? SECOND_SMS_API_KEY.trim() : '';
-    const res = await axios.get(ALLSMSVERIFY_BASE_URL, {
+    const cleanApiKey = JUICYSMS_API_KEY ? JUICYSMS_API_KEY.trim() : '';
+    const res = await axios.get(`${JUICYSMS_BASE_URL}/makeorder`, {
       ...robustAxiosConfig,
-      params: { action: 'getNumber', api_key: cleanApiKey, service: serviceId, country: countryId || 1 }
+      params: { key: cleanApiKey, serviceId: serviceId, country: countryId }
     });
 
-    const respText = String(res.data).trim();
-    if (respText.startsWith('ACCESS_NUMBER')) {
-      const parts = respText.split(':');
-      return { success: true, data: { order_id: parts[1], number: parts[2] } };
+    const respText = typeof res.data === 'string' ? res.data.trim() : JSON.stringify(res.data);
+    
+    if (respText.startsWith('ORDER_ID_')) {
+      // Format: ORDER_ID_{ORDER_ID}_NUMBER_{PHONE_NUMBER}
+      const parts = respText.split('_');
+      const orderId = parts[2];
+      const phoneNumber = parts.slice(4).join('_');
+      return { success: true, data: { order_id: orderId, number: phoneNumber } };
     }
-    return { success: false, message: respText || 'Server stock unavailable.' };
+    return { success: false, message: respText || 'Server stock unavailable or insufficient balance.' };
   } catch (err) {
     return { success: false, message: 'Request failed.' };
   }
 }
 
-async function checkSmsCode(orderId) {
+async function checkJuicySmsCode(orderId) {
   try {
-    const cleanApiKey = SECOND_SMS_API_KEY ? SECOND_SMS_API_KEY.trim() : '';
-    const res = await axios.get(ALLSMSVERIFY_BASE_URL, {
+    const cleanApiKey = JUICYSMS_API_KEY ? JUICYSMS_API_KEY.trim() : '';
+    const res = await axios.get(`${JUICYSMS_BASE_URL}/getsms`, {
       ...robustAxiosConfig,
-      params: { action: 'getStatus', api_key: cleanApiKey, id: orderId }
+      params: { key: cleanApiKey, orderId: orderId }
     });
-    const respText = String(res.data).trim();
-    if (respText.startsWith('STATUS_OK')) {
-      return { success: true, data: { code: respText.split(':')[1] } };
+    
+    const respText = typeof res.data === 'string' ? res.data.trim() : JSON.stringify(res.data);
+
+    if (respText.startsWith('SUCCESS_')) {
+      const code = respText.replace('SUCCESS_', '');
+      return { success: true, data: { code: code } };
     }
     return { success: false };
   } catch (err) {
@@ -231,12 +204,12 @@ async function checkSmsCode(orderId) {
   }
 }
 
-async function cancelOrder(orderId) {
+async function cancelJuicyOrder(orderId) {
   try {
-    const cleanApiKey = SECOND_SMS_API_KEY ? SECOND_SMS_API_KEY.trim() : '';
-    await axios.get(ALLSMSVERIFY_BASE_URL, {
+    const cleanApiKey = JUICYSMS_API_KEY ? JUICYSMS_API_KEY.trim() : '';
+    await axios.get(`${JUICYSMS_BASE_URL}/cancelorder`, {
       ...robustAxiosConfig,
-      params: { action: 'setStatus', api_key: cleanApiKey, id: orderId, status: 8 }
+      params: { key: cleanApiKey, orderId: orderId }
     });
   } catch (err) {
     console.error("Cancel order error:", err.message);
@@ -255,7 +228,7 @@ bot.start(async (ctx) => {
     `How far boss! 👋 Welcome to *MJ SMS*! ✨\n\n` +
     `💰 *Your Balance:* ₦${(session.balance || 0).toLocaleString()}\n\n` +
     `I dey here to help you get virtual numbers fast fast! 🚀\n` +
-    `• Type a country name or server ID (e.g., _Usa_ or _Usa WhatsApp_)\n` +
+    `• Type a country code (e.g., _NL_, _UK_, _USA_, _DE_)\n` +
     `• Type */fund* to top up your wallet balance!\n` +
     `• Type *support* anytime to speak to customer care.`,
     { parse_mode: 'Markdown' }
@@ -311,7 +284,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // 2. Balance triggers (Strict check for balance variations)
+  // 2. Balance triggers
   if (lowerText.includes('balance') || lowerText.includes('bal') || lowerText === 'my balance' || lowerText === "what's my balance" || lowerText === "what's my current balance") {
     ctx.reply(`Boss your current balance na ₦${(session.balance || 0).toLocaleString()} ✨`, { parse_mode: 'Markdown' });
     return;
@@ -335,7 +308,7 @@ bot.on('text', async (ctx) => {
     session.state = 'AWAITING_COUNTRY';
     session.country = null;
     saveSessions();
-    ctx.reply(`No p boss! Which country number you wan check now? (e.g., type *Usa* or *Nigeria*)`, { parse_mode: 'Markdown' });
+    ctx.reply(`No p boss! Which country you wan check now? (Type *NL*, *UK*, *USA*, or *DE*)`, { parse_mode: 'Markdown' });
     return;
   }
 
@@ -365,7 +338,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  const countries = await getAllSmsVerifyCountries();
+  const countries = await getJuicySmsCountries();
 
   const getNormalizedCountry = (input) => {
     const cleanInput = input.toLowerCase().trim();
@@ -379,13 +352,14 @@ bot.on('text', async (ctx) => {
              cleanInput.includes(cName) || 
              cId === cleanInput || 
              cShort === cleanInput ||
-             (cleanInput.includes('usa') && (cName.includes('united states') || cId === '1' || cShort === 'us')) ||
-             (cleanInput.includes('uk') && (cName.includes('united kingdom') || cShort === 'gb')) ||
-             (cleanInput.includes('nigeria') && cName.includes('nigeria'));
+             (cleanInput.includes('usa') && cId === 'USA') ||
+             (cleanInput.includes('uk') && cId === 'UK') ||
+             (cleanInput.includes('nl') && cId === 'NL') ||
+             (cleanInput.includes('de') && cId === 'DE');
     });
   };
 
-  // 5. Combined Input Handling ("Usa WhatsApp")
+  // 5. Combined Input Handling ("NL WhatsApp")
   if (countries.length > 0) {
     const words = lowerText.split(/\s+/);
     let matchedCountry = null;
@@ -412,7 +386,7 @@ bot.on('text', async (ctx) => {
     }
   }
 
-  // 6. Single Country Input ("United States", "Usa")
+  // 6. Single Country Input ("NL", "UK")
   const matchedCountryDirect = getNormalizedCountry(lowerText);
   if (matchedCountryDirect) {
     session.country = matchedCountryDirect;
@@ -420,7 +394,7 @@ bot.on('text', async (ctx) => {
     saveSessions();
     ctx.reply(
       `Ehen! You select *${matchedCountryDirect.name}* 👌\n\n` +
-      `Which app or service you wan verify? (e.g., _WhatsApp_, _Telegram_, _Twitter_)`,
+      `Which app or service you wan verify? (e.g., _WhatsApp_, _Telegram_, _Google_)`,
       { parse_mode: 'Markdown' }
     );
     return;
@@ -433,7 +407,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  ctx.reply(`Please state your country server name first (e.g., type *Usa* or *Usa WhatsApp*).`, { parse_mode: 'Markdown' });
+  ctx.reply(`Please state your country code first (e.g., type *NL* or *NL WhatsApp*).`, { parse_mode: 'Markdown' });
 });
 
 async function processServiceSelection(ctx, session, serviceQuery) {
@@ -477,9 +451,9 @@ bot.action(/^buy\|(.+)\|(.+)$/, async (ctx) => {
   const countryId = ctx.match[1];
   const serviceId = ctx.match[2];
 
-  ctx.reply(`Processing your number purchase... Please wait <span>⏳</span>`);
+  ctx.reply(`Processing your number purchase... Please wait ⏳`);
 
-  const response = await executePurchase(serviceId, countryId);
+  const response = await executeJuicyPurchase(serviceId, countryId);
 
   if (response.success && response.data) {
     const orderId = response.data.order_id;
@@ -498,7 +472,7 @@ bot.action(/^buy\|(.+)\|(.+)$/, async (ctx) => {
 
     const intervalId = setInterval(async () => {
       pollCount++;
-      const checkRes = await checkSmsCode(orderId);
+      const checkRes = await checkJuicySmsCode(orderId);
 
       if (checkRes.success && checkRes.data && checkRes.data.code) {
         clearInterval(intervalId);
@@ -511,7 +485,7 @@ bot.action(/^buy\|(.+)\|(.+)$/, async (ctx) => {
         );
       } else if (pollCount >= maxPolls) {
         clearInterval(intervalId);
-        await cancelOrder(orderId);
+        await cancelJuicyOrder(orderId);
         ctx.reply(`⏰ *Time Out:* Code no enter after 10 minutes. Order canceled!`);
       }
     }, 7000);
@@ -528,7 +502,7 @@ bot.action('reset_flow', (ctx) => {
   session.state = 'AWAITING_COUNTRY';
   session.country = null;
   saveSessions();
-  ctx.reply(`No p boss! Which country number you wan check now?`);
+  ctx.reply(`No p boss! Which country you wan check now? (Type *NL*, *UK*, *USA*, or *DE*)`);
 });
 
 // ------------------- WEBHOOKS & SERVER START -------------------
@@ -562,7 +536,7 @@ app.post('/webhook/paystack', async (req, res) => {
   res.sendStatus(200);
 });
 
-app.get('/', (res) => res.send('MJ SMS Bot Active!'));
+app.get('/', (req, res) => res.send('MJ SMS Bot Active!'));
 
 app.listen(PORT, async () => {
   console.log(`Server listening on port ${PORT}`);
