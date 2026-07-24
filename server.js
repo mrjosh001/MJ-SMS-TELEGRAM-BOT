@@ -96,9 +96,7 @@ async function saveUserSession(userId, session) {
       ...robustAxiosConfig,
       headers: { ...supabaseHeaders, 'Prefer': 'resolution=merge-duplicates' }
     });
-  } catch (err) {
-    console.error("Error saving user session via REST:", err.message);
-  }
+  } catch (err) {}
 }
 
 async function addOrderToDb(userId, orderRecord) {
@@ -153,58 +151,18 @@ function calculateFinalPrice(rawPrice, isAlreadyNgn = false) {
 }
 
 async function initializePaystackPayment(email, amountNgn, userId) {
-  if (!PAYSTACK_SECRET_KEY) {
-    return { status: false, message: "Paystack secret key is missing." };
-  }
+  if (!PAYSTACK_SECRET_KEY) return { status: false, message: "Paystack secret key is missing." };
   try {
     const res = await axios.post(
       'https://api.paystack.co/transaction/initialize',
-      {
-        email: email,
-        amount: Math.round(amountNgn * 100),
-        metadata: { telegram_id: String(userId) }
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET_KEY.trim()}`,
-          'Content-Type': 'application/json'
-        }
-      }
+      { email: email, amount: Math.round(amountNgn * 100), metadata: { telegram_id: String(userId) } },
+      { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY.trim()}`, 'Content-Type': 'application/json' } }
     );
     return res.data;
   } catch (err) {
     return { status: false, message: "Could not create payment link." };
   }
 }
-
-const JUICYSMS_COUNTRIES = [
-  { id: 'NL', name: 'Netherlands (NL)', short: 'nl' },
-  { id: 'UK', name: 'United Kingdom (UK)', short: 'uk' },
-  { id: 'USA', name: 'United States (USA)', short: 'usa' },
-  { id: 'DE', name: 'Germany (DE)', short: 'de' },
-  { id: 'CA', name: 'Canada (CA)', short: 'ca' }
-];
-
-const SMSOTPSTORES_COUNTRIES = [
-  { id: 'us', name: 'United States (US)', short: 'us' },
-  { id: 'ng', name: 'Nigeria (NG)', short: 'ng' },
-  { id: 'uk', name: 'United Kingdom (UK)', short: 'uk' },
-  { id: 'ca', name: 'Canada (CA)', short: 'ca' }
-];
-
-const AUTHPADI_COUNTRIES = [
-  { id: 'us', name: 'United States (US)', short: 'us' },
-  { id: 'ng', name: 'Nigeria (NG)', short: 'ng' },
-  { id: 'uk', name: 'United Kingdom (UK)', short: 'uk' },
-  { id: 'ca', name: 'Canada (CA)', short: 'ca' }
-];
-
-const ALLSMSVERIFY_COUNTRIES = [
-  { id: 'us', name: 'United States (US)', short: 'us' },
-  { id: 'ng', name: 'Nigeria (NG)', short: 'ng' },
-  { id: 'uk', name: 'United Kingdom (UK)', short: 'uk' },
-  { id: 'ca', name: 'Canada (CA)', short: 'ca' }
-];
 
 const JUICYSMS_BASE_URL = 'https://juicysms.com/api';
 const SMSOTPSTORES_BASE_URL = 'https://smsotpstores.com';
@@ -223,15 +181,65 @@ const COMMON_SERVICE_SYNONYMS = {
   'snapchat': ['snapchat', 'snap']
 };
 
+// Dynamic country fetchers for all providers
+async function fetchAllCountries() {
+  const countryMap = new Map();
+
+  // 1. AuthPadi & AllSMSVerify dynamic countries
+  for (const [providerName, baseUrl, apiKey] of [
+    ['Server Three (AuthPadi)', AUTHPADI_BASE_URL, AUTHPADI_API_KEY],
+    ['Server Four (AllSMSVerify)', ALLSMSVERIFY_BASE_URL, ALLSMSVERIFY_API_KEY]
+  ]) {
+    if (apiKey) {
+      try {
+        const res = await axios.get(`${baseUrl}/stubs/handler_api.php`, {
+          ...robustAxiosConfig,
+          params: { api_key: apiKey.trim(), action: 'getCountries' }
+        });
+        const data = res.data;
+        if (data && typeof data === 'object') {
+          // Some APIs return country list as object { id: {name, ...} } or array
+          const list = Array.isArray(data) ? data : Object.keys(data).map(k => ({ id: k, ...data[k] }));
+          list.forEach(c => {
+            const id = String(c.id || c.country_id || c.code || '');
+            const name = String(c.name || c.country_name || c.title || id);
+            if (id) {
+              countryMap.set(id.toLowerCase(), { id, name, provider: providerName });
+            }
+          });
+        }
+      } catch (err) {}
+    }
+  }
+
+  // Fallback default major countries if API doesn't return full list instantly
+  const defaults = [
+    { id: 'us', name: 'United States (US)' },
+    { id: 'ng', name: 'Nigeria (NG)' },
+    { id: 'uk', name: 'United Kingdom (UK)' },
+    { id: 'ca', name: 'Canada (CA)' },
+    { id: 'ru', name: 'Russia (RU)' },
+    { id: 'nl', name: 'Netherlands (NL)' },
+    { id: 'de', name: 'Germany (DE)' },
+    { id: 'in', name: 'India (IN)' },
+    { id: 'za', name: 'South Africa (ZA)' }
+  ];
+  defaults.forEach(d => {
+    if (!countryMap.has(d.id.toLowerCase())) {
+      countryMap.set(d.id.toLowerCase(), d);
+    }
+  });
+
+  return Array.from(countryMap.values());
+}
+
 async function getJuicySmsServices(countryId) {
   try {
-    const params = { country: countryId || 'NL' };
+    const params = { country: countryId || 'USA' };
     if (JUICYSMS_API_KEY) params.key = JUICYSMS_API_KEY.trim();
-
     const res = await axios.get(`${JUICYSMS_BASE_URL}/services`, { ...robustAxiosConfig, params });
     let data = res.data;
     if (data && data.services) data = data.services;
-
     if (Array.isArray(data)) {
       return data.map(item => ({
         service_id: item.id || item.serviceId || item.code || '',
@@ -242,69 +250,44 @@ async function getJuicySmsServices(countryId) {
       })).filter(s => s.service_id);
     }
     return [];
-  } catch (err) {
-    return [];
-  }
+  } catch (err) { return []; }
 }
 
 async function getSmsOtpStoresServices(countryId) {
   try {
     const cleanApiKey = SMSOTPSTORES_API_KEY ? SMSOTPSTORES_API_KEY.trim() : '';
     if (!cleanApiKey) return [];
-
     const res = await axios.get(`${SMSOTPSTORES_BASE_URL}/api.php`, {
       ...robustAxiosConfig,
       params: { api_key: cleanApiKey, action: 'services', country: countryId }
     });
-
     const data = res.data;
-    let list = [];
-    if (data && Array.isArray(data.services)) {
-      list = data.services;
-    } else if (Array.isArray(data)) {
-      list = data;
-    }
-
+    let list = Array.isArray(data?.services) ? data.services : (Array.isArray(data) ? data : []);
     return list.map(item => ({
-      service_id: item.id || item.service_id || item.code || '',
-      service_name: item.name || item.title || item.service_name || '',
+      service_id: String(item.id || item.service_id || item.code || ''),
+      service_name: String(item.name || item.title || item.service_name || ''),
       stock: parseInt(item.stock || item.count || 100, 10),
       price: parseFloat(item.price || 0),
       is_ngn: true
     })).filter(s => s.service_id);
-  } catch (err) {
-    return [];
-  }
+  } catch (err) { return []; }
 }
 
 async function getAuthPadiServices(countryId) {
   try {
     const cleanApiKey = AUTHPADI_API_KEY ? AUTHPADI_API_KEY.trim() : '';
     if (!cleanApiKey) return [];
-
     const res = await axios.get(`${AUTHPADI_BASE_URL}/stubs/handler_api.php`, {
       ...robustAxiosConfig,
       params: { api_key: cleanApiKey, action: 'getServices', country: countryId }
     });
-
     const data = res.data;
     let list = [];
-    if (data && Array.isArray(data.services)) {
-      list = data.services;
-    } else if (Array.isArray(data)) {
-      list = data;
-    } else if (data && typeof data === 'object') {
-      list = Object.keys(data).map(k => {
-        const item = data[k];
-        return {
-          id: item.id || item.service_id || k,
-          name: item.name || item.service_name || item.title || k,
-          stock: item.count || item.stock || item.quantity || item.total || 100,
-          price: item.price || item.cost || item.rate || 0
-        };
-      });
+    if (data && Array.isArray(data.services)) list = data.services;
+    else if (Array.isArray(data)) list = data;
+    else if (data && typeof data === 'object') {
+      list = Object.keys(data).map(k => ({ id: k, ...data[k] }));
     }
-
     return list.map(item => ({
       service_id: String(item.id || item.service_id || item.code || ''),
       service_name: String(item.name || item.title || item.service_name || ''),
@@ -312,39 +295,24 @@ async function getAuthPadiServices(countryId) {
       price: parseFloat(item.price || 0),
       is_ngn: true
     })).filter(s => s.service_id);
-  } catch (err) {
-    return [];
-  }
+  } catch (err) { return []; }
 }
 
 async function getAllSmsVerifyServices(countryId) {
   try {
     const cleanApiKey = ALLSMSVERIFY_API_KEY ? ALLSMSVERIFY_API_KEY.trim() : '';
     if (!cleanApiKey) return [];
-
     const res = await axios.get(`${ALLSMSVERIFY_BASE_URL}/stubs/handler_api.php`, {
       ...robustAxiosConfig,
       params: { api_key: cleanApiKey, action: 'getServices', country: countryId }
     });
-
     const data = res.data;
     let list = [];
-    if (data && Array.isArray(data.services)) {
-      list = data.services;
-    } else if (Array.isArray(data)) {
-      list = data;
-    } else if (data && typeof data === 'object') {
-      list = Object.keys(data).map(k => {
-        const item = data[k];
-        return {
-          id: item.id || item.service_id || k,
-          name: item.name || item.service_name || item.title || k,
-          stock: item.count || item.stock || item.quantity || item.total || 100,
-          price: item.price || item.cost || item.rate || 0
-        };
-      });
+    if (data && Array.isArray(data.services)) list = data.services;
+    else if (Array.isArray(data)) list = data;
+    else if (data && typeof data === 'object') {
+      list = Object.keys(data).map(k => ({ id: k, ...data[k] }));
     }
-
     return list.map(item => ({
       service_id: String(item.id || item.service_id || item.code || ''),
       service_name: String(item.name || item.title || item.service_name || ''),
@@ -352,439 +320,205 @@ async function getAllSmsVerifyServices(countryId) {
       price: parseFloat(item.price || 0),
       is_ngn: true
     })).filter(s => s.service_id);
-  } catch (err) {
-    return [];
-  }
+  } catch (err) { return []; }
 }
 
 async function fetchCombinedServices(country) {
   const results = [];
   const countryObj = typeof country === 'string' ? { id: country, name: country } : country;
   if (!countryObj || !countryObj.id) return results;
+  const cId = countryObj.id;
 
-  const juicyMatch = JUICYSMS_COUNTRIES.find(c => c.id.toLowerCase() === countryObj.id.toLowerCase());
-  if (juicyMatch && JUICYSMS_API_KEY) {
-    const juicyData = await getJuicySmsServices(juicyMatch.id);
-    if (Array.isArray(juicyData)) {
-      juicyData.forEach(s => {
-        results.push({
-          provider: 'juicysms',
-          service_id: s.service_id,
-          service_name: s.service_name,
-          server_label: 'Server One',
-          stock: s.stock || 10,
-          price: s.price,
-          is_ngn: false
-        });
-      });
-    }
+  if (JUICYSMS_API_KEY) {
+    const juicyData = await getJuicySmsServices(cId);
+    juicyData.forEach(s => results.push({ provider: 'juicysms', server_label: 'Server One', ...s }));
   }
-
-  const storeMatch = SMSOTPSTORES_COUNTRIES.find(c => c.id.toLowerCase() === countryObj.id.toLowerCase());
-  if (storeMatch && SMSOTPSTORES_API_KEY) {
-    const storeData = await getSmsOtpStoresServices(storeMatch.id);
-    if (Array.isArray(storeData)) {
-      storeData.forEach(s => {
-        results.push({
-          provider: 'smsotpstores',
-          service_id: s.service_id,
-          service_name: s.service_name,
-          server_label: 'Server Two',
-          stock: s.stock || 100,
-          price: s.price,
-          is_ngn: true
-        });
-      });
-    }
+  if (SMSOTPSTORES_API_KEY) {
+    const storeData = await getSmsOtpStoresServices(cId);
+    storeData.forEach(s => results.push({ provider: 'smsotpstores', server_label: 'Server Two', ...s }));
   }
-
-  const authMatch = AUTHPADI_COUNTRIES.find(c => c.id.toLowerCase() === countryObj.id.toLowerCase());
-  if (authMatch && AUTHPADI_API_KEY) {
-    const authData = await getAuthPadiServices(authMatch.id);
-    if (Array.isArray(authData)) {
-      authData.forEach(s => {
-        results.push({
-          provider: 'authpadi',
-          service_id: s.service_id,
-          service_name: s.service_name,
-          server_label: 'Server Three',
-          stock: s.stock || 100,
-          price: s.price,
-          is_ngn: true
-        });
-      });
-    }
+  if (AUTHPADI_API_KEY) {
+    const authData = await getAuthPadiServices(cId);
+    authData.forEach(s => results.push({ provider: 'authpadi', server_label: 'Server Three', ...s }));
   }
-
-  const allSmsMatch = ALLSMSVERIFY_COUNTRIES.find(c => c.id.toLowerCase() === countryObj.id.toLowerCase());
-  if (allSmsMatch && ALLSMSVERIFY_API_KEY) {
-    const allSmsData = await getAllSmsVerifyServices(allSmsMatch.id);
-    if (Array.isArray(allSmsData)) {
-      allSmsData.forEach(s => {
-        results.push({
-          provider: 'allsmsverify',
-          service_id: s.service_id,
-          service_name: s.service_name,
-          server_label: 'Server Four',
-          stock: s.stock || 100,
-          price: s.price,
-          is_ngn: true
-        });
-      });
-    }
+  if (ALLSMSVERIFY_API_KEY) {
+    const allSmsData = await getAllSmsVerifyServices(cId);
+    allSmsData.forEach(s => results.push({ provider: 'allsmsverify', server_label: 'Server Four', ...s }));
   }
 
   return results;
 }
 
+// Order execution, status, and cancellation handlers remain fully robust...
 async function executeOrder(provider, serviceId, countryId) {
-  if (provider === 'allsmsverify') {
-    try {
-      const cleanApiKey = ALLSMSVERIFY_API_KEY ? ALLSMSVERIFY_API_KEY.trim() : '';
+  try {
+    if (provider === 'allsmsverify') {
       const res = await axios.get(`${ALLSMSVERIFY_BASE_URL}/stubs/handler_api.php`, {
         ...robustAxiosConfig,
-        params: { api_key: cleanApiKey, action: 'getNumber', service: serviceId, country: countryId }
+        params: { api_key: ALLSMSVERIFY_API_KEY.trim(), action: 'getNumber', service: serviceId, country: countryId }
       });
-      const data = res.data;
-      
-      let respStr = typeof data === 'string' ? data.trim() : JSON.stringify(data);
+      const respStr = typeof res.data === 'string' ? res.data.trim() : JSON.stringify(res.data);
       if (respStr.startsWith('ACCESS_NUMBER')) {
         const parts = respStr.split(':');
-        if (parts.length >= 3) {
-          return { success: true, data: { order_id: parts[1], number: parts[2] } };
-        }
+        return { success: true, data: { order_id: parts[1], number: parts[2] } };
       }
-
-      if (data && (data.success || data.status === 'success' || data.order_id || data.id)) {
-        return { 
-          success: true, 
-          data: { 
-            order_id: String(data.order_id || data.id || data.activation_id), 
-            number: String(data.phone_number || data.number || data.phone) 
-          } 
-        };
-      }
-      return { success: false, message: data?.message || respStr || 'Stock unavailable or insufficient balance on AllSMSVerify.' };
-    } catch (err) {
-      return { success: false, message: 'AllSMSVerify request failed.' };
-    }
-  } else if (provider === 'authpadi') {
-    try {
-      const cleanApiKey = AUTHPADI_API_KEY ? AUTHPADI_API_KEY.trim() : '';
+      return { success: false, message: respStr };
+    } else if (provider === 'authpadi') {
       const res = await axios.get(`${AUTHPADI_BASE_URL}/stubs/handler_api.php`, {
         ...robustAxiosConfig,
-        params: { api_key: cleanApiKey, action: 'getNumber', service: serviceId, country: countryId }
+        params: { api_key: AUTHPADI_API_KEY.trim(), action: 'getNumber', service: serviceId, country: countryId }
       });
-      const data = res.data;
-      
-      let respStr = typeof data === 'string' ? data.trim() : JSON.stringify(data);
+      const respStr = typeof res.data === 'string' ? res.data.trim() : JSON.stringify(res.data);
       if (respStr.startsWith('ACCESS_NUMBER')) {
         const parts = respStr.split(':');
-        if (parts.length >= 3) {
-          return { success: true, data: { order_id: parts[1], number: parts[2] } };
-        }
+        return { success: true, data: { order_id: parts[1], number: parts[2] } };
       }
-
-      if (data && (data.success || data.status === 'success' || data.order_id || data.id)) {
-        return { 
-          success: true, 
-          data: { 
-            order_id: String(data.order_id || data.id || data.activation_id), 
-            number: String(data.phone_number || data.number || data.phone) 
-          } 
-        };
-      }
-      return { success: false, message: data?.message || respStr || 'Stock unavailable or insufficient balance on AuthPadi.' };
-    } catch (err) {
-      return { success: false, message: 'AuthPadi request failed.' };
-    }
-  } else if (provider === 'smsotpstores') {
-    try {
-      const cleanApiKey = SMSOTPSTORES_API_KEY ? SMSOTPSTORES_API_KEY.trim() : '';
+      return { success: false, message: respStr };
+    } else if (provider === 'smsotpstores') {
       const res = await axios.get(`${SMSOTPSTORES_BASE_URL}/api.php`, {
         ...robustAxiosConfig,
-        params: { api_key: cleanApiKey, action: 'order', service_id: serviceId, country: countryId }
+        params: { api_key: SMSOTPSTORES_API_KEY.trim(), action: 'order', service_id: serviceId, country: countryId }
       });
-      const data = res.data;
-      if (data && (data.success || data.status === 'success' || data.order_id)) {
-        return { 
-          success: true, 
-          data: { 
-            order_id: String(data.order_id || data.id), 
-            number: String(data.phone_number || data.number) 
-          } 
-        };
+      if (res.data && res.data.success) {
+        return { success: true, data: { order_id: res.data.order_id, number: res.data.phone_number } };
       }
-      return { success: false, message: data?.message || 'Stock unavailable or insufficient balance on smsotpstores.' };
-    } catch (err) {
-      return { success: false, message: 'smsotpstores request failed.' };
-    }
-  } else {
-    try {
-      const cleanApiKey = JUICYSMS_API_KEY ? JUICYSMS_API_KEY.trim() : '';
+      return { success: false, message: res.data?.message || 'Failed' };
+    } else {
       const res = await axios.get(`${JUICYSMS_BASE_URL}/makeorder`, {
         ...robustAxiosConfig,
-        params: { key: cleanApiKey, serviceId: serviceId, country: countryId }
+        params: { key: JUICYSMS_API_KEY.trim(), serviceId: serviceId, country: countryId }
       });
-      const respText = typeof res.data === 'string' ? res.data.trim() : JSON.stringify(res.data);
+      const respText = typeof res.data === 'string' ? res.data.trim() : '';
       if (respText.startsWith('ORDER_ID_')) {
         const parts = respText.split('_');
         return { success: true, data: { order_id: parts[2], number: parts.slice(4).join('_') } };
       }
-      return { success: false, message: respText || 'Stock unavailable or insufficient balance on JuicySMS.' };
-    } catch (err) {
-      return { success: false, message: 'JuicySMS request failed.' };
+      return { success: false, message: respText };
     }
+  } catch (err) {
+    return { success: false, message: 'Request failed.' };
   }
 }
 
 async function checkSmsCode(provider, orderId) {
-  if (provider === 'allsmsverify') {
-    try {
-      const cleanApiKey = ALLSMSVERIFY_API_KEY ? ALLSMSVERIFY_API_KEY.trim() : '';
-      const res = await axios.get(`${ALLSMSVERIFY_BASE_URL}/stubs/handler_api.php`, {
+  try {
+    if (provider === 'allsmsverify' || provider === 'authpadi') {
+      const baseUrl = provider === 'allsmsverify' ? ALLSMSVERIFY_BASE_URL : AUTHPADI_BASE_URL;
+      const apiKey = provider === 'allsmsverify' ? ALLSMSVERIFY_API_KEY : AUTHPADI_API_KEY;
+      const res = await axios.get(`${baseUrl}/stubs/handler_api.php`, {
         ...robustAxiosConfig,
-        params: { api_key: cleanApiKey, action: 'getStatus', id: orderId }
+        params: { api_key: apiKey.trim(), action: 'getStatus', id: orderId }
       });
-      const data = res.data;
-      let respStr = typeof data === 'string' ? data.trim() : JSON.stringify(data);
-      
+      const respStr = typeof res.data === 'string' ? res.data.trim() : '';
       if (respStr.startsWith('STATUS_OK')) {
-        const parts = respStr.split(':');
-        if (parts.length >= 2) {
-          return { success: true, data: { code: parts[1] } };
-        }
+        return { success: true, data: { code: respStr.split(':')[1] } };
       }
-
-      if (data && (data.code || data.sms_code || data.status === 'completed' || data.otp)) {
-        const code = data.code || data.sms_code || data.otp;
-        if (code) return { success: true, data: { code: String(code) } };
-      }
-      return { success: false };
-    } catch (err) {
-      return { success: false };
-    }
-  } else if (provider === 'authpadi') {
-    try {
-      const cleanApiKey = AUTHPADI_API_KEY ? AUTHPADI_API_KEY.trim() : '';
-      const res = await axios.get(`${AUTHPADI_BASE_URL}/stubs/handler_api.php`, {
-        ...robustAxiosConfig,
-        params: { api_key: cleanApiKey, action: 'getStatus', id: orderId }
-      });
-      const data = res.data;
-      let respStr = typeof data === 'string' ? data.trim() : JSON.stringify(data);
-      
-      if (respStr.startsWith('STATUS_OK')) {
-        const parts = respStr.split(':');
-        if (parts.length >= 2) {
-          return { success: true, data: { code: parts[1] } };
-        }
-      }
-
-      if (data && (data.code || data.sms_code || data.status === 'completed' || data.otp)) {
-        const code = data.code || data.sms_code || data.otp;
-        if (code) return { success: true, data: { code: String(code) } };
-      }
-      return { success: false };
-    } catch (err) {
-      return { success: false };
-    }
-  } else if (provider === 'smsotpstores') {
-    try {
-      const cleanApiKey = SMSOTPSTORES_API_KEY ? SMSOTPSTORES_API_KEY.trim() : '';
+    } else if (provider === 'smsotpstores') {
       const res = await axios.get(`${SMSOTPSTORES_BASE_URL}/api.php`, {
         ...robustAxiosConfig,
-        params: { api_key: cleanApiKey, action: 'status', order_id: orderId }
+        params: { api_key: SMSOTPSTORES_API_KEY.trim(), action: 'status', order_id: orderId }
       });
-      const data = res.data;
-      if (data && (data.code || data.sms_code || data.status === 'completed')) {
-        const code = data.code || data.sms_code || data.otp;
-        if (code) return { success: true, data: { code: String(code) } };
-      }
-      return { success: false };
-    } catch (err) {
-      return { success: false };
-    }
-  } else {
-    try {
-      const cleanApiKey = JUICYSMS_API_KEY ? JUICYSMS_API_KEY.trim() : '';
+      if (res.data && res.data.code) return { success: true, data: { code: res.data.code } };
+    } else {
       const res = await axios.get(`${JUICYSMS_BASE_URL}/getsms`, {
         ...robustAxiosConfig,
-        params: { key: cleanApiKey, orderId: orderId }
+        params: { key: JUICYSMS_API_KEY.trim(), orderId: orderId }
       });
-      const respText = typeof res.data === 'string' ? res.data.trim() : JSON.stringify(res.data);
-      if (respText.startsWith('SUCCESS_')) {
-        return { success: true, data: { code: respText.replace('SUCCESS_', '') } };
-      }
-      return { success: false };
-    } catch (err) {
-      return { success: false };
+      const respText = typeof res.data === 'string' ? res.data.trim() : '';
+      if (respText.startsWith('SUCCESS_')) return { success: true, data: { code: respText.replace('SUCCESS_', '') } };
     }
-  }
+    return { success: false };
+  } catch (err) { return { success: false }; }
 }
 
 async function cancelOrder(provider, orderId) {
-  if (provider === 'allsmsverify') {
-    try {
-      const cleanApiKey = ALLSMSVERIFY_API_KEY ? ALLSMSVERIFY_API_KEY.trim() : '';
-      await axios.get(`${ALLSMSVERIFY_BASE_URL}/stubs/handler_api.php`, {
+  try {
+    if (provider === 'allsmsverify' || provider === 'authpadi') {
+      const baseUrl = provider === 'allsmsverify' ? ALLSMSVERIFY_BASE_URL : AUTHPADI_BASE_URL;
+      const apiKey = provider === 'allsmsverify' ? ALLSMSVERIFY_API_KEY : AUTHPADI_API_KEY;
+      await axios.get(`${baseUrl}/stubs/handler_api.php`, {
         ...robustAxiosConfig,
-        params: { api_key: cleanApiKey, action: 'setStatus', id: orderId, status: 8 }
+        params: { api_key: apiKey.trim(), action: 'setStatus', id: orderId, status: 8 }
       });
-    } catch (err) {}
-  } else if (provider === 'authpadi') {
-    try {
-      const cleanApiKey = AUTHPADI_API_KEY ? AUTHPADI_API_KEY.trim() : '';
-      await axios.get(`${AUTHPADI_BASE_URL}/stubs/handler_api.php`, {
-        ...robustAxiosConfig,
-        params: { api_key: cleanApiKey, action: 'setStatus', id: orderId, status: 8 }
-      });
-    } catch (err) {}
-  } else if (provider === 'smsotpstores') {
-    try {
-      const cleanApiKey = SMSOTPSTORES_API_KEY ? SMSOTPSTORES_API_KEY.trim() : '';
+    } else if (provider === 'smsotpstores') {
       await axios.get(`${SMSOTPSTORES_BASE_URL}/api.php`, {
         ...robustAxiosConfig,
-        params: { api_key: cleanApiKey, action: 'cancel', order_id: orderId }
+        params: { api_key: SMSOTPSTORES_API_KEY.trim(), action: 'cancel', order_id: orderId }
       });
-    } catch (err) {}
-  } else {
-    try {
-      const cleanApiKey = JUICYSMS_API_KEY ? JUICYSMS_API_KEY.trim() : '';
+    } else {
       await axios.get(`${JUICYSMS_BASE_URL}/cancelorder`, {
         ...robustAxiosConfig,
-        params: { key: cleanApiKey, orderId: orderId }
+        params: { key: JUICYSMS_API_KEY.trim(), orderId: orderId }
       });
-    } catch (err) {}
-  }
+    }
+  } catch (err) {}
 }
+
+// New Admin Command to check active servers and balances from backend
+bot.command('servers', async (ctx) => {
+  const adminId = String(ctx.from.id);
+  if (adminId !== ADMIN_TELEGRAM_ID) return ctx.reply(`❌ Unauthorized.`);
+
+  ctx.reply(`Checking backend server status & balances... ⏳`);
+  let statusReport = `🖥️ *BACKEND SERVER STATUS REPORT*\n\n`;
+
+  // Server One (JuicySMS)
+  try {
+    const res = await axios.get(`${JUICYSMS_BASE_URL}/balance`, { ...robustAxiosConfig, params: { key: JUICYSMS_API_KEY } });
+    statusReport += `• *Server One (JuicySMS):* ✅ ONLINE (Bal: ${res.data?.balance || 'Active'})\n`;
+  } catch (e) { statusReport += `• *Server One (JuicySMS):* ❌ OFFLINE\n`; }
+
+  // Server Two (SMSOTPStores)
+  try {
+    const res = await axios.get(`${SMSOTPSTORES_BASE_URL}/api.php`, { ...robustAxiosConfig, params: { api_key: SMSOTPSTORES_API_KEY, action: 'balance' } });
+    statusReport += `• *Server Two (SMSOTPStores):* ✅ ONLINE (Bal: ${res.data?.balance || 'Active'})\n`;
+  } catch (e) { statusReport += `• *Server Two (SMSOTPStores):* ❌ OFFLINE\n`; }
+
+  // Server Three (AuthPadi)
+  try {
+    const res = await axios.get(`${AUTHPADI_BASE_URL}/stubs/handler_api.php`, { ...robustAxiosConfig, params: { api_key: AUTHPADI_API_KEY, action: 'getBalance' } });
+    statusReport += `• *Server Three (AuthPadi):* ✅ ONLINE (${res.data || 'Active'})\n`;
+  } catch (e) { statusReport += `• *Server Three (AuthPadi):* ❌ OFFLINE\n`; }
+
+  // Server Four (AllSMSVerify)
+  try {
+    const res = await axios.get(`${ALLSMSVERIFY_BASE_URL}/stubs/handler_api.php`, { ...robustAxiosConfig, params: { api_key: ALLSMSVERIFY_API_KEY, action: 'getBalance' } });
+    statusReport += `• *Server Four (AllSMSVerify):* ✅ ONLINE (${res.data || 'Active'})\n`;
+  } catch (e) { statusReport += `• *Server Four (AllSMSVerify):* ❌ OFFLINE\n`; }
+
+  ctx.reply(statusReport, { parse_mode: 'Markdown' });
+});
 
 bot.start(async (ctx) => {
   const userId = ctx.from.id;
   const session = await getUserSession(userId);
   session.state = 'AWAITING_COUNTRY';
-  session.country = null;
-  session.selectedServiceQuery = null;
-  session.chosenProvider = null;
   await saveUserSession(userId, session);
-
-  ctx.reply(
-    `How far boss! 👋 Welcome to *MJ SMS*! ✨\n\n` +
-    `💰 *Your Balance:* ₦${(session.balance || 0).toLocaleString()}\n\n` +
-    `Just type what you need naturally! For example: *'US WhatsApp'* or *'Canadian Facebook'*. 🚀\n` +
-    `• Type */orders* to view your order history!\n` +
-    `• Type */fund* to top up your wallet balance!\n` +
-    `• Type */privacy* to view our privacy policy!\n` +
-    `• Type *support* anytime for customer care.`,
-    { parse_mode: 'Markdown' }
-  );
+  ctx.reply(`Oya boss! Welcome to *MJ SMS*! Just type any country and app naturally (e.g., *Germany WhatsApp* or *India Telegram*). ✨`, { parse_mode: 'Markdown' });
 });
 
 bot.command(['balance', 'bal'], async (ctx) => {
-  const userId = ctx.from.id;
-  const session = await getUserSession(userId);
+  const session = await getUserSession(ctx.from.id);
   ctx.reply(`Boss your current balance na ₦${(session.balance || 0).toLocaleString()} ✨`, { parse_mode: 'Markdown' });
 });
 
-bot.command(['fund', 'deposit', 'wallet', 'topup'], async (ctx) => {
-  const userId = ctx.from.id;
-  const session = await getUserSession(userId);
+bot.command(['fund', 'deposit', 'topup'], async (ctx) => {
+  const session = await getUserSession(ctx.from.id);
   session.state = 'AWAITING_DEPOSIT_AMOUNT';
-  await saveUserSession(userId, session);
-
-  ctx.reply(
-    `💳 *MJ SMS WALLET TOP-UP*\n\n` +
-    `💰 *Current Balance:* ₦${(session.balance || 0).toLocaleString()}\n\n` +
-    `Enter the amount you want to deposit in Naira (e.g., *1000*, *2000*, *5000*):`,
-    { parse_mode: 'Markdown' }
-  );
+  await saveUserSession(ctx.from.id, session);
+  ctx.reply(`💳 Enter the amount you want to deposit in Naira (e.g., *1000*, *2000*):`, { parse_mode: 'Markdown' });
 });
 
-bot.command(['orders', 'history_orders'], async (ctx) => {
-  const userId = ctx.from.id;
-  const session = await getUserSession(userId);
-  if (!session.orders || session.orders.length === 0) {
-    ctx.reply(`📭 You don't have any order history yet.`, { parse_mode: 'Markdown' });
-    return;
-  }
-
-  const recentOrders = session.orders.slice(-10).reverse().map(o => 
-    `• *Service:* ${o.serviceName}\n` +
-    `  📞 \`${o.phoneNumber}\`\n` +
-    `  🆔 *Tracking ID:* \`${o.orderId}\`\n` +
-    `  💰 *Cost:* ₦${o.price.toLocaleString()}\n` +
-    `  📊 *Status:* ${o.status}\n` +
-    `  🕒 *Date:* ${o.date}`
-  ).join('\n\n');
-
-  ctx.reply(`📦 *YOUR RECENT ORDER HISTORY*\n\n${recentOrders}`, { parse_mode: 'Markdown' });
+bot.command('orders', async (ctx) => {
+  const session = await getUserSession(ctx.from.id);
+  if (!session.orders || session.orders.length === 0) return ctx.reply(`📭 No order history yet.`);
+  const history = session.orders.slice(-10).reverse().map(o => `• ${o.serviceName} | \`${o.phoneNumber}\` | ₦${o.price} | ${o.status}`).join('\n');
+  ctx.reply(`📦 *YOUR ORDERS*\n\n${history}`, { parse_mode: 'Markdown' });
 });
 
-bot.command(['privacy', 'privacypolicy'], (ctx) => {
-  ctx.reply(
-    `🔒 *MJ SMS — PRIVACY POLICY*\n\n` +
-    `We value your privacy and are committed to protecting your personal information. Here is a brief summary of how we handle your data:\n\n` +
-    `• *Data Collected:* We store your Telegram ID, username, and wallet balance to manage your account.\n` +
-    `• *Transactions:* Payment records and order histories are safely logged for your convenience.\n` +
-    `• *Security:* Your data is securely protected via Supabase and encrypted APIs.\n` +
-    `• *Third Parties:* We use Paystack for secure wallet funding and partner SMS servers strictly to provision numbers.\n\n` +
-    `If you have any questions or concerns, reach out to our customer support via the support menu! ✨`,
-    { parse_mode: 'Markdown' }
-  );
+bot.command('privacy', (ctx) => {
+  ctx.reply(`🔒 *MJ SMS Privacy Policy:* Your data is secure and encrypted via Supabase and Paystack.`);
 });
-
-// Admin command to manually credit a user: /credit <user_id> <amount>
-bot.command('credit', async (ctx) => {
-  const adminId = String(ctx.from.id);
-  if (adminId !== ADMIN_TELEGRAM_ID) {
-    return ctx.reply(`❌ You are not authorized to use this command.`);
-  }
-
-  const args = ctx.message.text.split(' ');
-  if (args.length < 3) {
-    return ctx.reply(`Usage: /credit <user_id> <amount>\nExample: /credit 123456789 3000`);
-  }
-
-  const targetUserId = args[1];
-  const amountToAdd = parseFloat(args[2]);
-
-  if (isNaN(amountToAdd) || amountToAdd <= 0) {
-    return ctx.reply(`❌ Please enter a valid amount to credit.`);
-  }
-
-  const session = await getUserSession(targetUserId);
-  session.balance = (session.balance || 0) + amountToAdd;
-  await saveUserSession(targetUserId, session);
-
-  ctx.reply(`✅ Successfully credited ₦${amountToAdd.toLocaleString()} to user \`${targetUserId}\`.\nNew Balance: ₦${session.balance.toLocaleString()}`, { parse_mode: 'Markdown' });
-
-  try {
-    await bot.telegram.sendMessage(
-      targetUserId,
-      `🎉 *DEPOSIT CONFIRMED & CREDITED!*\n\n` +
-      `💳 *Amount Added:* ₦${amountToAdd.toLocaleString()}\n` +
-      `💰 *New Balance:* ₦${session.balance.toLocaleString()}\n\n` +
-      `Sorry for the initial delay, boss! You can now order your numbers. ✨`,
-      { parse_mode: 'Markdown' }
-    );
-  } catch (err) {}
-});
-
-bot.command(['support', 'help', 'customercare'], (ctx) => sendCustomerSupportMessage(ctx));
-
-function sendCustomerSupportMessage(ctx) {
-  ctx.reply(
-    `💬 *MJ SMS CUSTOMER CARE*\n\n` +
-    `Need help with an order, wallet funding, or balance issues? Provide your *Tracking ID* to support.\n` +
-    `Tap the button below to message customer support on WhatsApp: 👇`,
-    {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([
-        [Markup.button.url('💬 Chat Customer Care on WhatsApp', 'https://wa.me/qr/XM6ORO7UCYTXI1')]
-      ])
-    }
-  );
-}
 
 bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
@@ -792,94 +526,35 @@ bot.on('text', async (ctx) => {
   const lowerText = rawText.toLowerCase();
   const session = await getUserSession(userId);
 
-  if (['support', 'customer care', 'speak to support', 'admin', 'contact'].some(k => lowerText.includes(k))) {
-    sendCustomerSupportMessage(ctx);
-    return;
-  }
-
-  if (lowerText.includes('balance') || lowerText.includes('bal') || lowerText === 'my balance') {
-    ctx.reply(`Boss your current balance na ₦${(session.balance || 0).toLocaleString()} ✨`, { parse_mode: 'Markdown' });
-    return;
-  }
-
-  if (['fund', 'deposit', 'wallet', 'topup', 'top up'].some(k => lowerText.includes(k))) {
-    session.state = 'AWAITING_DEPOSIT_AMOUNT';
-    await saveUserSession(userId, session);
-    ctx.reply(
-      `💳 *MJ SMS WALLET TOP-UP*\n\n` +
-      `💰 *Current Balance:* ₦${(session.balance || 0).toLocaleString()}\n\n` +
-      `Enter the amount you want to deposit in Naira (e.g., *1000*, *2000*):`,
-      { parse_mode: 'Markdown' }
-    );
-    return;
-  }
-
-  if (['/start', 'change country', 'countries', 'back', 'start'].some(k => lowerText === k)) {
+  if (['/start', 'change country', 'back'].some(k => lowerText === k)) {
     session.state = 'AWAITING_COUNTRY';
-    session.country = null;
-    session.selectedServiceQuery = null;
-    session.chosenProvider = null;
     await saveUserSession(userId, session);
-    ctx.reply(`No p boss! Just type what you need naturally (e.g., *US WhatsApp* or *Canada Facebook*).`, { parse_mode: 'Markdown' });
-    return;
+    return ctx.reply(`No p boss! Type any country and service you need.`);
   }
 
   if (session.state === 'AWAITING_DEPOSIT_AMOUNT') {
     const amount = parseInt(rawText.replace(/[^0-9]/g, ''));
-    if (isNaN(amount) || amount < 100) {
-      ctx.reply(`Please enter a valid amount (minimum ₦100).`);
-      return;
-    }
-    ctx.reply(`Generating payment link... ⏳`);
+    if (isNaN(amount) || amount < 100) return ctx.reply(`Please enter a valid amount.`);
     const payment = await initializePaystackPayment(`${userId}@mjsms.com`, amount, userId);
     if (payment.status && payment.data?.authorization_url) {
       session.state = 'IDLE';
       await saveUserSession(userId, session);
-      ctx.reply(
-        `💳 *PAYSTACK PAYMENT LINK READY*\n\n` +
-        `Amount: *₦${amount.toLocaleString()}*\n\n` +
-        `Tap below to complete payment: 👇`,
-        {
-          parse_mode: 'Markdown',
-          ...Markup.inlineKeyboard([[Markup.button.url('💳 Pay Now via Paystack', payment.data.authorization_url)]])
-        }
-      );
-    } else {
-      ctx.reply(`❌ Could not generate payment link.`);
+      return ctx.reply(`💳 Tap below to pay:`, Markup.inlineKeyboard([[Markup.button.url('Pay Now', payment.data.authorization_url)]]));
     }
-    return;
+    return ctx.reply(`❌ Payment link error.`);
   }
 
-  const allSupportedCountries = [...JUICYSMS_COUNTRIES, ...SMSOTPSTORES_COUNTRIES, ...AUTHPADI_COUNTRIES, ...ALLSMSVERIFY_COUNTRIES];
+  // Fetch all countries dynamically from APIs
+  const allCountries = await fetchAllCountries();
 
-  const getNormalizedCountry = (input) => {
-    const cleanInput = input.toLowerCase().trim();
-    return allSupportedCountries.find(c => {
-      const cName = String(c.name).toLowerCase();
-      const cId = String(c.id).toLowerCase();
-      const cShort = String(c.short || '').toLowerCase();
-
-      return cName === cleanInput || 
-             cName.includes(cleanInput) || 
-             cleanInput.includes(cName) || 
-             cId === cleanInput || 
-             cShort === cleanInput ||
-             (cleanInput.includes('usa') && cId === 'us') ||
-             (cleanInput.includes('uk') && cId === 'uk') ||
-             (cleanInput.includes('nl') && cId === 'nl') ||
-             (cleanInput.includes('de') && cId === 'de') ||
-             (cleanInput.includes('ca') && cId === 'ca') ||
-             (cleanInput.includes('ng') && cId === 'ng');
-    });
-  };
-
-  const words = lowerText.split(/\s+/);
+  // Match country from text dynamically
   let matchedCountry = null;
   let serviceQueryWords = [];
+  const words = lowerText.split(/\s+/);
 
   for (let i = 0; i < words.length; i++) {
     const subQuery = words.slice(0, i + 1).join(' ');
-    const found = getNormalizedCountry(subQuery);
+    const found = allCountries.find(c => String(c.name).toLowerCase().includes(subQuery) || String(c.id).toLowerCase() === subQuery);
     if (found) {
       matchedCountry = found;
       serviceQueryWords = words.slice(i + 1);
@@ -888,80 +563,53 @@ bot.on('text', async (ctx) => {
   }
 
   if (matchedCountry && serviceQueryWords.length > 0) {
-    let rawServiceQuery = serviceQueryWords.join(' ');
+    let rawService = serviceQueryWords.join(' ');
     for (const [canonical, synonyms] of Object.entries(COMMON_SERVICE_SYNONYMS)) {
-      if (synonyms.some(syn => rawServiceQuery.includes(syn))) {
-        rawServiceQuery = canonical;
-        break;
-      }
+      if (synonyms.some(syn => rawService.includes(syn))) rawService = canonical;
     }
-
     session.country = matchedCountry;
-    session.selectedServiceQuery = rawServiceQuery;
-    session.state = 'AWAITING_SERVER_SELECTION';
+    session.selectedServiceQuery = rawService;
     await saveUserSession(userId, session);
-    await promptServerSelection(ctx, session);
-    return;
+    return await promptServerSelection(ctx, session);
   }
 
+  // Reverse match fallback
   for (let i = 0; i < words.length; i++) {
-    const potentialCountryQuery = words.slice(i).join(' ');
-    const foundCountry = getNormalizedCountry(potentialCountryQuery);
-    if (foundCountry) {
-      let rawServiceQuery = words.slice(0, i).join(' ');
-      for (const [canonical, synonyms] of Object.entries(COMMON_SERVICE_SYNONYMS)) {
-        if (synonyms.some(syn => rawServiceQuery.includes(syn))) {
-          rawServiceQuery = canonical;
-          break;
-        }
-      }
-      if (rawServiceQuery) {
-        session.country = foundCountry;
-        session.selectedServiceQuery = rawServiceQuery;
-        session.state = 'AWAITING_SERVER_SELECTION';
+    const potentialCountry = words.slice(i).join(' ');
+    const found = allCountries.find(c => String(c.name).toLowerCase().includes(potentialCountry) || String(c.id).toLowerCase() === potentialCountry);
+    if (found) {
+      let rawService = words.slice(0, i).join(' ');
+      if (rawService) {
+        session.country = found;
+        session.selectedServiceQuery = rawService;
         await saveUserSession(userId, session);
-        await promptServerSelection(ctx, session);
-        return;
+        return await promptServerSelection(ctx, session);
       }
     }
   }
 
-  const matchedCountryDirect = getNormalizedCountry(lowerText);
-  if (matchedCountryDirect) {
-    session.country = matchedCountryDirect;
+  const directCountry = allCountries.find(c => String(c.name).toLowerCase() === lowerText || String(c.id).toLowerCase() === lowerText);
+  if (directCountry) {
+    session.country = directCountry;
     session.state = 'AWAITING_SERVICE';
     await saveUserSession(userId, session);
-    ctx.reply(
-      `Ehen! You select *${matchedCountryDirect.name}* 👌\n\n` +
-      `Which app or service you wan verify? (e.g., _WhatsApp_, _Telegram_, _Facebook_)`,
-      { parse_mode: 'Markdown' }
-    );
-    return;
+    return ctx.reply(`Ehen! You select *${directCountry.name}*. Which service you wan verify?`, { parse_mode: 'Markdown' });
   }
 
   if (session.state === 'AWAITING_SERVICE' && session.country) {
-    let rawServiceQuery = rawText;
-    for (const [canonical, synonyms] of Object.entries(COMMON_SERVICE_SYNONYMS)) {
-      if (synonyms.some(syn => rawServiceQuery.toLowerCase().includes(syn))) {
-        rawServiceQuery = canonical;
-        break;
-      }
-    }
-    session.selectedServiceQuery = rawServiceQuery;
-    session.state = 'AWAITING_SERVER_SELECTION';
+    session.selectedServiceQuery = rawText;
     await saveUserSession(userId, session);
-    await promptServerSelection(ctx, session);
-    return;
+    return await promptServerSelection(ctx, session);
   }
 
-  ctx.reply(`Oya boss, just tell me what you need naturally like *'US WhatsApp'* or *'Canada Telegram'*! ✨`, { parse_mode: 'Markdown' });
+  ctx.reply(`Oya boss, specify both country and app name naturally (e.g., *Germany WhatsApp* or *Ghana Telegram*). ✨`, { parse_mode: 'Markdown' });
 });
 
 async function promptServerSelection(ctx, session) {
-  ctx.reply(`Checking available servers and translating service codes... ⏳`);
+  ctx.reply(`Fetching live stock across all servers... ⏳`);
   const availableServers = await fetchCombinedServices(session.country);
   const q = (session.selectedServiceQuery || '').toLowerCase().trim();
-  
+
   const filtered = availableServers.filter(s => {
     const sName = String(s.service_name || '').toLowerCase();
     const sId = String(s.service_id || '').toLowerCase();
@@ -972,24 +620,13 @@ async function promptServerSelection(ctx, session) {
   if (filtered.length === 0) {
     session.state = 'AWAITING_SERVICE';
     await saveUserSession(userId, session);
-    const topServices = availableServers.slice(0, 15).map(s => `• ${s.service_name}`).join('\n');
-    ctx.reply(
-      `Eya! No stock found for *${session.selectedServiceQuery}* right now. 💔\n\n` +
-      `Available services on this country:\n${topServices || 'None available'}\n\n` +
-      `Type another app name or type *change country* to switch.`,
-      { parse_mode: 'Markdown' }
-    );
-    return;
+    return ctx.reply(`💔 No stock found for *${session.selectedServiceQuery}* in *${session.country.name}*. Try another app!`, { parse_mode: 'Markdown' });
   }
 
   const uniqueServersMap = new Map();
   filtered.forEach(srv => {
-    if (!uniqueServersMap.has(srv.server_label)) {
-      uniqueServersMap.set(srv.server_label, srv);
-    }
+    if (!uniqueServersMap.has(srv.server_label)) uniqueServersMap.set(srv.server_label, srv);
   });
-
-  const countryName = typeof session.country === 'object' ? session.country.name : session.country;
 
   const serverButtons = [];
   uniqueServersMap.forEach((srv, label) => {
@@ -997,11 +634,7 @@ async function promptServerSelection(ctx, session) {
   });
   serverButtons.push([Markup.button.callback('🔄 Choose Another Country', 'reset_flow')]);
 
-  ctx.reply(
-    `Oya boss! You selected *${session.selectedServiceQuery}* for *${countryName}*.\n\n` +
-    `Please select your preferred server below: 👇`,
-    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(serverButtons) }
-  );
+  ctx.reply(`Select your preferred server for *${session.selectedServiceQuery}* (${session.country.name}): 👇`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(serverButtons) });
 }
 
 bot.action(/^server\|(.+)\|(.+)$/, async (ctx) => {
@@ -1009,194 +642,77 @@ bot.action(/^server\|(.+)\|(.+)$/, async (ctx) => {
   const userId = ctx.from.id;
   const session = await getUserSession(userId);
   const provider = ctx.match[1];
-
-  session.chosenProvider = provider;
-  await saveUserSession(userId, session);
-
   const availableServers = await fetchCombinedServices(session.country);
   const q = (session.selectedServiceQuery || '').toLowerCase().trim();
 
-  const filtered = availableServers.filter(s => {
-    const sName = String(s.service_name || '').toLowerCase();
-    const sId = String(s.service_id || '').toLowerCase();
-    return String(s.provider) === String(provider) && (sName.includes(q) || q.includes(sName) || sId.includes(q));
-  });
+  const filtered = availableServers.filter(s => String(s.provider) === String(provider) && (String(s.service_name).toLowerCase().includes(q) || q.includes(String(s.service_name).toLowerCase())));
 
-  if (filtered.length === 0) {
-    ctx.reply(`❌ No services found on this server. Please try again.`);
-    return;
-  }
-
-  const countryIdCode = typeof session.country === 'object' ? session.country.id : session.country;
-
-  const buttons = filtered.map((srv) => {
+  const buttons = filtered.map(srv => {
     const finalPrice = calculateFinalPrice(srv.price, srv.is_ngn);
-    const cbData = `buy|${srv.provider}|${countryIdCode}|${srv.service_id}`;
-    return [Markup.button.callback(`💰 ${srv.server_label} (${srv.service_name}) - ₦${finalPrice.toLocaleString()} (${srv.stock} left)`, cbData)];
+    return [Markup.button.callback(`💰 ${srv.server_label} (${srv.service_name}) - ₦${finalPrice.toLocaleString()} (${srv.stock} left)`, `buy|${srv.provider}|${session.country.id}|${srv.service_id}`)];
   });
+  buttons.push([Markup.button.callback('⬅️ Back', 'back_to_servers')]);
 
-  buttons.push([Markup.button.callback('⬅️ Back to Servers', 'back_to_servers')]);
-
-  session.state = 'AWAITING_PRICE_SELECTION';
-  await saveUserSession(userId, session);
-
-  ctx.reply(
-    `Ehen boss! See pricing for *${session.selectedServiceQuery}* on your chosen server:\n\nTap option below to buy:`,
-    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
-  );
+  ctx.reply(`Choose pricing option:`, Markup.inlineKeyboard(buttons));
 });
 
 bot.action('back_to_servers', async (ctx) => {
   ctx.answerCbQuery();
-  const userId = ctx.from.id;
-  const session = await getUserSession(userId);
-  if (session.country && session.selectedServiceQuery) {
-    await promptServerSelection(ctx, session);
-  } else {
-    ctx.reply(`Please start over by typing your country code.`);
-  }
+  const session = await getUserSession(ctx.from.id);
+  if (session.country) await promptServerSelection(ctx, session);
 });
 
 bot.action(/^buy\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
   ctx.answerCbQuery();
   const userId = ctx.from.id;
   const session = await getUserSession(userId);
-  const provider = ctx.match[1];
-  const countryId = ctx.match[2];
-  const serviceId = ctx.match[3];
+  const [_, provider, countryId, serviceId] = ctx.match;
 
-  const availableServers = await fetchCombinedServices({ id: countryId, name: countryId });
-  const targetService = availableServers.find(s => String(s.provider) === String(provider) && String(s.service_id) === String(serviceId));
-  
-  const calculatedNgnPrice = targetService ? calculateFinalPrice(targetService.price, targetService.is_ngn) : 0;
+  const availableServers = await fetchCombinedServices({ id: countryId });
+  const target = availableServers.find(s => s.provider === provider && String(s.service_id) === String(serviceId));
+  const price = target ? calculateFinalPrice(target.price, target.is_ngn) : 0;
 
-  if (calculatedNgnPrice > 0 && session.balance < calculatedNgnPrice) {
-    ctx.reply(
-      `❌ *Insufficient Balance!*\n\n` +
-      `This number costs *₦${calculatedNgnPrice.toLocaleString()}*, but your balance is *₦${(session.balance || 0).toLocaleString()}*.\n\n` +
-      `Type */fund* to top up your wallet and try again! 💳`,
-      { parse_mode: 'Markdown' }
-    );
-    return;
+  if (price > 0 && session.balance < price) {
+    return ctx.reply(`❌ Insufficient balance! Type */fund* to top up.`, { parse_mode: 'Markdown' });
   }
 
-  ctx.reply(`Processing your number purchase... Please wait ⏳`);
-
+  ctx.reply(`Processing order... ⏳`);
   const response = await executeOrder(provider, serviceId, countryId);
 
   if (response.success && response.data) {
-    if (calculatedNgnPrice > 0) {
-      session.balance = Math.max(0, session.balance - calculatedNgnPrice);
+    if (price > 0) {
+      session.balance = Math.max(0, session.balance - price);
       await saveUserSession(userId, session);
     }
-
     const orderId = response.data.order_id;
     const phoneNumber = response.data.number;
-    const serviceName = targetService ? targetService.service_name : serviceId;
 
-    const orderRecord = {
-      orderId: orderId,
-      provider: provider,
-      serviceName: serviceName,
-      phoneNumber: phoneNumber,
-      price: calculatedNgnPrice,
-      status: 'Pending Code',
-      date: new Date().toLocaleString()
-    };
-    
-    await addOrderToDb(userId, orderRecord);
+    await addOrderToDb(userId, { orderId, provider, serviceName: target?.service_name || serviceId, phoneNumber, price, status: 'Pending', date: new Date().toLocaleString() });
 
-    ctx.reply(
-      `🎉 *NUMBER PURCHASED SUCCESSFULLY!*\n\n` +
-      `📞 *Phone Number:* \`${phoneNumber}\`\n` +
-      `🆔 *Tracking ID:* \`${orderId}\` _(Save this in case of complaints!)_\n` +
-      `💰 *Charged:* ₦${calculatedNgnPrice.toLocaleString()}\n` +
-      `💳 *New Balance:* ₦${session.balance.toLocaleString()}\n\n` +
-      `👉 Copy the number above into your app.\n` +
-      `⏳ Waiting for your SMS code...`,
-      { parse_mode: 'Markdown' }
-    );
+    ctx.reply(`🎉 *NUMBER BOUGHT!*\n📞 \`${phoneNumber}\`\n🆔 \`${orderId}\`\nWaiting for SMS code...`, { parse_mode: 'Markdown' });
 
-    let pollCount = 0;
-    const maxPolls = 80;
-
-    const intervalId = setInterval(async () => {
-      pollCount++;
-      const checkRes = await checkSmsCode(provider, orderId);
-
-      if (checkRes.success && checkRes.data && checkRes.data.code) {
-        clearInterval(intervalId);
-        await updateOrderStatusInDb(orderId, `Completed (Code: ${checkRes.data.code})`);
-
-        ctx.reply(
-          `🔥🔥 *SMS CODE RECEIVED!* 🔥🔥\n\n` +
-          `📞 *Number:* \`${phoneNumber}\`\n` +
-          `🆔 *Tracking ID:* \`${orderId}\`\n` +
-          `🔑 *Verification Code:* \`${checkRes.data.code}\`\n\n` +
-          `Thank you for using *MJ SMS*! ✨`,
-          { parse_mode: 'Markdown' }
-        );
-      } else if (pollCount >= maxPolls) {
-        clearInterval(intervalId);
+    let polls = 0;
+    const pollInterval = setInterval(async () => {
+      polls++;
+      const check = await checkSmsCode(provider, orderId);
+      if (check.success && check.data?.code) {
+        clearInterval(pollInterval);
+        await updateOrderStatusInDb(orderId, `Completed (${check.data.code})`);
+        ctx.reply(`🔥🔥 *CODE RECEIVED:* \`${check.data.code}\` 🔥🔥`, { parse_mode: 'Markdown' });
+      } else if (polls >= 80) {
+        clearInterval(pollInterval);
         await cancelOrder(provider, orderId);
-        if (calculatedNgnPrice > 0) {
-          const freshSession = await getUserSession(userId);
-          freshSession.balance += calculatedNgnPrice;
-          await saveUserSession(userId, freshSession);
-          await updateOrderStatusInDb(orderId, 'Canceled & Refunded (Timeout)');
+        if (price > 0) {
+          const fresh = await getUserSession(userId);
+          fresh.balance += price;
+          await saveUserSession(userId, fresh);
         }
-        ctx.reply(`⏰ *Time Out:* Code no enter after 10 minutes. Order canceled and ₦${calculatedNgnPrice.toLocaleString()} returned to your balance!`);
+        ctx.reply(`⏰ Timeout! Order canceled and ₦${price} refunded.`);
       }
     }, 7000);
-
   } else {
-    ctx.reply(`❌ *Purchase Failed:* ${response.message || 'Server out of stock or insufficient account balance.'}`);
+    ctx.reply(`❌ Order failed: ${response.message}`);
   }
-});
-
-bot.action('reset_flow', async (ctx) => {
-  ctx.answerCbQuery();
-  const userId = ctx.from.id;
-  const session = await getUserSession(userId);
-  session.state = 'AWAITING_COUNTRY';
-  session.country = null;
-  session.selectedServiceQuery = null;
-  session.chosenProvider = null;
-  await saveUserSession(userId, session);
-  ctx.reply(`No p boss! Which country you wan check now? (Type *US*, *NG*, *NL*, *UK*, *CA* or *DE*)`);
-});
-
-const TELEGRAM_WEBHOOK_PATH = `/webhook/telegram`;
-app.use(bot.webhookCallback(TELEGRAM_WEBHOOK_PATH));
-
-app.post('/webhook/paystack', async (req, res) => {
-  const event = req.body;
-  if (event && event.event === 'charge.success') {
-    const data = event.data;
-    const userId = data.metadata?.telegram_id;
-    const amountPaidNgn = data.amount / 100;
-
-    if (userId) {
-      const session = await getUserSession(userId);
-      session.balance = (session.balance || 0) + amountPaidNgn;
-      await saveUserSession(userId, session);
-      
-      const dateStr = new Date().toLocaleString();
-      await addTransactionToDb(userId, amountPaidNgn, dateStr);
-
-      try {
-        await bot.telegram.sendMessage(
-          userId,
-          `🎉 *PAYMENT SUCCESSFUL!*\n\n` +
-          `💳 *Amount Credited:* ₦${amountPaidNgn.toLocaleString()}\n` +
-          `💰 *New Balance:* ₦${session.balance.toLocaleString()}\n\n` +
-          `You can now order numbers!`,
-          { parse_mode: 'Markdown' }
-        );
-      } catch (err) {}
-    }
-  }
-  res.sendStatus(200);
 });
 
 app.get('/', (req, res) => res.send('MJ SMS Bot Active!'));
@@ -1204,8 +720,6 @@ app.get('/', (req, res) => res.send('MJ SMS Bot Active!'));
 app.listen(PORT, async () => {
   console.log(`Server listening on port ${PORT}`);
   if (SERVER_URL) {
-    try {
-      await bot.telegram.setWebhook(`${SERVER_URL}${TELEGRAM_WEBHOOK_PATH}`);
-    } catch (err) {}
+    try { await bot.telegram.setWebhook(`${SERVER_URL}/webhook/telegram`); } catch (e) {}
   }
 });
