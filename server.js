@@ -270,12 +270,11 @@ async function getAuthPadiServices(countryId) {
     } else if (Array.isArray(data)) {
       list = data;
     } else if (data && typeof data === 'object') {
-      // Handle key-value service maps if returned by standard stubs api format
       list = Object.keys(data).map(k => ({
         id: k,
-        name: data[k].name || k,
-        stock: data[k].count || data[k].stock || 100,
-        price: data[k].price || 0
+        name: data[k].name || data[k].service_name || k,
+        stock: data[k].count || data[k].stock || data[k].quantity || 100,
+        price: data[k].price || data[k].cost || 0
       }));
     }
 
@@ -287,6 +286,7 @@ async function getAuthPadiServices(countryId) {
       is_ngn: true
     })).filter(s => s.service_id);
   } catch (err) {
+    console.error("AuthPadi Services Error:", err.message);
     return [];
   }
 }
@@ -366,7 +366,6 @@ async function executeOrder(provider, serviceId, countryId) {
       });
       const data = res.data;
       
-      // Handle standard text response format (e.g. ACCESS_NUMBER:id:number) or JSON responses
       let respStr = typeof data === 'string' ? data.trim() : JSON.stringify(data);
       if (respStr.startsWith('ACCESS_NUMBER')) {
         const parts = respStr.split(':');
