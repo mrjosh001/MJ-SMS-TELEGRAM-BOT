@@ -19,11 +19,9 @@ if (!BOT_TOKEN) {
 }
 
 const bot = new Telegraf(BOT_TOKEN);
-
-// User sessions memory store to maintain Pidgin chat context
 const userSessions = {};
 
-// Axios instance configured for logsdomain.com API
+// Axios instance pre-configured for logsdomain.com API
 const api = axios.create({
   baseURL: BASE_URL,
   headers: {
@@ -33,33 +31,17 @@ const api = axios.create({
 });
 
 // ------------------- DYNAMIC PROFIT MARGIN CONFIG -------------------
-
-// Default margin for general services (1.4 = 40% markup)
 const DEFAULT_MARGIN = 1.4;
 
-// Custom high-demand pricing rules (Minimum price floor & multiplier)
 const SERVICE_PRICING_RULES = {
-  'whatsapp': {
-    minPrice: 6000,    // Sell WhatsApp for at least ₦6,000
-    multiplier: 1.8    // 80% markup if base cost is high
-  },
-  'telegram': {
-    minPrice: 3500,
-    multiplier: 1.6
-  },
-  'facebook': {
-    minPrice: 2000,
-    multiplier: 1.5
-  },
-  'bamboo': {
-    minPrice: 4000,
-    multiplier: 1.7
-  }
+  'whatsapp': { minPrice: 6000, multiplier: 1.8 },
+  'telegram': { minPrice: 3500, multiplier: 1.6 },
+  'facebook': { minPrice: 2000, multiplier: 1.5 },
+  'bamboo': { minPrice: 4000, multiplier: 1.7 }
 };
 
-// Calculates final retail price in NGN
 function calculateRetailPrice(serviceName, providerPriceNgn) {
-  const serviceKey = (serviceName || '').toLowerCase();
+  const serviceKey = serviceName.toLowerCase();
   const rule = SERVICE_PRICING_RULES[serviceKey];
 
   let calculatedPrice = providerPriceNgn * DEFAULT_MARGIN;
@@ -70,43 +52,56 @@ function calculateRetailPrice(serviceName, providerPriceNgn) {
     minPrice = rule.minPrice || 0;
   }
 
-  const finalPrice = Math.max(calculatedPrice, minPrice);
-  return Math.ceil(finalPrice);
+  return Math.ceil(Math.max(calculatedPrice, minPrice));
 }
 
 // ------------------- API INTEGRATION FUNCTIONS -------------------
 
-// 1. Fetch available countries
 async function getCountries() {
   try {
     const res = await api.get('/numbers/countries');
-    return res.data && res.data.success ? res.data.data : [];
+    return res.data.success ? res.data.data : [];
   } catch (err) {
     console.error("Error fetching countries:", err.response?.data || err.message);
     return [];
   }
 }
 
-// 2. Fetch available services for a country
+// Updated getServices: logs raw provider response and handles array/object data shapes
 async function getServices(countryId) {
   try {
     const res = await api.get(`/numbers/services?country_id=${countryId}`);
-    return res.data && res.data.success ? res.data.data : [];
+    
+    // 🔍 THIS WILL PRINT THE EXACT API RESPONSE IN RENDER LOGS
+    console.log("LOGSDOMAIN SERVICES RAW RESPONSE:", JSON.stringify(res.data, null, 2));
+
+    if (!res.data || !res.data.data) {
+      return [];
+    }
+
+    // Handle array or object return formats
+    const servicesData = Array.isArray(res.data.data) 
+      ? res.data.data 
+      : Object.values(res.data.data);
+
+    return servicesData;
   } catch (err) {
     console.error("Error fetching services:", err.response?.data || err.message);
     return [];
   }
 }
 
-// 3. Purchase a number order
-async function purchaseNumber(countryId, serviceId) {
+async function purchaseNumber(countryId, serviceId, operatorId = null) {
   try {
     const idempotencyKey = `mj-order-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    const res = await api.post('/numbers/orders', {
+    const payload = {
       country_id: parseInt(countryId),
       service_id: parseInt(serviceId),
       idempotency_key: idempotencyKey
-    });
+    };
+    if (operatorId) payload.operator_id = operatorId;
+
+    const res = await api.post('/numbers/orders', payload);
     return res.data;
   } catch (err) {
     console.error("Error purchasing number:", err.response?.data || err.message);
@@ -114,108 +109,95 @@ async function purchaseNumber(countryId, serviceId) {
   }
 }
 
-// 4. Check for received SMS OTP code
 async function checkSmsCode(orderId) {
   try {
     const res = await api.post(`/numbers/orders/${orderId}/check`);
     return res.data;
   } catch (err) {
-    console.error("Error checking code:", err.response?.data || err.message);
     return { success: false };
   }
 }
 
-// 5. Cancel order
 async function cancelOrder(orderId) {
   try {
     const res = await api.post(`/numbers/orders/${orderId}/cancel`);
     return res.data;
   } catch (err) {
-    console.error("Error cancelling order:", err.response?.data || err.message);
     return { success: false };
   }
 }
 
-// ------------------- TELEGRAM CONVERSATIONAL FLOW -------------------
+// ------------------- ELSA CONVERSATIONAL BOT FLOW -------------------
 
-// /start command
+// Start command
 bot.start((ctx) => {
   const userId = ctx.from.id;
   userSessions[userId] = { state: 'AWAITING_COUNTRY' };
 
   ctx.reply(
-    `How far boss! 👋 My name na MJ, welcome to *MJ SMS*.\n\n` +
+    `How far boss! 👋 My name is *Elsa*. Welcome to *MJ SMS*! ✨\n` +
+    `Have a happy day today! 😊\n\n` +
     `I dey here to help you get virtual numbers for any app or country fast fast! 🚀\n\n` +
-    `Which country number you dey look for today? (e.g. _United States_, _Nigeria_, _United Kingdom_, _Sudan_)`,
+    `Which country number you dey look for today? (e.g. _United States_, _Nigeria_, _United Kingdom_)`,
     { parse_mode: 'Markdown' }
   );
 });
 
-// Main conversational message handler in Pidgin with smart one-liner support
+// Incoming text messages handler
 bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
   const rawText = ctx.message.text.trim();
   const lowerText = rawText.toLowerCase();
 
-  if (!userSessions[userId]) {
-    userSessions[userId] = { state: 'AWAITING_COUNTRY' };
-  }
-
+  if (!userSessions[userId]) userSessions[userId] = { state: 'AWAITING_COUNTRY' };
   const session = userSessions[userId];
 
   // Friendly greetings
   if (['hi', 'hello', 'hey', 'awfa', 'howfar', 'how far', 'xup'].some(g => lowerText.includes(g))) {
-    ctx.reply(`How far my boss! 😊\nWhich country virtual number you wan buy today? Just drop the country name for me.`);
+    ctx.reply(
+      `How far my boss! 😊 My name na *Elsa*, welcome to *MJ SMS*!\n` +
+      `Have a happy day today! ✨\n\n` +
+      `Which country virtual number you wan buy today? Just drop the country name for me.`
+    );
     session.state = 'AWAITING_COUNTRY';
     return;
   }
 
-  // ⚡ SMART ONE-LINER CHECK (e.g. "USA WhatsApp", "Nigeria Telegram", "Sudan Facebook")
   const countries = await getCountries();
+
+  // Smart Parsing: Detect combined input like "USA WhatsApp" or "Nigeria Telegram"
   if (countries.length > 0) {
     const words = lowerText.split(/\s+/);
-    
-    // Check if user provided both a country AND a service in one message
     let matchedCountry = null;
     let matchedServiceQuery = null;
 
-    // Find country in words
     for (const word of words) {
-      const foundCountry = countries.find(c => 
+      const found = countries.find(c => 
         c.name.toLowerCase() === word || 
         c.short.toLowerCase() === word ||
         (word === 'usa' && c.short.toLowerCase() === 'us') ||
         (word === 'uk' && c.short.toLowerCase() === 'gb')
       );
-
-      if (foundCountry) {
-        matchedCountry = foundCountry;
-        // Remaining words form the service query
+      if (found) {
+        matchedCountry = found;
         matchedServiceQuery = words.filter(w => w !== word).join(' ');
         break;
       }
     }
 
-    // If both Country and Service were typed together in one sentence
     if (matchedCountry && matchedServiceQuery) {
       session.country = matchedCountry;
       session.state = 'AWAITING_SERVICE';
-      
-      ctx.reply(`Oya wait make I check live price and stock for *${matchedServiceQuery}* (${matchedCountry.name})... 🔎`, { parse_mode: 'Markdown' });
+      ctx.reply(`Oya wait make I check available servers and price for *${matchedServiceQuery}* (${matchedCountry.name})... 🔎`, { parse_mode: 'Markdown' });
       await processServiceSelection(ctx, session, matchedServiceQuery);
       return;
     }
   }
 
-  // STEP 1: Process Country Selection
+  // Step 1: Process Country Input
   if (session.state === 'AWAITING_COUNTRY' || session.state === 'IDLE') {
     ctx.reply(`Hold on boss, make I check available countries... 🔎`);
-
-    if (!countries || !countries.length) {
-      ctx.reply(`Eya! Network issue dey to fetch countries right now. Try typing the country name again.`);
-      return;
-    }
-
+    
     const matchedCountry = countries.find(c => 
       c.name.toLowerCase().includes(lowerText) || 
       c.short.toLowerCase() === lowerText ||
@@ -226,26 +208,21 @@ bot.on('text', async (ctx) => {
     if (matchedCountry) {
       session.country = matchedCountry;
       session.state = 'AWAITING_SERVICE';
-
       ctx.reply(
         `Ehen! You select *${matchedCountry.name}* 👌\n\n` +
-        `Which app or service you wan verify with this number? (e.g. _WhatsApp_, _Telegram_, _Facebook_, _Bamboo_)`,
+        `Which app or service you wan verify? (e.g. _WhatsApp_, _Telegram_, _Facebook_)`,
         { parse_mode: 'Markdown' }
       );
     } else {
-      ctx.reply(
-        `I no find "*${rawText}*" for list of available countries boss. 😅\n\n` +
-        `Try type popular countries like _United States_, _United Kingdom_, _Nigeria_, _Canada_, or _Sudan_!`,
-        { parse_mode: 'Markdown' }
-      );
+      ctx.reply(`I no find "*${rawText}*" for available countries boss. Try *United States*, *United Kingdom*, or *Nigeria*!`, { parse_mode: 'Markdown' });
     }
     return;
   }
 
-  // STEP 2: Process Service Selection
+  // Step 2: Process Service Input
   if (session.state === 'AWAITING_SERVICE') {
-    // Check if user is trying to switch country instead while in service state
-    const newCountryMatch = (await getCountries()).find(c => 
+    // Check if user typed a new country name instead
+    const newCountryMatch = countries.find(c => 
       c.name.toLowerCase() === lowerText || 
       c.short.toLowerCase() === lowerText ||
       (lowerText === 'usa' && c.short.toLowerCase() === 'us')
@@ -253,75 +230,87 @@ bot.on('text', async (ctx) => {
 
     if (newCountryMatch) {
       session.country = newCountryMatch;
-      ctx.reply(
-        `Switched country to *${newCountryMatch.name}* 👌\n\nWhich app or service you wan verify?`,
-        { parse_mode: 'Markdown' }
-      );
+      ctx.reply(`Switched country to *${newCountryMatch.name}* 👌\n\nWhich app or service you wan verify?`, { parse_mode: 'Markdown' });
       return;
     }
 
-    ctx.reply(`Oya wait make I check live price and stock for *${rawText}* (${session.country.name})... 🔎`, { parse_mode: 'Markdown' });
+    ctx.reply(`Oya wait make I check available servers for *${rawText}* (${session.country.name})... 🔎`, { parse_mode: 'Markdown' });
     await processServiceSelection(ctx, session, rawText);
   }
 });
 
-// Helper function to query services and display available stock/pricing
+// Helper function to extract and render available Servers/Operators
 async function processServiceSelection(ctx, session, serviceQuery) {
   const lowerQuery = serviceQuery.toLowerCase();
   const services = await getServices(session.country.id);
 
   if (!services.length) {
-    ctx.reply(`No services found for *${session.country.name}* right now. Try typing another country!`, { parse_mode: 'Markdown' });
+    ctx.reply(`No services found for *${session.country.name}* right now. Try another country!`, { parse_mode: 'Markdown' });
     session.state = 'AWAITING_COUNTRY';
     return;
   }
 
-  const matchedService = services.find(s => 
-    s.service_name.toLowerCase().includes(lowerQuery)
-  );
+  const matchedService = services.find(s => s.service_name.toLowerCase().includes(lowerQuery));
 
-  if (matchedService) {
-    if (matchedService.available_quantity < 1) {
-      ctx.reply(`Eya! Stock for *${matchedService.service_name}* (${session.country.name}) don finish for market! 💔\nTry type another app name or country.`, { parse_mode: 'Markdown' });
-      return;
-    }
-
-    const rawProviderPrice = parseFloat(matchedService.price);
-    const finalRetailPrice = calculateRetailPrice(matchedService.service_name, rawProviderPrice);
-
-    session.selectedService = matchedService;
-    session.finalPrice = finalRetailPrice;
-
-    const actionButtons = Markup.inlineKeyboard([
-      [Markup.button.callback(`💳 Buy Number (₦${finalRetailPrice})`, `buy_${session.country.id}_${matchedService.service_id}`)],
-      [Markup.button.callback('🔄 Choose Another Country', 'reset_flow')]
-    ]);
-
-    ctx.reply(
-      `Omo sharp! Line dey available! 🔥\n\n` +
-      `📌 *Country:* ${session.country.name}\n` +
-      `📌 *App:* ${matchedService.service_name}\n` +
-      `📊 *Success Rate:* ${matchedService.success_rate}%\n` +
-      `📦 *In Stock:* ${matchedService.available_quantity} numbers\n` +
-      `💰 *Price:* ₦${finalRetailPrice}\n\n` +
-      `Tap button below to buy this number now:`,
-      { parse_mode: 'Markdown', ...actionButtons }
-    );
-  } else {
-    ctx.reply(`I no see *${serviceQuery}* under ${session.country.name}. Try typing another app name like _WhatsApp_, _Telegram_, or _Facebook_.`);
+  if (!matchedService) {
+    ctx.reply(`I no see *${serviceQuery}* under ${session.country.name}. Try typing another app like _WhatsApp_ or _Telegram_.`);
+    return;
   }
+
+  session.selectedService = matchedService;
+
+  // Extract operators/servers array if returned by logsdomain API
+  let serverList = [];
+  if (matchedService.operators && Array.isArray(matchedService.operators) && matchedService.operators.length > 0) {
+    serverList = matchedService.operators;
+  } else {
+    // Standard single server fallback
+    serverList = [{
+      id: 'default',
+      name: matchedService.operator_name || 'Standard Server',
+      available_quantity: matchedService.available_quantity || 0,
+      price: matchedService.price
+    }];
+  }
+
+  // Filter servers that have available stock
+  const activeServers = serverList.filter(op => (op.available_quantity || op.count || 0) > 0);
+
+  if (activeServers.length === 0) {
+    ctx.reply(`Eya! Stock for *${matchedService.service_name}* (${session.country.name}) don finish across all servers! 💔\nTry another app or country.`, { parse_mode: 'Markdown' });
+    return;
+  }
+
+  // Generate dynamic buttons for each server option
+  const buttons = activeServers.map(srv => {
+    const srvCost = parseFloat(srv.price || matchedService.price);
+    const finalPrice = calculateRetailPrice(matchedService.service_name, srvCost);
+    const stockCount = srv.available_quantity || srv.count || 0;
+    const srvName = srv.name || srv.operator_name || 'Server';
+
+    return [Markup.button.callback(`🖥️ ${srvName} (${stockCount} left) — ₦${finalPrice}`, `srv_${session.country.id}_${matchedService.service_id}_${srv.id}`)];
+  });
+
+  buttons.push([Markup.button.callback('🔄 Choose Another Country', 'reset_flow')]);
+
+  ctx.reply(
+    `Ehen boss! For *${matchedService.service_name}* (${session.country.name}), see the available servers below:\n\n` +
+    `Which server or route you wan use buy the number? Tap option below:`,
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
+  );
 }
 
-// ------------------- BUTTON ACTIONS & ORDER PROCESSING -------------------
+// ------------------- SERVER BUTTON CALLBACK -------------------
 
-bot.action(/^buy_(\d+)_(\d+)$/, async (ctx) => {
+bot.action(/^srv_(\d+)_(\d+)_(.+)$/, async (ctx) => {
   ctx.answerCbQuery();
   const countryId = ctx.match[1];
   const serviceId = ctx.match[2];
+  const operatorId = ctx.match[3] === 'default' ? null : ctx.match[3];
 
   ctx.reply(`Processing your number purchase... Please wait ⏳`);
 
-  const response = await purchaseNumber(countryId, serviceId);
+  const response = await purchaseNumber(countryId, serviceId, operatorId);
 
   if (response.success && response.data) {
     const order = response.data;
@@ -334,11 +323,11 @@ bot.action(/^buy_(\d+)_(\d+)$/, async (ctx) => {
       `📱 *Service:* ${order.service_name}\n` +
       `🌍 *Country:* ${order.country_name}\n\n` +
       `👉 Copy the number above and enter it into your app.\n` +
-      `⏳ I dey wait for your SMS verification code now... (I go send am here automatically as e enter)`,
+      `⏳ Elsa is waiting for your SMS code... (I go send am here automatically as e enter)`,
       { parse_mode: 'Markdown' }
     );
 
-    // Poll for SMS verification code (Every 7 seconds up to 10 minutes)
+    // Poll for incoming SMS Code (up to 10 mins)
     let pollCount = 0;
     const maxPolls = 80;
 
@@ -352,18 +341,18 @@ bot.action(/^buy_(\d+)_(\d+)$/, async (ctx) => {
           `🔥🔥 *SMS CODE RECEIVED!* 🔥🔥\n\n` +
           `📞 *Number:* \`${phoneNumber}\`\n` +
           `🔑 *Verification Code:* \`${checkRes.data.code}\`\n\n` +
-          `Thank you for using *MJ SMS*! 🚀`,
+          `Thank you for using *MJ SMS*! Have a happy day! ✨`,
           { parse_mode: 'Markdown' }
         );
       } else if (pollCount >= maxPolls) {
         clearInterval(intervalId);
         await cancelOrder(orderId);
-        ctx.reply(`⏰ *Time Out:* Code no enter after 10 minutes. Order don cancel & money don refund to your wallet!`);
+        ctx.reply(`⏰ *Time Out:* Code no enter after 10 minutes. Order don cancel & money don refund!`);
       }
     }, 7000);
 
   } else {
-    ctx.reply(`❌ *Purchase Failed:* ${response.message || 'Insufficient wallet balance on provider or line out of stock.'}`);
+    ctx.reply(`❌ *Purchase Failed:* ${response.message || 'Server out of stock or insufficient balance.'}`);
   }
 });
 
@@ -374,12 +363,12 @@ bot.action('reset_flow', (ctx) => {
   ctx.reply(`No p boss! Which country number you wan check now?`);
 });
 
-// ------------------- SERVER WEBHOOK SETUP -------------------
+// ------------------- WEBHOOK & EXPRESS SERVER SETUP -------------------
 
 const WEBHOOK_PATH = `/webhook/telegram`;
 app.use(bot.webhookCallback(WEBHOOK_PATH));
 
-app.get('/', (req, res) => res.send('MJ SMS Bot is Active!'));
+app.get('/', (req, res) => res.send('MJ SMS Bot (Elsa) is Active!'));
 
 app.listen(PORT, async () => {
   console.log(`Server listening on port ${PORT}`);
