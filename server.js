@@ -139,10 +139,8 @@ function calculateFinalPrice(rawPrice, isAlreadyNgn = false) {
   if (baseCostNgn <= 0) return 3000;
 
   if (baseCostNgn < 3000) {
-    // Add a flat ₦3,000 markup if supplier cost is less than ₦3,000
     return Math.ceil(baseCostNgn + 3000);
   } else {
-    // Apply 80% profit margin markup (Cost * 1.8) for ₦3,000 and above
     return Math.ceil(baseCostNgn * 1.8);
   }
 }
@@ -501,9 +499,12 @@ bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
   const rawText = ctx.message.text.trim();
   const lowerText = rawText.toLowerCase();
+
+  if (rawText.startsWith('/')) return;
+
   const session = await getUserSession(userId);
 
-  if (['/start', 'change country', 'back'].some(k => lowerText === k)) {
+  if (['change country', 'back'].some(k => lowerText === k)) {
     session.state = 'AWAITING_INPUT';
     await saveUserSession(userId, session);
     return ctx.reply(`No p boss! Type any country and service name naturally.`);
@@ -718,3 +719,4 @@ bot.launch().then(() => {
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
