@@ -12,12 +12,10 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SERVER_URL = process.env.RENDER_EXTERNAL_URL;
-const SMS_API_KEY = process.env.SMS_API_KEY;
 const SECOND_SMS_API_KEY = process.env.SECOND_SMS_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 
 // Provider Endpoints
-const LOGSDOMAIN_BASE_URL = 'https://logsdomain.com/api/v1';
 const ALLSMSVERIFY_BASE_URL = 'https://allsmsverify.com/stubs/handler_api.php';
 
 if (!BOT_TOKEN) {
@@ -100,7 +98,7 @@ async function initializePaystackPayment(email, amountNgn, userId) {
   }
 }
 
-// ------------------- ALLSMSVERIFY API INTEGRATION (UPDATED) -------------------
+// ------------------- ALLSMSVERIFY API INTEGRATION -------------------
 async function getAllSmsVerifyCountries() {
   const cleanApiKey = SECOND_SMS_API_KEY ? SECOND_SMS_API_KEY.trim() : null;
   if (!cleanApiKey) return [];
@@ -112,16 +110,26 @@ async function getAllSmsVerifyCountries() {
     });
 
     const data = res.data;
-    if (data && typeof data === 'object') {
+    if (data) {
       if (Array.isArray(data)) return data;
-      return Object.entries(data).map(([key, item]) => ({
-        id: key,
-        name: item.name || item.title || key,
-        short: key
-      }));
+      return Object.entries(data).map(([key, item]) => {
+        if (typeof item === 'object' && item !== null) {
+          return {
+            id: key,
+            name: item.name || item.title || key,
+            short: key
+          };
+        }
+        return {
+          id: key,
+          name: String(item),
+          short: key
+        };
+      });
     }
     return [];
   } catch (err) {
+    console.error("Error fetching countries:", err.message);
     return [];
   }
 }
@@ -139,7 +147,7 @@ async function getAllSmsVerifyServices(countryId) {
     const data = res.data;
     if (data && typeof data === 'object' && !Array.isArray(data)) {
       return Object.entries(data).map(([key, item]) => {
-        if (typeof item === 'object') {
+        if (typeof item === 'object' && item !== null) {
           return {
             service_id: key,
             service_name: item.name || item.title || key,
@@ -248,7 +256,7 @@ bot.start(async (ctx) => {
     `How far boss! 👋 Welcome to *MJ SMS*! ✨\n\n` +
     `💰 *Your Balance:* ₦${(session.balance || 0).toLocaleString()}\n\n` +
     `I dey here to help you get virtual numbers fast fast! 🚀\n` +
-    `• Type a country name or server ID\n` +
+    `• Type a country name or server ID (e.g., _Usa WhatsApp_)\n` +
     `• Type */fund* to top up your wallet balance!\n` +
     `• Type *support* anytime to speak to customer care.`,
     { parse_mode: 'Markdown' }
@@ -337,30 +345,73 @@ bot.on('text', async (ctx) => {
 
   const countries = await getAllSmsVerifyCountries();
 
-  const matchedCountry = countries.find(c => 
-    String(c.name).toLowerCase() === lowerText || 
-    String(c.id).toLowerCase() === lowerText
-  );
+  const getNormalizedCountry = (input) => {
+    const cleanInput = input.toLowerCase().trim();
+    return countries.find(c => {
+      const cName = String(c.name).toLowerCase();
+      const cId = String(c.id).toLowerCase();
+      const cShort = String(c.short || '').toLowerCase();
 
-  if (matchedCountry) {
-    session.country = matchedCountry;
+      return cName === cleanInput || 
+             cName.includes(cleanInput) || 
+             cleanInput.includes(cName) || 
+             cId === cleanInput || 
+             cShort === cleanInput ||
+             (cleanInput === 'usa' && (cName.includes('united states') || cId === '1' || cShort === 'us')) ||
+             (cleanInput === 'uk' && (cName.includes('united kingdom') || cShort === 'gb')) ||
+             (cleanInput === 'nigeria' && cName.includes('nigeria'));
+    });
+  };
+
+  // 1. Combined Input Handling ("Usa WhatsApp")
+  if (countries.length > 0) {
+    const words = lowerText.split(/\s+/);
+    let matchedCountry = null;
+    let serviceQueryWords = [];
+
+    for (let i = 0; i < words.length; i++) {
+      const subQuery = words.slice(0, i + 1).join(' ');
+      const found = getNormalizedCountry(subQuery);
+      if (found) {
+        matchedCountry = found;
+        serviceQueryWords = words.slice(i + 1);
+        break;
+      }
+    }
+
+    if (matchedCountry && serviceQueryWords.length > 0) {
+      const serviceQuery = serviceQueryWords.join(' ');
+      session.country = matchedCountry;
+      session.state = 'AWAITING_SERVICE';
+      saveSessions();
+      ctx.reply(`Oya wait make we check available servers for *${serviceQuery}* (${matchedCountry.name})... 🔎`, { parse_mode: 'Markdown' });
+      await processServiceSelection(ctx, session, serviceQuery);
+      return;
+    }
+  }
+
+  // 2. Single Country Input ("United States", "Usa")
+  const matchedCountryDirect = getNormalizedCountry(lowerText);
+  if (matchedCountryDirect) {
+    session.country = matchedCountryDirect;
     session.state = 'AWAITING_SERVICE';
     saveSessions();
     ctx.reply(
-      `Ehen! You select *${matchedCountry.name}* 👌\n\n` +
-      `Which app or service you wan verify? (e.g., _whatsapp_, _telegram_)`,
+      `Ehen! You select *${matchedCountryDirect.name}* 👌\n\n` +
+      `Which app or service you wan verify? (e.g., _WhatsApp_, _Telegram_)`,
       { parse_mode: 'Markdown' }
     );
     return;
   }
 
+  // 3. Service Query when state is already AWAITING_SERVICE
   if (session.state === 'AWAITING_SERVICE' && session.country) {
-    ctx.reply(`Oya wait make we check servers for *${rawText}* (${session.country.name})... 🔎`, { parse_mode: 'Markdown' });
+    ctx.reply(`Oya wait make we check available servers for *${rawText}* (${session.country.name})... 🔎`, { parse_mode: 'Markdown' });
     await processServiceSelection(ctx, session, rawText);
     return;
   }
 
-  ctx.reply(`Please state your country server name or ID first (e.g., type a country name).`, { parse_mode: 'Markdown' });
+  ctx.reply(`Please state your country server name or ID first (e.g., type "Usa" or "Usa WhatsApp").`, { parse_mode: 'Markdown' });
 });
 
 async function processServiceSelection(ctx, session, serviceQuery) {
@@ -391,7 +442,6 @@ bot.action(/^buy\|(.+)\|(.+)$/, async (ctx) => {
   ctx.answerCbQuery();
   const countryId = ctx.match[1];
   const serviceId = ctx.match[2];
-  const userId = ctx.from.id;
 
   ctx.reply(`Processing your number purchase... Please wait ⏳`);
 
