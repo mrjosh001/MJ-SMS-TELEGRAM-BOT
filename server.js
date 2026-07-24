@@ -17,6 +17,9 @@ const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const SUPABASE_REST_URL = process.env.SUPABASE_REST_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
+// Your authorized admin Telegram ID
+const ADMIN_TELEGRAM_ID = '7466363018';
+
 if (!BOT_TOKEN) {
   console.error("FATAL ERROR: BOT_TOKEN environment variable is missing!");
   process.exit(1);
@@ -199,7 +202,6 @@ const JUICYSMS_BASE_URL = 'https://juicysms.com/api';
 const SMSOTPSTORES_BASE_URL = 'https://smsotpstores.com';
 const AUTHPADI_BASE_URL = 'https://dashboard.authpadi.com';
 
-// Smart natural language translation dictionary for common services
 const COMMON_SERVICE_SYNONYMS = {
   'whatsapp': ['whatsapp', 'wa', 'whats app'],
   'telegram': ['telegram', 'tg', 'tele'],
@@ -312,7 +314,6 @@ async function fetchCombinedServices(country) {
   const countryObj = typeof country === 'string' ? { id: country, name: country } : country;
   if (!countryObj || !countryObj.id) return results;
 
-  // Server One: JuicySMS
   const juicyMatch = JUICYSMS_COUNTRIES.find(c => c.id.toLowerCase() === countryObj.id.toLowerCase());
   if (juicyMatch && JUICYSMS_API_KEY) {
     const juicyData = await getJuicySmsServices(juicyMatch.id);
@@ -331,7 +332,6 @@ async function fetchCombinedServices(country) {
     }
   }
 
-  // Server Two: smsotpstores
   const storeMatch = SMSOTPSTORES_COUNTRIES.find(c => c.id.toLowerCase() === countryObj.id.toLowerCase());
   if (storeMatch && SMSOTPSTORES_API_KEY) {
     const storeData = await getSmsOtpStoresServices(storeMatch.id);
@@ -350,7 +350,6 @@ async function fetchCombinedServices(country) {
     }
   }
 
-  // Server Three: AuthPadi
   const authMatch = AUTHPADI_COUNTRIES.find(c => c.id.toLowerCase() === countryObj.id.toLowerCase());
   if (authMatch && AUTHPADI_API_KEY) {
     const authData = await getAuthPadiServices(authMatch.id);
@@ -591,6 +590,43 @@ bot.command(['orders', 'history_orders'], async (ctx) => {
   ctx.reply(`📦 *YOUR RECENT ORDER HISTORY*\n\n${recentOrders}`, { parse_mode: 'Markdown' });
 });
 
+// Admin command to manually credit a user: /credit <user_id> <amount>
+bot.command('credit', async (ctx) => {
+  const adminId = String(ctx.from.id);
+  if (adminId !== ADMIN_TELEGRAM_ID) {
+    return ctx.reply(`❌ You are not authorized to use this command.`);
+  }
+
+  const args = ctx.message.text.split(' ');
+  if (args.length < 3) {
+    return ctx.reply(`Usage: /credit <user_id> <amount>\nExample: /credit 123456789 3000`);
+  }
+
+  const targetUserId = args[1];
+  const amountToAdd = parseFloat(args[2]);
+
+  if (isNaN(amountToAdd) || amountToAdd <= 0) {
+    return ctx.reply(`❌ Please enter a valid amount to credit.`);
+  }
+
+  const session = await getUserSession(targetUserId);
+  session.balance = (session.balance || 0) + amountToAdd;
+  await saveUserSession(targetUserId, session);
+
+  ctx.reply(`✅ Successfully credited ₦${amountToAdd.toLocaleString()} to user \`${targetUserId}\`.\nNew Balance: ₦${session.balance.toLocaleString()}`, { parse_mode: 'Markdown' });
+
+  try {
+    await bot.telegram.sendMessage(
+      targetUserId,
+      `🎉 *DEPOSIT CONFIRMED & CREDITED!*\n\n` +
+      `💳 *Amount Added:* ₦${amountToAdd.toLocaleString()}\n` +
+      `💰 *New Balance:* ₦${session.balance.toLocaleString()}\n\n` +
+      `Sorry for the initial delay, boss! You can now order your numbers. ✨`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (err) {}
+});
+
 bot.command(['support', 'help', 'customercare'], (ctx) => sendCustomerSupportMessage(ctx));
 
 function sendCustomerSupportMessage(ctx) {
@@ -694,7 +730,6 @@ bot.on('text', async (ctx) => {
     });
   };
 
-  // Smart Natural Language Translation Parser
   const words = lowerText.split(/\s+/);
   let matchedCountry = null;
   let serviceQueryWords = [];
@@ -709,11 +744,8 @@ bot.on('text', async (ctx) => {
     }
   }
 
-  // If user typed country first followed by service (e.g., "US WhatsApp" or "Canadian Facebook")
   if (matchedCountry && serviceQueryWords.length > 0) {
     let rawServiceQuery = serviceQueryWords.join(' ');
-    
-    // Translate synonyms if any match
     for (const [canonical, synonyms] of Object.entries(COMMON_SERVICE_SYNONYMS)) {
       if (synonyms.some(syn => rawServiceQuery.includes(syn))) {
         rawServiceQuery = canonical;
@@ -729,7 +761,6 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // If user typed service first followed by country (e.g., "WhatsApp USA" or "Facebook Canada")
   for (let i = 0; i < words.length; i++) {
     const potentialCountryQuery = words.slice(i).join(' ');
     const foundCountry = getNormalizedCountry(potentialCountryQuery);
