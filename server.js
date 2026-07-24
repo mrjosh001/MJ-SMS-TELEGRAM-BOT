@@ -311,14 +311,14 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // 2. Balance triggers (Strictly balance checking only)
-  if (['balance', 'bal', "what's my balance", 'my balance'].includes(lowerText)) {
+  // 2. Balance triggers (Strict check for balance variations)
+  if (lowerText.includes('balance') || lowerText.includes('bal') || lowerText === 'my balance' || lowerText === "what's my balance" || lowerText === "what's my current balance") {
     ctx.reply(`Boss your current balance na ₦${(session.balance || 0).toLocaleString()} ✨`, { parse_mode: 'Markdown' });
     return;
   }
 
   // 3. Fund / Wallet deposit triggers
-  if (['fund', 'deposit', 'wallet', 'topup', 'top up', 'i want to fund my wallet', 'fund my account', 'fund account'].some(k => lowerText.includes(k))) {
+  if (['fund', 'deposit', 'wallet', 'topup', 'top up', 'i want to fund my wallet', 'fund my account', 'fund account', 'i wan fund my account'].some(k => lowerText.includes(k))) {
     session.state = 'AWAITING_DEPOSIT_AMOUNT';
     saveSessions();
     ctx.reply(
@@ -477,7 +477,7 @@ bot.action(/^buy\|(.+)\|(.+)$/, async (ctx) => {
   const countryId = ctx.match[1];
   const serviceId = ctx.match[2];
 
-  ctx.reply(`Processing your number purchase... Please wait ⏳`);
+  ctx.reply(`Processing your number purchase... Please wait <span>⏳</span>`);
 
   const response = await executePurchase(serviceId, countryId);
 
@@ -562,7 +562,7 @@ app.post('/webhook/paystack', async (req, res) => {
   res.sendStatus(200);
 });
 
-app.get('/', (req, res) => res.send('MJ SMS Bot Active!'));
+app.get('/', (res) => res.send('MJ SMS Bot Active!'));
 
 app.listen(PORT, async () => {
   console.log(`Server listening on port ${PORT}`);
