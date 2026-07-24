@@ -18,7 +18,7 @@ const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 
 // API Base URLs
 const JUICYSMS_BASE_URL = 'https://juicysms.com/api';
-const PLUSVERIFY_BASE_URL = 'https://plusverify.com.ng/api';
+const PLUSVERIFY_BASE_URL = 'https://plusverify.com.ng/api/v1';
 
 if (!BOT_TOKEN) {
   console.error("FATAL ERROR: BOT_TOKEN environment variable is missing!");
@@ -140,6 +140,7 @@ const JUICYSMS_COUNTRIES = [
   { id: 'DE', name: 'Germany (DE)', short: 'de' }
 ];
 
+// PlusVerify standard country codes supported for ordering
 const PLUSVERIFY_COUNTRIES = [
   { id: 'us', name: 'United States (US)', short: 'us' },
   { id: 'ng', name: 'Nigeria (NG)', short: 'ng' }
@@ -173,7 +174,10 @@ async function getJuicySmsServices(countryId) {
 async function getPlusVerifyServices() {
   try {
     const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
-    if (!cleanApiKey) return [];
+    if (!cleanApiKey) {
+      console.log("PLUSVERIFY_API_KEY is missing or empty!");
+      return [];
+    }
 
     const res = await axios.get(`${PLUSVERIFY_BASE_URL}/services.php`, {
       ...robustAxiosConfig,
@@ -181,12 +185,9 @@ async function getPlusVerifyServices() {
     });
 
     const data = res.data;
-    // Handle both data.otp_services or direct array return depending on PlusVerify API response variations
     let servicesList = [];
     if (data && data.success && Array.isArray(data.otp_services)) {
       servicesList = data.otp_services;
-    } else if (data && Array.isArray(data.services)) {
-      servicesList = data.services;
     } else if (Array.isArray(data)) {
       servicesList = data;
     }
@@ -195,8 +196,8 @@ async function getPlusVerifyServices() {
       return servicesList.map(item => ({
         service_id: item.id || item.service_id || item.code || '',
         service_name: item.name || item.title || item.service_name || item.id || '',
-        stock: parseInt(item.count || item.stock || item.quantity || 100, 10),
-        price: parseFloat(item.price || item.cost || 0),
+        stock: 100, // PlusVerify default stock indicator
+        price: parseFloat(item.price || 0),
         is_ngn: true
       })).filter(s => s.service_id);
     }
@@ -231,7 +232,7 @@ async function fetchCombinedServices(country) {
     }
   }
 
-  // Provider 2: PlusVerify mapped to Server Two (Universal/Multi-country availability check)
+  // Provider 2: PlusVerify mapped to Server Two (using exact v1 endpoint docs)
   const plusData = await getPlusVerifyServices();
   if (Array.isArray(plusData)) {
     plusData.forEach(s => {
@@ -256,23 +257,32 @@ async function executeOrder(provider, serviceId, countryId) {
   if (provider === 'plusverify') {
     try {
       const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
-      const res = await axios.post(`${PLUSVERIFY_BASE_URL}/otp.php`, null, {
+      // Correct v1 endpoint mapping matching documentation specifications: POST otp.php with api_key, service_id, country_id
+      const res = await axios.post(`${PLUSVERIFY_BASE_URL}/otp.php`, {
+        api_key: cleanApiKey,
+        service_id: serviceId,
+        country_id: countryId
+      }, {
         ...robustAxiosConfig,
-        params: { api_key: cleanApiKey, service_id: serviceId, country_id: countryId }
+        headers: {
+          ...robustAxiosConfig.headers,
+          'Content-Type': 'application/json'
+        }
       });
       const data = res.data;
-      if (data && (data.success === true || data.status === 'success') && (data.order_id || data.id) && (data.phone_number || data.number)) {
+      if (data && (data.success === true || data.status === 'success') && data.order_id && data.phone_number) {
         return { 
           success: true, 
           data: { 
-            order_id: String(data.order_id || data.id), 
-            number: String(data.phone_number || data.number),
-            charge: parseFloat(data.charge || data.price || 0)
+            order_id: String(data.order_id), 
+            number: String(data.phone_number),
+            charge: parseFloat(data.charge || 0)
           } 
         };
       }
       return { success: false, message: data?.message || 'Stock unavailable or insufficient balance on PlusVerify.' };
     } catch (err) {
+      console.error("PlusVerify order error:", err.message);
       return { success: false, message: 'PlusVerify request failed.' };
     }
   } else {
@@ -298,13 +308,20 @@ async function checkSmsCode(provider, orderId) {
   if (provider === 'plusverify') {
     try {
       const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
-      const res = await axios.post(`${PLUSVERIFY_BASE_URL}/status.php`, null, {
+      // Correct v1 endpoint mapping matching documentation specifications: POST status.php with api_key and order_id
+      const res = await axios.post(`${PLUSVERIFY_BASE_URL}/status.php`, {
+        api_key: cleanApiKey,
+        order_id: orderId
+      }, {
         ...robustAxiosConfig,
-        params: { api_key: cleanApiKey, order_id: orderId }
+        headers: {
+          ...robustAxiosConfig.headers,
+          'Content-Type': 'application/json'
+        }
       });
       const data = res.data;
-      if (data && (data.success === true || data.status === 'success') && (data.sms_code || data.code)) {
-        return { success: true, data: { code: String(data.sms_code || data.code) } };
+      if (data && (data.success === true || data.status === 'success' || data.status === 'COMPLETED') && data.sms_code) {
+        return { success: true, data: { code: String(data.sms_code) } };
       }
       return { success: false };
     } catch (err) {
@@ -332,9 +349,17 @@ async function cancelOrder(provider, orderId) {
   if (provider === 'plusverify') {
     try {
       const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
-      await axios.post(`${PLUSVERIFY_BASE_URL}/update_status.php`, null, {
+      // Correct v1 cancellation payload following documentation specifications (status: 8)
+      await axios.post(`${PLUSVERIFY_BASE_URL}/update_status.php`, {
+        api_key: cleanApiKey,
+        order_id: orderId,
+        status: 8
+      }, {
         ...robustAxiosConfig,
-        params: { api_key: cleanApiKey, order_id: orderId, status: 8 }
+        headers: {
+          ...robustAxiosConfig.headers,
+          'Content-Type': 'application/json'
+        }
       });
     } catch (err) {
       console.error("PlusVerify cancel order error:", err.message);
@@ -840,4 +865,3 @@ app.listen(PORT, async () => {
     } catch (err) {}
   }
 });
-
