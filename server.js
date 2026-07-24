@@ -13,12 +13,12 @@ const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SERVER_URL = process.env.RENDER_EXTERNAL_URL;
 const JUICYSMS_API_KEY = process.env.JUICYSMS_API_KEY || process.env.SECOND_SMS_API_KEY;
-const PLUSVERIFY_API_KEY = process.env.PLUSVERIFY_API_KEY; // PlusVerify API Key from https://plusverify.com.ng/profile.php
+const PLUSVERIFY_API_KEY = process.env.PLUSVERIFY_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 
 // API Base URLs
 const JUICYSMS_BASE_URL = 'https://juicysms.com/api';
-const PLUSVERIFY_BASE_URL = 'https://plusverify.com.ng/api'; // Official PlusVerify Base URL endpoints
+const PLUSVERIFY_BASE_URL = 'https://plusverify.com.ng/api';
 
 if (!BOT_TOKEN) {
   console.error("FATAL ERROR: BOT_TOKEN environment variable is missing!");
@@ -37,7 +37,6 @@ function loadSessions() {
       const rawData = fs.readFileSync(DB_FILE, 'utf8');
       const parsed = JSON.parse(rawData);
       
-      // Ensure absolute data integrity for existing customers (safeguarding balances & order history)
       userSessions = {};
       for (const [userId, userData] of Object.entries(parsed)) {
         userSessions[userId] = {
@@ -171,10 +170,6 @@ async function getJuicySmsServices(countryId) {
   }
 }
 
-/**
- * Integrated strictly following PlusVerify documentation requirements:
- * GET services.php?api_key=KEY
- */
 async function getPlusVerifyServices() {
   try {
     const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
@@ -186,17 +181,28 @@ async function getPlusVerifyServices() {
     });
 
     const data = res.data;
+    // Handle both data.otp_services or direct array return depending on PlusVerify API response variations
+    let servicesList = [];
     if (data && data.success && Array.isArray(data.otp_services)) {
-      return data.otp_services.map(item => ({
-        service_id: item.id || '',
-        service_name: item.name || item.id || '',
-        stock: 100, // Default stock availability for native plusverify items
-        price: parseFloat(item.price || 0),
+      servicesList = data.otp_services;
+    } else if (data && Array.isArray(data.services)) {
+      servicesList = data.services;
+    } else if (Array.isArray(data)) {
+      servicesList = data;
+    }
+
+    if (servicesList.length > 0) {
+      return servicesList.map(item => ({
+        service_id: item.id || item.service_id || item.code || '',
+        service_name: item.name || item.title || item.service_name || item.id || '',
+        stock: parseInt(item.count || item.stock || item.quantity || 100, 10),
+        price: parseFloat(item.price || item.cost || 0),
         is_ngn: true
       })).filter(s => s.service_id);
     }
     return [];
   } catch (err) {
+    console.error("PlusVerify services error:", err.message);
     return [];
   }
 }
@@ -204,7 +210,7 @@ async function getPlusVerifyServices() {
 async function fetchCombinedServices(country) {
   const results = [];
   
-  // Fetch from JuicySMS if country matches Juicy format
+  // Provider 1: JuicySMS mapped to Server One
   const juicyMatch = JUICYSMS_COUNTRIES.find(c => c.id.toLowerCase() === country.id.toLowerCase());
   if (juicyMatch) {
     const juicyData = await getJuicySmsServices(juicyMatch.id);
@@ -215,7 +221,8 @@ async function fetchCombinedServices(country) {
           service_id: s.service_id,
           service_name: s.service_name,
           operator_id: juicyMatch.id,
-          server_name: `${juicyMatch.name} (JuicySMS)`,
+          server_label: 'Server One',
+          server_name: `${country.name} (Server One)`,
           stock: s.stock || 10,
           price: s.price,
           is_ngn: false
@@ -224,7 +231,7 @@ async function fetchCombinedServices(country) {
     }
   }
 
-  // Fetch from PlusVerify if country matches PlusVerify format or universally
+  // Provider 2: PlusVerify mapped to Server Two (Universal/Multi-country availability check)
   const plusData = await getPlusVerifyServices();
   if (Array.isArray(plusData)) {
     plusData.forEach(s => {
@@ -233,7 +240,8 @@ async function fetchCombinedServices(country) {
         service_id: s.service_id,
         service_name: s.service_name,
         operator_id: country.id.toLowerCase(),
-        server_name: `${country.name} (PlusVerify)`,
+        server_label: 'Server Two',
+        server_name: `${country.name} (Server Two)`,
         stock: s.stock || 100,
         price: s.price,
         is_ngn: true
@@ -244,26 +252,22 @@ async function fetchCombinedServices(country) {
   return results;
 }
 
-/**
- * Execute order adhering precisely to PlusVerify otp.php / JuicySMS patterns
- */
 async function executeOrder(provider, serviceId, countryId) {
   if (provider === 'plusverify') {
     try {
       const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
-      // PlusVerify POST/GET otp.php endpoint as per official docs
       const res = await axios.post(`${PLUSVERIFY_BASE_URL}/otp.php`, null, {
         ...robustAxiosConfig,
         params: { api_key: cleanApiKey, service_id: serviceId, country_id: countryId }
       });
       const data = res.data;
-      if (data && data.success && data.order_id && data.phone_number) {
+      if (data && (data.success === true || data.status === 'success') && (data.order_id || data.id) && (data.phone_number || data.number)) {
         return { 
           success: true, 
           data: { 
-            order_id: String(data.order_id), 
-            number: String(data.phone_number),
-            charge: parseFloat(data.charge || 0)
+            order_id: String(data.order_id || data.id), 
+            number: String(data.phone_number || data.number),
+            charge: parseFloat(data.charge || data.price || 0)
           } 
         };
       }
@@ -272,7 +276,6 @@ async function executeOrder(provider, serviceId, countryId) {
       return { success: false, message: 'PlusVerify request failed.' };
     }
   } else {
-    // JuicySMS Handler
     try {
       const cleanApiKey = JUICYSMS_API_KEY ? JUICYSMS_API_KEY.trim() : '';
       const res = await axios.get(`${JUICYSMS_BASE_URL}/makeorder`, {
@@ -291,9 +294,6 @@ async function executeOrder(provider, serviceId, countryId) {
   }
 }
 
-/**
- * Polling SMS code adhering to PlusVerify status.php / JuicySMS getsms patterns
- */
 async function checkSmsCode(provider, orderId) {
   if (provider === 'plusverify') {
     try {
@@ -303,8 +303,8 @@ async function checkSmsCode(provider, orderId) {
         params: { api_key: cleanApiKey, order_id: orderId }
       });
       const data = res.data;
-      if (data && data.success && data.sms_code) {
-        return { success: true, data: { code: String(data.sms_code) } };
+      if (data && (data.success === true || data.status === 'success') && (data.sms_code || data.code)) {
+        return { success: true, data: { code: String(data.sms_code || data.code) } };
       }
       return { success: false };
     } catch (err) {
@@ -328,9 +328,6 @@ async function checkSmsCode(provider, orderId) {
   }
 }
 
-/**
- * Cancel order adhering to PlusVerify update_status.php (status=8) / JuicySMS cancelorder
- */
 async function cancelOrder(provider, orderId) {
   if (provider === 'plusverify') {
     try {
@@ -361,6 +358,7 @@ bot.start(async (ctx) => {
   const session = getUserSession(userId);
   session.state = 'AWAITING_COUNTRY';
   session.country = null;
+  session.selectedServiceQuery = null;
   saveSessions();
 
   ctx.reply(
@@ -480,6 +478,7 @@ bot.on('text', async (ctx) => {
   if (['/start', 'change country', 'countries', 'back'].some(k => lowerText.includes(k))) {
     session.state = 'AWAITING_COUNTRY';
     session.country = null;
+    session.selectedServiceQuery = null;
     saveSessions();
     ctx.reply(`No p boss! Which country you wan check now? (Type *US*, *NG*, *NL*, *UK*, *USA*, or *DE*)`, { parse_mode: 'Markdown' });
     return;
@@ -551,10 +550,10 @@ bot.on('text', async (ctx) => {
     if (matchedCountry && serviceQueryWords.length > 0) {
       const serviceQuery = serviceQueryWords.join(' ');
       session.country = matchedCountry;
-      session.state = 'AWAITING_SERVICE';
+      session.selectedServiceQuery = serviceQuery;
+      session.state = 'AWAITING_SERVER_SELECTION';
       saveSessions();
-      ctx.reply(`Oya wait make we check available servers for *${serviceQuery}* (${matchedCountry.name})... 🔎`, { parse_mode: 'Markdown' });
-      await processServiceSelection(ctx, session, serviceQuery);
+      await promptServerSelection(ctx, session);
       return;
     }
   }
@@ -573,18 +572,21 @@ bot.on('text', async (ctx) => {
   }
 
   if (session.state === 'AWAITING_SERVICE' && session.country) {
-    ctx.reply(`Oya wait make we check available servers for *${rawText}* (${session.country.name})... 🔎`, { parse_mode: 'Markdown' });
-    await processServiceSelection(ctx, session, rawText);
+    session.selectedServiceQuery = rawText;
+    session.state = 'AWAITING_SERVER_SELECTION';
+    saveSessions();
+    await promptServerSelection(ctx, session);
     return;
   }
 
   ctx.reply(`Please state your country code first (e.g., type *US* or *US WhatsApp*).`, { parse_mode: 'Markdown' });
 });
 
-async function processServiceSelection(ctx, session, serviceQuery) {
+// ------------------- NEW FLOW: ASK SERVER FIRST, THEN PRICE -------------------
+async function promptServerSelection(ctx, session) {
   const availableServers = await fetchCombinedServices(session.country);
+  const q = session.selectedServiceQuery.toLowerCase().trim();
   
-  const q = serviceQuery.toLowerCase().trim();
   const filtered = availableServers.filter(s => {
     const sName = String(s.service_name || '').toLowerCase();
     const sId = String(s.service_id || '').toLowerCase();
@@ -592,31 +594,91 @@ async function processServiceSelection(ctx, session, serviceQuery) {
   });
 
   if (filtered.length === 0) {
-    const topServices = availableServers.slice(0, 15).map(s => `• ${s.service_name} (${s.stock} left)`).join('\n');
+    session.state = 'AWAITING_SERVICE';
+    saveSessions();
+    const topServices = availableServers.slice(0, 15).map(s => `• ${s.service_name}`).join('\n');
     ctx.reply(
-      `Eya! No stock found for *${serviceQuery}* right now. 💔\n\n` +
-      `Here are available services on this server:\n${topServices || 'None available'}\n\n` +
+      `Eya! No stock found for *${session.selectedServiceQuery}* right now. 💔\n\n` +
+      `Available services on this country:\n${topServices || 'None available'}\n\n` +
       `Type another app name or type *change country* to switch.`,
       { parse_mode: 'Markdown' }
     );
     return;
   }
 
-  const buttons = filtered.map((srv) => {
-    const finalPrice = calculateFinalPrice(srv.price, srv.is_ngn);
-    const cbData = `buy|${srv.provider}|${session.country.id}|${srv.service_id}`;
-    return [Markup.button.callback(`🖥️ ${srv.server_name} (${srv.stock} left) — ₦${finalPrice.toLocaleString()}`, cbData)];
+  const uniqueServersMap = new Map();
+  filtered.forEach(srv => {
+    if (!uniqueServersMap.has(srv.server_label)) {
+      uniqueServersMap.set(srv.server_label, srv);
+    }
   });
 
-  buttons.push([Markup.button.callback('🔄 Choose Another Country', 'reset_flow')]);
+  const serverButtons = [];
+  uniqueServersMap.forEach((srv, label) => {
+    serverButtons.push([Markup.button.callback(`🖥️ ${label} (${session.country.name})`, `server|${srv.provider}|${session.country.id}`)]);
+  });
+  serverButtons.push([Markup.button.callback('🔄 Choose Another Country', 'reset_flow')]);
 
   ctx.reply(
-    `Ehen boss! See available options for *${serviceQuery}*:\n\nTap option below to buy:`,
-    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
+    `Oya boss! You selected *${session.selectedServiceQuery}* for *${session.country.name}*.\n\n` +
+    `Please select your preferred server below: 👇`,
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(serverButtons) }
   );
 }
 
-// ------------------- BUTTON HANDLERS -------------------
+bot.action(/^server\|(.+)\|(.+)$/, async (ctx) => {
+  ctx.answerCbQuery();
+  const userId = ctx.from.id;
+  const session = getUserSession(userId);
+  const provider = ctx.match[1];
+  const countryId = ctx.match[2];
+
+  session.chosenProvider = provider;
+  saveSessions();
+
+  const availableServers = await fetchCombinedServices(session.country);
+  const q = (session.selectedServiceQuery || '').toLowerCase().trim();
+
+  const filtered = availableServers.filter(s => {
+    const sName = String(s.service_name || '').toLowerCase();
+    const sId = String(s.service_id || '').toLowerCase();
+    return String(s.provider) === String(provider) && (sName === q || sName.includes(q) || q.includes(sName) || sId === q || sId.includes(q));
+  });
+
+  if (filtered.length === 0) {
+    ctx.reply(`❌ No services found on this server. Please try again.`);
+    return;
+  }
+
+  const buttons = filtered.map((srv) => {
+    const finalPrice = calculateFinalPrice(srv.price, srv.is_ngn);
+    const cbData = `buy|${srv.provider}|${session.country.id}|${srv.service_id}`;
+    return [Markup.button.callback(`💰 ${srv.server_label} Price: ₦${finalPrice.toLocaleString()} (${srv.stock} left)`, cbData)];
+  });
+
+  buttons.push([Markup.button.callback('⬅️ Back to Servers', 'back_to_servers')]);
+
+  session.state = 'AWAITING_PRICE_SELECTION';
+  saveSessions();
+
+  ctx.reply(
+    `Ehen boss! See pricing for *${session.selectedServiceQuery}* on your chosen server:\n\nTap option below to buy:`,
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
+  );
+});
+
+bot.action('back_to_servers', async (ctx) => {
+  ctx.answerCbQuery();
+  const userId = ctx.from.id;
+  const session = getUserSession(userId);
+  if (session.country && session.selectedServiceQuery) {
+    await promptServerSelection(ctx, session);
+  } else {
+    ctx.reply(`Please start over by typing your country code.`);
+  }
+});
+
+// ------------------- BUTTON HANDLERS FOR BUYING -------------------
 bot.action(/^buy\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
   ctx.answerCbQuery();
   const userId = ctx.from.id;
@@ -727,6 +789,7 @@ bot.action('reset_flow', (ctx) => {
   const session = getUserSession(userId);
   session.state = 'AWAITING_COUNTRY';
   session.country = null;
+  session.selectedServiceQuery = null;
   saveSessions();
   ctx.reply(`No p boss! Which country you wan check now? (Type *US*, *NG*, *NL*, *UK* or *DE*)`);
 });
@@ -777,3 +840,4 @@ app.listen(PORT, async () => {
     } catch (err) {}
   }
 });
+
