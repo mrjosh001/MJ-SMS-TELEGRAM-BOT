@@ -71,8 +71,20 @@ const robustAxiosConfig = {
 };
 
 const USD_TO_NGN_RATE = 1500; 
-// Updated to 70% profit margin markup (1 + 0.70 = 1.7)
-const DEFAULT_MARGIN = 1.7;
+
+// ------------------- PRICING CALCULATION LOGIC -------------------
+function calculateFinalPrice(rawUsdPrice) {
+  const baseCostNgn = rawUsdPrice * USD_TO_NGN_RATE;
+  
+  // If base cost in NGN is below 3,500, add a flat 3,000 profit margin
+  if (baseCostNgn < 3500) {
+    return Math.ceil(baseCostNgn + 3000);
+  } 
+  // If base cost is 3,500 or above, apply a 100% markup (double the base cost)
+  else {
+    return Math.ceil(baseCostNgn * 2);
+  }
+}
 
 // ------------------- PAYSTACK INTEGRATION -------------------
 async function initializePaystackPayment(email, amountNgn, userId) {
@@ -429,8 +441,7 @@ async function processServiceSelection(ctx, session, serviceQuery) {
   }
 
   const buttons = filtered.map((srv) => {
-    const priceInNgn = srv.price * USD_TO_NGN_RATE;
-    const finalPrice = Math.ceil(priceInNgn * DEFAULT_MARGIN);
+    const finalPrice = calculateFinalPrice(srv.price);
     const cbData = `buy|${session.country.id}|${srv.service_id}`;
     return [Markup.button.callback(`🖥️ ${srv.server_name} (${srv.stock} left) — ₦${finalPrice.toLocaleString()}`, cbData)];
   });
@@ -454,7 +465,7 @@ bot.action(/^buy\|(.+)\|(.+)$/, async (ctx) => {
   const availableServers = await fetchCombinedServices({ id: countryId, name: countryId });
   const targetService = availableServers.find(s => String(s.service_id) === String(serviceId));
   
-  const calculatedNgnPrice = targetService ? Math.ceil(targetService.price * USD_TO_NGN_RATE * DEFAULT_MARGIN) : 0;
+  const calculatedNgnPrice = targetService ? calculateFinalPrice(targetService.price) : 0;
 
   if (calculatedNgnPrice > 0 && session.balance < calculatedNgnPrice) {
     ctx.reply(
