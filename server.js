@@ -6,22 +6,15 @@ const https = require('https');
 const app = express();
 app.use(express.json());
 
-// ------------------- ENVIRONMENT VARIABLES -------------------
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SERVER_URL = process.env.RENDER_EXTERNAL_URL;
 const JUICYSMS_API_KEY = process.env.JUICYSMS_API_KEY || process.env.SECOND_SMS_API_KEY;
 const PLUSVERIFY_API_KEY = process.env.PLUSVERIFY_API_KEY || process.env.PLUS_VERIFY_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
-const DATABASE_URL = process.env.DATABASE_URL;
 
-let SUPABASE_REST_URL = process.env.SUPABASE_REST_URL;
-if (DATABASE_URL && !SUPABASE_REST_URL) {
-  const match = DATABASE_URL.match(/@db\.([a-z0-9]+)\.supabase\.co/);
-  if (match && match[1]) {
-    SUPABASE_REST_URL = `https://${match[1]}.supabase.co/rest/v1`;
-  }
-}
+const SUPABASE_REST_URL = process.env.SUPABASE_REST_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
 if (!BOT_TOKEN) {
   console.error("FATAL ERROR: BOT_TOKEN environment variable is missing!");
@@ -29,131 +22,6 @@ if (!BOT_TOKEN) {
 }
 
 const bot = new Telegraf(BOT_TOKEN);
-
-// ------------------- SUPABASE REST API STORAGE HELPERS -------------------
-async function getSupabaseHeaders() {
-  const apiKey = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY || '';
-  return {
-    'apikey': apiKey,
-    'Authorization': `Bearer ${apiKey}`,
-    'Content-Type': 'application/json',
-    'Prefer': 'return=representation'
-  };
-}
-
-async function getUserSession(userId) {
-  if (!SUPABASE_REST_URL) {
-    return { balance: 0, state: 'AWAITING_COUNTRY', country: null, orders: [], transactions: [] };
-  }
-  try {
-    const headers = await getSupabaseHeaders();
-    const userRes = await axios.get(`${SUPABASE_REST_URL}/users?user_id=eq.${userId}`, { headers });
-    
-    let user;
-    if (!userRes.data || userRes.data.length === 0) {
-      const newUserData = { user_id: userId, balance: 0, state: 'AWAITING_COUNTRY', country: null, selected_service_query: null, chosen_provider: null };
-      await axios.post(`${SUPABASE_REST_URL}/users`, newUserData, { headers });
-      user = newUserData;
-    } else {
-      user = userRes.data[0];
-    }
-
-    const ordersRes = await axios.get(`${SUPABASE_REST_URL}/orders?user_id=eq.${userId}&select=*`, { headers });
-    const txRes = await axios.get(`${SUPABASE_REST_URL}/transactions?user_id=eq.${userId}&select=*`, { headers });
-
-    let parsedCountry = user.country;
-    if (typeof parsedCountry === 'string') {
-      const allSupportedCountries = [...JUICYSMS_COUNTRIES, ...PLUSVERIFY_COUNTRIES];
-      parsedCountry = allSupportedCountries.find(c => c.id.toLowerCase() === parsedCountry.toLowerCase()) || { id: parsedCountry, name: parsedCountry };
-    }
-
-    return {
-      balance: parseFloat(user.balance || 0),
-      state: user.state || 'AWAITING_COUNTRY',
-      country: parsedCountry || null,
-      selectedServiceQuery: user.selected_service_query || null,
-      chosenProvider: user.chosen_provider || null,
-      orders: (ordersRes.data || []).map(o => ({
-        orderId: o.order_id,
-        provider: o.provider,
-        serviceName: o.service_name,
-        phoneNumber: o.phone_number,
-        price: parseFloat(o.price || 0),
-        status: o.status,
-        date: o.date
-      })),
-      transactions: (txRes.data || []).map(t => ({
-        amount: parseFloat(t.amount || 0),
-        date: t.date
-      }))
-    };
-  } catch (err) {
-    console.error("Error fetching user session via REST:", err.message);
-    return { balance: 0, state: 'AWAITING_COUNTRY', country: null, orders: [], transactions: [] };
-  }
-}
-
-async function saveUserSession(userId, session) {
-  if (!SUPABASE_REST_URL) return;
-  try {
-    const headers = await getSupabaseHeaders();
-    const countryToSave = session.country && typeof session.country === 'object' ? session.country.id : session.country;
-    await axios.patch(`${SUPABASE_REST_URL}/users?user_id=eq.${userId}`, {
-      balance: session.balance,
-      state: session.state,
-      country: countryToSave,
-      selected_service_query: session.selectedServiceQuery,
-      chosen_provider: session.chosenProvider
-    }, { headers });
-  } catch (err) {
-    console.error("Error saving user session via REST:", err.message);
-  }
-}
-
-async function addOrderToDb(userId, orderRecord) {
-  if (!SUPABASE_REST_URL) return;
-  try {
-    const headers = await getSupabaseHeaders();
-    await axios.post(`${SUPABASE_REST_URL}/orders`, {
-      user_id: userId,
-      order_id: orderRecord.orderId,
-      provider: orderRecord.provider,
-      service_name: orderRecord.serviceName,
-      phone_number: orderRecord.phoneNumber,
-      price: orderRecord.price,
-      status: orderRecord.status,
-      date: orderRecord.date
-    }, { headers });
-  } catch (err) {
-    console.error("Error adding order via REST:", err.message);
-  }
-}
-
-async function updateOrderStatusInDb(orderId, newStatus) {
-  if (!SUPABASE_REST_URL) return;
-  try {
-    const headers = await getSupabaseHeaders();
-    await axios.patch(`${SUPABASE_REST_URL}/orders?order_id=eq.${orderId}`, {
-      status: newStatus
-    }, { headers });
-  } catch (err) {
-    console.error("Error updating order status via REST:", err.message);
-  }
-}
-
-async function addTransactionToDb(userId, amount, date) {
-  if (!SUPABASE_REST_URL) return;
-  try {
-    const headers = await getSupabaseHeaders();
-    await axios.post(`${SUPABASE_REST_URL}/transactions`, {
-      user_id: userId,
-      amount: amount,
-      date: date
-    }, { headers });
-  } catch (err) {
-    console.error("Error adding transaction via REST:", err.message);
-  }
-}
 
 const agent = new https.Agent({ keepAlive: true, rejectUnauthorized: false });
 const robustAxiosConfig = {
@@ -164,6 +32,109 @@ const robustAxiosConfig = {
     'Accept': 'application/json, text/plain, */*'
   }
 };
+
+const supabaseHeaders = {
+  'apikey': SUPABASE_SERVICE_KEY ? SUPABASE_SERVICE_KEY.trim() : '',
+  'Authorization': `Bearer ${SUPABASE_SERVICE_KEY ? SUPABASE_SERVICE_KEY.trim() : ''}`,
+  'Content-Type': 'application/json',
+  'Prefer': 'return=representation'
+};
+
+async function getUserSession(userId) {
+  try {
+    const res = await axios.get(`${SUPABASE_REST_URL}/user_sessions?user_id=eq.${userId}&select=*`, {
+      ...robustAxiosConfig,
+      headers: supabaseHeaders
+    });
+    if (res.data && res.data.length > 0) {
+      const row = res.data[0];
+      return {
+        balance: parseFloat(row.balance || 0),
+        state: row.state || 'AWAITING_COUNTRY',
+        country: row.country || null,
+        selectedServiceQuery: row.selected_service_query || null,
+        chosenProvider: row.chosen_provider || null,
+        orders: row.orders || [],
+        transactions: row.transactions || []
+      };
+    }
+  } catch (err) {}
+
+  const defaultSession = {
+    balance: 0,
+    state: 'AWAITING_COUNTRY',
+    country: null,
+    selectedServiceQuery: null,
+    chosenProvider: null,
+    orders: [],
+    transactions: []
+  };
+  await saveUserSession(userId, defaultSession);
+  return defaultSession;
+}
+
+async function saveUserSession(userId, session) {
+  try {
+    const payload = {
+      user_id: String(userId),
+      balance: session.balance,
+      state: session.state,
+      country: session.country,
+      selected_service_query: session.selectedServiceQuery,
+      chosen_provider: session.chosenProvider,
+      orders: session.orders,
+      transactions: session.transactions,
+      updated_at: new Date().toISOString()
+    };
+
+    await axios.post(`${SUPABASE_REST_URL}/user_sessions`, payload, {
+      ...robustAxiosConfig,
+      headers: { ...supabaseHeaders, 'Prefer': 'resolution=merge-duplicates' }
+    });
+  } catch (err) {
+    console.error("Error saving user session via REST:", err.message);
+  }
+}
+
+async function addOrderToDb(userId, orderRecord) {
+  const session = await getUserSession(userId);
+  session.orders.push(orderRecord);
+  await saveUserSession(userId, session);
+}
+
+async function updateOrderStatusInDb(orderId, newStatus) {
+  try {
+    const res = await axios.get(`${SUPABASE_REST_URL}/user_sessions?select=*`, {
+      ...robustAxiosConfig,
+      headers: supabaseHeaders
+    });
+    if (res.data) {
+      for (const row of res.data) {
+        let updated = false;
+        const orders = row.orders || [];
+        orders.forEach(o => {
+          if (String(o.orderId) === String(orderId)) {
+            o.status = newStatus;
+            updated = true;
+          }
+        });
+        if (updated) {
+          await axios.patch(`${SUPABASE_REST_URL}/user_sessions?user_id=eq.${row.user_id}`, { orders }, {
+            ...robustAxiosConfig,
+            headers: supabaseHeaders
+          });
+          break;
+        }
+      }
+    }
+  } catch (err) {}
+}
+
+async function addTransactionToDb(userId, amount, date) {
+  const session = await getUserSession(userId);
+  session.transactions.push({ amount, date });
+  await saveUserSession(userId, session);
+}
 
 const USD_TO_NGN_RATE = 1500; 
 
@@ -696,16 +667,15 @@ async function promptServerSelection(ctx, session) {
   const availableServers = await fetchCombinedServices(session.country);
   const q = (session.selectedServiceQuery || '').toLowerCase().trim();
   
-  // FIXED: Flexible partial & case-insensitive matching for service names (e.g., "whatsapp" matches "WhatsApp", "whatsapp-business")
   const filtered = availableServers.filter(s => {
     const sName = String(s.service_name || '').toLowerCase();
     const sId = String(s.service_id || '').toLowerCase();
     return sName.includes(q) || q.includes(sName) || sId.includes(q);
   });
 
+  const userId = ctx.from.id;
   if (filtered.length === 0) {
     session.state = 'AWAITING_SERVICE';
-    const userId = ctx.from.id;
     await saveUserSession(userId, session);
     const topServices = availableServers.slice(0, 15).map(s => `• ${s.service_name}`).join('\n');
     ctx.reply(
@@ -753,7 +723,6 @@ bot.action(/^server\|(.+)\|(.+)$/, async (ctx) => {
   const availableServers = await fetchCombinedServices(session.country);
   const q = (session.selectedServiceQuery || '').toLowerCase().trim();
 
-  // FIXED: Flexible partial matching here too
   const filtered = availableServers.filter(s => {
     const sName = String(s.service_name || '').toLowerCase();
     const sId = String(s.service_id || '').toLowerCase();
@@ -825,6 +794,7 @@ bot.action(/^buy\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
   if (response.success && response.data) {
     if (calculatedNgnPrice > 0) {
       session.balance = Math.max(0, session.balance - calculatedNgnPrice);
+      await saveUserSession(userId, session);
     }
 
     const orderId = response.data.order_id;
@@ -842,7 +812,6 @@ bot.action(/^buy\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
     };
     
     await addOrderToDb(userId, orderRecord);
-    await saveUserSession(userId, session);
 
     ctx.reply(
       `🎉 *NUMBER PURCHASED SUCCESSFULLY!*\n\n` +
