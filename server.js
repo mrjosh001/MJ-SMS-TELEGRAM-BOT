@@ -22,21 +22,6 @@ const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const LOGSDOMAIN_BASE_URL = 'https://logsdomain.com/api/v1';
 const ALLSMSVERIFY_BASE_URL = 'https://allsmsverify.com/stubs/handler_api.php';
 
-// ALLSMSVERIFY / SMS-ACTIVATE COUNTRY ID MAPPER
-const ALLSMSVERIFY_COUNTRY_MAP = {
-  'ru': 0, 'ua': 1, 'kz': 2, 'cn': 3, 'ph': 4, 'mm': 5, 'id': 6, 'my': 7,
-  'ke': 8, 'tz': 9, 'vn': 10, 'kg': 11, 'us': 12, 'il': 13, 'hk': 14, 'pl': 15,
-  'gb': 16, 'ng': 19, 'in': 22, 'br': 27, 'ca': 36, 'de': 43, 'fr': 78
-};
-
-function getAllSmsCountryId(shortCode) {
-  if (!shortCode) return 12; // default USA
-  const cleanCode = String(shortCode).toLowerCase().trim();
-  return ALLSMSVERIFY_COUNTRY_MAP[cleanCode] !== undefined 
-    ? ALLSMSVERIFY_COUNTRY_MAP[cleanCode] 
-    : cleanCode;
-}
-
 if (!BOT_TOKEN) {
   console.error("FATAL ERROR: BOT_TOKEN environment variable is missing!");
   process.exit(1);
@@ -189,11 +174,52 @@ async function getLogsDomainServices(countryId) {
 
 // ------------------- ALLSMSVERIFY INTEGRATION -------------------
 
-async function getAllSmsVerifyServices(countryShortCode) {
+let allSmsServerMapCache = null;
+
+async function getAllSmsServerMap() {
+  if (allSmsServerMapCache) return allSmsServerMapCache;
+  const cleanApiKey = SECOND_SMS_API_KEY ? SECOND_SMS_API_KEY.trim() : null;
+  if (!cleanApiKey) return {};
+
+  try {
+    const res = await axios.get(ALLSMSVERIFY_BASE_URL, {
+      ...robustAxiosConfig,
+      params: { action: 'getCountries', api_key: cleanApiKey }
+    });
+    if (res.data && typeof res.data === 'object') {
+      allSmsServerMapCache = res.data;
+      return allSmsServerMapCache;
+    }
+  } catch (err) {
+    console.error("Error fetching AllSMSVerify countries map:", err.message);
+  }
+  return {};
+}
+
+async function getAllSmsVerifyServices(countryShortCode, countryName) {
   const cleanApiKey = SECOND_SMS_API_KEY ? SECOND_SMS_API_KEY.trim() : null;
   if (!cleanApiKey) return [];
 
-  const targetCountry = getAllSmsCountryId(countryShortCode);
+  const serverMap = await getAllSmsServerMap();
+  let targetServerId = null;
+
+  // Try matching server ID by country name or short code from handler_api.php
+  if (serverMap && typeof serverMap === 'object') {
+    for (const [serverId, info] of Object.entries(serverMap)) {
+      const sName = (info.name || info.title || info.country || '').toLowerCase();
+      const sCode = (info.code || info.short || '').toLowerCase();
+      if (
+        (countryName && sName.includes(countryName.toLowerCase())) ||
+        (countryShortCode && sCode === countryShortCode.toLowerCase())
+      ) {
+        targetServerId = serverId;
+        break;
+      }
+    }
+  }
+
+  // Fallback to default server 1 if not mapped
+  if (!targetServerId) targetServerId = 1;
 
   try {
     const res = await axios.get(ALLSMSVERIFY_BASE_URL, {
@@ -201,7 +227,7 @@ async function getAllSmsVerifyServices(countryShortCode) {
       params: {
         action: 'getServices',
         api_key: cleanApiKey,
-        country: targetCountry
+        country: targetServerId
       }
     });
 
@@ -221,7 +247,8 @@ async function getAllSmsVerifyServices(countryShortCode) {
             service_id: key,
             service_name: item.name || item.title || key,
             stock: item.count || item.stock || item.available || 10,
-            price: item.cost || item.price || 0
+            price: item.cost || item.price || 0,
+            server_id: targetServerId
           };
         }
         return null;
@@ -272,7 +299,7 @@ async function fetchCombinedServices(country) {
   }
 
   // 2. AllSMSVerify
-  const allSmsData = await getAllSmsVerifyServices(country.short);
+  const allSmsData = await getAllSmsVerifyServices(country.short, country.name);
   if (Array.isArray(allSmsData)) {
     allSmsData.forEach(s => {
       const serviceName = s.service_name || s.name || s.title || s.service || '';
@@ -282,8 +309,8 @@ async function fetchCombinedServices(country) {
           provider: 'allsmsverify',
           service_id: s.service_id || s.code || serviceName,
           service_name: serviceName,
-          operator_id: s.operator_id || null,
-          server_name: s.server_name || s.operator_name || 'Server (AllSMS)',
+          operator_id: s.server_id || '1',
+          server_name: s.server_name || 'Server (AllSMS)',
           stock: stock,
           price: parseFloat(s.price || 0)
         });
@@ -313,7 +340,7 @@ async function executePurchase(provider, countryId, countryShort, serviceId, ope
   if (provider === 'a' || provider === 'allsmsverify') {
     try {
       const cleanApiKey = SECOND_SMS_API_KEY ? SECOND_SMS_API_KEY.trim() : '';
-      const targetCountry = getAllSmsCountryId(countryShort);
+      const serverId = operatorId || '1';
 
       const res = await axios.get(ALLSMSVERIFY_BASE_URL, {
         ...robustAxiosConfig,
@@ -321,7 +348,7 @@ async function executePurchase(provider, countryId, countryShort, serviceId, ope
           action: 'getNumber',
           api_key: cleanApiKey,
           service: serviceId,
-          country: targetCountry
+          country: serverId
         }
       });
 
@@ -473,20 +500,22 @@ bot.on('text', async (ctx) => {
 
   const session = getUserSession(userId);
 
-  // A. Catch Support / Customer Care Keywords
+  // A. Support / Customer Care Trigger
   if (['support', 'customer care', 'speak to support', 'help', 'admin', 'contact'].some(k => lowerText.includes(k))) {
     sendCustomerSupportMessage(ctx);
     return;
   }
 
-  // B. Catch plain "balance", "wallet"
-  if (['balance', 'wallet', 'my balance', 'check balance'].includes(lowerText)) {
+  // B. Balance Checks or Sentences about Balance
+  if (lowerText.includes('balance') || lowerText.includes('wallet')) {
     const bal = session.balance || 0;
     ctx.reply(
       `💰 *YOUR WALLET BALANCE:* ₦${bal.toLocaleString()}\n\n` +
-      `To top up, type */fund* or reply with an amount like *fund 1000*.`,
+      `To top up your wallet, type */fund* or reply with an amount like *fund 1000*.`,
       { parse_mode: 'Markdown' }
     );
+    session.state = 'AWAITING_COUNTRY';
+    saveSessions();
     return;
   }
 
