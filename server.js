@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SERVER_URL = process.env.RENDER_EXTERNAL_URL;
 const JUICYSMS_API_KEY = process.env.JUICYSMS_API_KEY || process.env.SECOND_SMS_API_KEY;
-const PLUSVERIFY_API_KEY = process.env.PLUSVERIFY_API_KEY;
+const PLUSVERIFY_API_KEY = process.env.PLUSVERIFY_API_KEY || process.env.PLUS_VERIFY_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 
 // API Base URLs
@@ -140,7 +140,6 @@ const JUICYSMS_COUNTRIES = [
   { id: 'DE', name: 'Germany (DE)', short: 'de' }
 ];
 
-// PlusVerify standard country codes supported for ordering
 const PLUSVERIFY_COUNTRIES = [
   { id: 'us', name: 'United States (US)', short: 'us' },
   { id: 'ng', name: 'Nigeria (NG)', short: 'ng' }
@@ -175,7 +174,6 @@ async function getPlusVerifyServices() {
   try {
     const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
     if (!cleanApiKey) {
-      console.log("PLUSVERIFY_API_KEY is missing or empty!");
       return [];
     }
 
@@ -196,15 +194,41 @@ async function getPlusVerifyServices() {
       return servicesList.map(item => ({
         service_id: item.id || item.service_id || item.code || '',
         service_name: item.name || item.title || item.service_name || item.id || '',
-        stock: 100, // PlusVerify default stock indicator
+        stock: 100,
         price: parseFloat(item.price || 0),
         is_ngn: true
       })).filter(s => s.service_id);
     }
     return [];
   } catch (err) {
-    console.error("PlusVerify services error:", err.message);
     return [];
+  }
+}
+
+async function getPlusVerifyPrice(serviceId, countryId) {
+  try {
+    const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
+    if (!cleanApiKey) return null;
+
+    const res = await axios.post(`${PLUSVERIFY_BASE_URL}/price.php`, {
+      api_key: cleanApiKey,
+      service_id: serviceId,
+      country_id: countryId
+    }, {
+      ...robustAxiosConfig,
+      headers: {
+        ...robustAxiosConfig.headers,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const data = res.data;
+    if (data && (data.success === true || data.status === 'success') && typeof data.price !== 'undefined') {
+      return parseFloat(data.price);
+    }
+    return null;
+  } catch (err) {
+    return null;
   }
 }
 
@@ -232,22 +256,28 @@ async function fetchCombinedServices(country) {
     }
   }
 
-  // Provider 2: PlusVerify mapped to Server Two (using exact v1 endpoint docs)
-  const plusData = await getPlusVerifyServices();
-  if (Array.isArray(plusData)) {
-    plusData.forEach(s => {
-      results.push({
-        provider: 'plusverify',
-        service_id: s.service_id,
-        service_name: s.service_name,
-        operator_id: country.id.toLowerCase(),
-        server_label: 'Server Two',
-        server_name: `${country.name} (Server Two)`,
-        stock: s.stock || 100,
-        price: s.price,
-        is_ngn: true
-      });
-    });
+  // Provider 2: PlusVerify mapped to Server Two (Only checked if API key is present)
+  const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
+  if (cleanApiKey) {
+    const plusData = await getPlusVerifyServices();
+    if (Array.isArray(plusData)) {
+      for (const s of plusData) {
+        const livePrice = await getPlusVerifyPrice(s.service_id, country.id.toLowerCase());
+        if (livePrice !== null) {
+          results.push({
+            provider: 'plusverify',
+            service_id: s.service_id,
+            service_name: s.service_name,
+            operator_id: country.id.toLowerCase(),
+            server_label: 'Server Two',
+            server_name: `${country.name} (Server Two)`,
+            stock: 100,
+            price: livePrice,
+            is_ngn: true
+          });
+        }
+      }
+    }
   }
 
   return results;
@@ -257,7 +287,6 @@ async function executeOrder(provider, serviceId, countryId) {
   if (provider === 'plusverify') {
     try {
       const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
-      // Correct v1 endpoint mapping matching documentation specifications: POST otp.php with api_key, service_id, country_id
       const res = await axios.post(`${PLUSVERIFY_BASE_URL}/otp.php`, {
         api_key: cleanApiKey,
         service_id: serviceId,
@@ -282,7 +311,6 @@ async function executeOrder(provider, serviceId, countryId) {
       }
       return { success: false, message: data?.message || 'Stock unavailable or insufficient balance on PlusVerify.' };
     } catch (err) {
-      console.error("PlusVerify order error:", err.message);
       return { success: false, message: 'PlusVerify request failed.' };
     }
   } else {
@@ -308,7 +336,6 @@ async function checkSmsCode(provider, orderId) {
   if (provider === 'plusverify') {
     try {
       const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
-      // Correct v1 endpoint mapping matching documentation specifications: POST status.php with api_key and order_id
       const res = await axios.post(`${PLUSVERIFY_BASE_URL}/status.php`, {
         api_key: cleanApiKey,
         order_id: orderId
@@ -349,7 +376,6 @@ async function cancelOrder(provider, orderId) {
   if (provider === 'plusverify') {
     try {
       const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
-      // Correct v1 cancellation payload following documentation specifications (status: 8)
       await axios.post(`${PLUSVERIFY_BASE_URL}/update_status.php`, {
         api_key: cleanApiKey,
         order_id: orderId,
@@ -361,9 +387,7 @@ async function cancelOrder(provider, orderId) {
           'Content-Type': 'application/json'
         }
       });
-    } catch (err) {
-      console.error("PlusVerify cancel order error:", err.message);
-    }
+    } catch (err) {}
   } else {
     try {
       const cleanApiKey = JUICYSMS_API_KEY ? JUICYSMS_API_KEY.trim() : '';
@@ -371,9 +395,7 @@ async function cancelOrder(provider, orderId) {
         ...robustAxiosConfig,
         params: { key: cleanApiKey, orderId: orderId }
       });
-    } catch (err) {
-      console.error("JuicySMS cancel order error:", err.message);
-    }
+    } catch (err) {}
   }
 }
 
@@ -607,8 +629,9 @@ bot.on('text', async (ctx) => {
   ctx.reply(`Please state your country code first (e.g., type *US* or *US WhatsApp*).`, { parse_mode: 'Markdown' });
 });
 
-// ------------------- NEW FLOW: ASK SERVER FIRST, THEN PRICE -------------------
+// ------------------- FLOW: ASK SERVER FIRST, THEN PRICE -------------------
 async function promptServerSelection(ctx, session) {
+  ctx.reply(`Checking available servers and stock... ⏳`);
   const availableServers = await fetchCombinedServices(session.country);
   const q = session.selectedServiceQuery.toLowerCase().trim();
   
@@ -799,7 +822,7 @@ bot.action(/^buy\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
             saveSessions();
           }
         }
-        ctx.reply(`⏰ *Time Out:* Code no enter after 10 minutes. Order canceled and ₦${calculatedNgnPrice.toLocaleString()} refunded to your balance!`);
+        ctx.reply(`⏰ *Time Out:* Code no enter after 10 minutes. Order canceled and ₦${calculatedNgnPrice.toLocaleString()} returned to your balance!`);
       }
     }, 7000);
 
