@@ -25,7 +25,7 @@ if (!BOT_TOKEN) {
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// ------------------- PERSISTENT BALANCE STORAGE -------------------
+// ------------------- PERSISTENT STORAGE -------------------
 const DB_FILE = path.join(__dirname, 'users.json');
 let userSessions = {};
 
@@ -70,6 +70,7 @@ const robustAxiosConfig = {
   }
 };
 
+const USD_TO_NGN_RATE = 1500; 
 const DEFAULT_MARGIN = 1.4;
 
 // ------------------- PAYSTACK INTEGRATION -------------------
@@ -126,13 +127,16 @@ async function getJuicySmsServices(countryId) {
     if (data && data.services) data = data.services;
 
     if (Array.isArray(data)) {
-      return data.map(item => ({
-        service_id: item.id || item.serviceId || item.code || '',
-        service_name: item.title || item.name || item.service_id || '',
-        stock: parseInt(item.count || item.stock || item.quantity || 10, 10),
-        price: parseFloat(item.price || item.cost || 0),
-        server_id: countryId
-      })).filter(s => s.service_id);
+      return data.map(item => {
+        const rawPrice = parseFloat(item.price || item.cost || 0);
+        return {
+          service_id: item.id || item.serviceId || item.code || '',
+          service_name: item.title || item.name || item.service_id || '',
+          stock: parseInt(item.count || item.stock || item.quantity || 10, 10),
+          price: rawPrice,
+          server_id: countryId
+        };
+      }).filter(s => s.service_id);
     }
     return [];
   } catch (err) {
@@ -172,7 +176,6 @@ async function executeJuicyPurchase(serviceId, countryId) {
     const respText = typeof res.data === 'string' ? res.data.trim() : JSON.stringify(res.data);
     
     if (respText.startsWith('ORDER_ID_')) {
-      // Format: ORDER_ID_{ORDER_ID}_NUMBER_{PHONE_NUMBER}
       const parts = respText.split('_');
       const orderId = parts[2];
       const phoneNumber = parts.slice(4).join('_');
@@ -278,19 +281,16 @@ bot.on('text', async (ctx) => {
   const lowerText = rawText.toLowerCase();
   const session = getUserSession(userId);
 
-  // 1. Support triggers
   if (['support', 'customer care', 'speak to support', 'admin', 'contact', 'i want to speak with support'].some(k => lowerText.includes(k))) {
     sendCustomerSupportMessage(ctx);
     return;
   }
 
-  // 2. Balance triggers
   if (lowerText.includes('balance') || lowerText.includes('bal') || lowerText === 'my balance' || lowerText === "what's my balance" || lowerText === "what's my current balance") {
     ctx.reply(`Boss your current balance na ₦${(session.balance || 0).toLocaleString()} ✨`, { parse_mode: 'Markdown' });
     return;
   }
 
-  // 3. Fund / Wallet deposit triggers
   if (['fund', 'deposit', 'wallet', 'topup', 'top up', 'i want to fund my wallet', 'fund my account', 'fund account', 'i wan fund my account'].some(k => lowerText.includes(k))) {
     session.state = 'AWAITING_DEPOSIT_AMOUNT';
     saveSessions();
@@ -303,7 +303,6 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // 4. Reset country flow triggers
   if (['/start', 'change country', 'countries', 'back'].some(k => lowerText.includes(k))) {
     session.state = 'AWAITING_COUNTRY';
     session.country = null;
@@ -359,7 +358,6 @@ bot.on('text', async (ctx) => {
     });
   };
 
-  // 5. Combined Input Handling ("NL WhatsApp")
   if (countries.length > 0) {
     const words = lowerText.split(/\s+/);
     let matchedCountry = null;
@@ -386,7 +384,6 @@ bot.on('text', async (ctx) => {
     }
   }
 
-  // 6. Single Country Input ("NL", "UK")
   const matchedCountryDirect = getNormalizedCountry(lowerText);
   if (matchedCountryDirect) {
     session.country = matchedCountryDirect;
@@ -400,7 +397,6 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // 7. Service Query when state is already AWAITING_SERVICE
   if (session.state === 'AWAITING_SERVICE' && session.country) {
     ctx.reply(`Oya wait make we check available servers for *${rawText}* (${session.country.name})... 🔎`, { parse_mode: 'Markdown' });
     await processServiceSelection(ctx, session, rawText);
@@ -432,9 +428,10 @@ async function processServiceSelection(ctx, session, serviceQuery) {
   }
 
   const buttons = filtered.map((srv) => {
-    const finalPrice = Math.ceil(srv.price * DEFAULT_MARGIN);
+    const priceInNgn = srv.price * USD_TO_NGN_RATE;
+    const finalPrice = Math.ceil(priceInNgn * DEFAULT_MARGIN);
     const cbData = `buy|${session.country.id}|${srv.service_id}`;
-    return [Markup.button.callback(`🖥️ ${srv.server_name} (${srv.stock} left) — ₦${finalPrice}`, cbData)];
+    return [Markup.button.callback(`🖥️ ${srv.server_name} (${srv.stock} left) — ₦${finalPrice.toLocaleString()}`, cbData)];
   });
 
   buttons.push([Markup.button.callback('🔄 Choose Another Country', 'reset_flow')]);
@@ -448,20 +445,46 @@ async function processServiceSelection(ctx, session, serviceQuery) {
 // ------------------- BUTTON HANDLERS -------------------
 bot.action(/^buy\|(.+)\|(.+)$/, async (ctx) => {
   ctx.answerCbQuery();
+  const userId = ctx.from.id;
+  const session = getUserSession(userId);
   const countryId = ctx.match[1];
   const serviceId = ctx.match[2];
+
+  // 1. Fetch live service details/price to check user wallet balance first
+  const availableServers = await fetchCombinedServices({ id: countryId, name: countryId });
+  const targetService = availableServers.find(s => String(s.service_id) === String(serviceId));
+  
+  const calculatedNgnPrice = targetService ? Math.ceil(targetService.price * USD_TO_NGN_RATE * DEFAULT_MARGIN) : 0;
+
+  if (calculatedNgnPrice > 0 && session.balance < calculatedNgnPrice) {
+    ctx.reply(
+      `❌ *Insufficient Balance!*\n\n` +
+      `This number costs *₦${calculatedNgnPrice.toLocaleString()}*, but your balance is *₦${(session.balance || 0).toLocaleString()}*.\n\n` +
+      `Type */fund* to top up your wallet and try again! 💳`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
 
   ctx.reply(`Processing your number purchase... Please wait ⏳`);
 
   const response = await executeJuicyPurchase(serviceId, countryId);
 
   if (response.success && response.data) {
+    // Deduct user balance on successful purchase
+    if (calculatedNgnPrice > 0) {
+      session.balance = Math.max(0, session.balance - calculatedNgnPrice);
+      saveSessions();
+    }
+
     const orderId = response.data.order_id;
     const phoneNumber = response.data.number;
 
     ctx.reply(
       `🎉 *NUMBER PURCHASED SUCCESSFULLY!*\n\n` +
-      `📞 *Phone Number:* \`${phoneNumber}\`\n\n` +
+      `📞 *Phone Number:* \`${phoneNumber}\`\n` +
+      `💰 *Charged:* ₦${calculatedNgnPrice.toLocaleString()}\n` +
+      `💳 *New Balance:* ₦${session.balance.toLocaleString()}\n\n` +
       `👉 Copy the number above into your app.\n` +
       `⏳ Waiting for your SMS code...`,
       { parse_mode: 'Markdown' }
@@ -486,12 +509,17 @@ bot.action(/^buy\|(.+)\|(.+)$/, async (ctx) => {
       } else if (pollCount >= maxPolls) {
         clearInterval(intervalId);
         await cancelJuicyOrder(orderId);
-        ctx.reply(`⏰ *Time Out:* Code no enter after 10 minutes. Order canceled!`);
+        // Refund user balance if timed out/canceled
+        if (calculatedNgnPrice > 0) {
+          session.balance += calculatedNgnPrice;
+          saveSessions();
+        }
+        ctx.reply(`⏰ *Time Out:* Code no enter after 10 minutes. Order canceled and ₦${calculatedNgnPrice.toLocaleString()} refunded to your balance!`);
       }
     }, 7000);
 
   } else {
-    ctx.reply(`❌ *Purchase Failed:* ${response.message || 'Server out of stock.'}`);
+    ctx.reply(`❌ *Purchase Failed:* ${response.message || 'Server out of stock or insufficient account balance.'}`);
   }
 });
 
@@ -536,7 +564,7 @@ app.post('/webhook/paystack', async (req, res) => {
   res.sendStatus(200);
 });
 
-app.get('/', (req, res) => res.send('MJ SMS Bot Active!'));
+app.get('/', (reque, res) => res.send('MJ SMS Bot Active!'));
 
 app.listen(PORT, async () => {
   console.log(`Server listening on port ${PORT}`);
