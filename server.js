@@ -1,6 +1,7 @@
 const express = require('express');
 const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
+const https = require('https');
 
 const app = express();
 app.use(express.json());
@@ -12,8 +13,9 @@ const SERVER_URL = process.env.RENDER_EXTERNAL_URL;
 const SMS_API_KEY = process.env.SMS_API_KEY;
 const SECOND_SMS_API_KEY = process.env.SECOND_SMS_API_KEY;
 
+// Provider Base Endpoints
 const LOGSDOMAIN_BASE_URL = 'https://logsdomain.com/api/v1';
-const ALLSMSVERIFY_BASE_URL = 'https://allsmsverify.com/api';
+const ALLSMSVERIFY_BASE_URL = 'https://allsmsverify.com/stubs/handler_api.php';
 
 if (!BOT_TOKEN) {
   console.error("FATAL ERROR: BOT_TOKEN is missing!");
@@ -22,6 +24,21 @@ if (!BOT_TOKEN) {
 
 const bot = new Telegraf(BOT_TOKEN);
 const userSessions = {};
+
+// Custom HTTPS agent to prevent TLS dropouts on cloud hosting
+const agent = new https.Agent({
+  keepAlive: true,
+  rejectUnauthorized: false
+});
+
+const robustAxiosConfig = {
+  timeout: 12000,
+  httpsAgent: agent,
+  headers: {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*'
+  }
+};
 
 // ------------------- DYNAMIC PROFIT MARGIN CONFIG -------------------
 const DEFAULT_MARGIN = 1.4;
@@ -48,13 +65,14 @@ function calculateRetailPrice(serviceName, providerPriceNgn) {
   return Math.ceil(Math.max(calculatedPrice, minPrice));
 }
 
-// ------------------- API INTEGRATION FUNCTIONS -------------------
+// ------------------- LOGSDOMAIN INTEGRATION -------------------
 
 async function getCountries() {
   if (!SMS_API_KEY) return [];
   try {
     const res = await axios.get(`${LOGSDOMAIN_BASE_URL}/numbers/countries`, {
-      headers: { 'Authorization': `Bearer ${SMS_API_KEY}`, 'Accept': 'application/json' }
+      ...robustAxiosConfig,
+      headers: { ...robustAxiosConfig.headers, 'Authorization': `Bearer ${SMS_API_KEY}` }
     });
     return res.data?.success ? res.data.data : [];
   } catch (err) {
@@ -67,7 +85,8 @@ async function getLogsDomainServices(countryId) {
   if (!SMS_API_KEY) return [];
   try {
     const res = await axios.get(`${LOGSDOMAIN_BASE_URL}/numbers/services?country_id=${countryId}`, {
-      headers: { 'Authorization': `Bearer ${SMS_API_KEY}`, 'Accept': 'application/json' }
+      ...robustAxiosConfig,
+      headers: { ...robustAxiosConfig.headers, 'Authorization': `Bearer ${SMS_API_KEY}` }
     });
     if (!res.data || !res.data.data) return [];
     return Array.isArray(res.data.data) ? res.data.data : Object.values(res.data.data);
@@ -77,19 +96,36 @@ async function getLogsDomainServices(countryId) {
   }
 }
 
+// ------------------- ALLSMSVERIFY INTEGRATION -------------------
+
 async function getAllSmsVerifyServices(countryShortCode) {
   if (!SECOND_SMS_API_KEY) return [];
   try {
-    const res = await axios.get(`${ALLSMSVERIFY_BASE_URL}/services`, {
-      params: { api_key: SECOND_SMS_API_KEY, country: countryShortCode },
-      headers: { 'Accept': 'application/json' }
+    const res = await axios.get(ALLSMSVERIFY_BASE_URL, {
+      ...robustAxiosConfig,
+      params: {
+        action: 'getServices',
+        api_key: SECOND_SMS_API_KEY,
+        country: countryShortCode
+      }
     });
-    return res.data?.success ? res.data.data : (Array.isArray(res.data) ? res.data : []);
+
+    const data = res.data;
+    if (typeof data === 'string' && (data.includes('<!DOCTYPE html>') || data.includes('BAD_KEY') || data.includes('404'))) {
+      return [];
+    }
+
+    if (Array.isArray(data)) return data;
+    if (data && typeof data === 'object') return Object.values(data);
+
+    return [];
   } catch (err) {
-    console.error("Allsmsverify Services Error:", err.response?.data || err.message);
+    console.error("AllSMSVerify Services Error:", err.message);
     return [];
   }
 }
+
+// ------------------- COMBINED PROVIDER DISPATCHER -------------------
 
 async function fetchCombinedServices(country) {
   const results = [];
@@ -98,22 +134,26 @@ async function fetchCombinedServices(country) {
   const logsData = await getLogsDomainServices(country.id);
   if (Array.isArray(logsData)) {
     logsData.forEach(s => {
+      const serviceName = s.service_name || s.name || s.title || '';
+      const serviceId = s.service_id || s.id || serviceName;
+
       let ops = s.operators && s.operators.length ? s.operators : [{
         id: 'default',
-        name: s.operator_name || 'Server 1 (Logs)',
-        available_quantity: s.available_quantity || 0,
+        name: s.operator_name || 'Server 1',
+        available_quantity: s.available_quantity || s.count || 0,
         price: s.price
       }];
 
       ops.forEach(op => {
-        if ((op.available_quantity || op.count || 0) > 0) {
+        const stock = op.available_quantity || op.count || s.available_quantity || 0;
+        if (stock > 0) {
           results.push({
             provider: 'logsdomain',
-            service_id: s.service_id,
-            service_name: s.service_name,
+            service_id: serviceId,
+            service_name: serviceName,
             operator_id: op.id === 'default' ? null : op.id,
             server_name: op.name || 'Server 1',
-            stock: op.available_quantity || op.count || 0,
+            stock: stock,
             price: parseFloat(op.price || s.price || 0)
           });
         }
@@ -121,16 +161,17 @@ async function fetchCombinedServices(country) {
     });
   }
 
-  // Allsmsverify
+  // AllSMSVerify
   const allSmsData = await getAllSmsVerifyServices(country.short);
   if (Array.isArray(allSmsData)) {
     allSmsData.forEach(s => {
+      const serviceName = s.service_name || s.name || s.title || s.service || '';
       const stock = s.stock || s.available_quantity || s.count || 0;
       if (stock > 0) {
         results.push({
           provider: 'allsmsverify',
-          service_id: s.service_id || s.code || s.name,
-          service_name: s.service_name || s.name,
+          service_id: s.service_id || s.code || serviceName,
+          service_name: serviceName,
           operator_id: s.operator_id || null,
           server_name: s.server_name || s.operator_name || 'Server (AllSMS)',
           stock: stock,
@@ -143,19 +184,40 @@ async function fetchCombinedServices(country) {
   return results;
 }
 
-// Order execution
+function matchesServiceQuery(serviceName, query) {
+  const sName = serviceName.toLowerCase();
+  const q = query.toLowerCase().trim();
+
+  if (sName.includes(q)) return true;
+  if ((q === 'telegram' || q === 'tg') && (sName.includes('telegram') || sName === 'tg')) return true;
+  if ((q === 'whatsapp' || q === 'wa') && (sName.includes('whatsapp') || sName === 'wa')) return true;
+
+  return false;
+}
+
+// ------------------- PURCHASE & POLLING EXECUTION -------------------
+
 async function executePurchase(provider, countryId, countryShort, serviceId, operatorId) {
   if (provider === 'a' || provider === 'allsmsverify') {
     try {
-      const res = await axios.post(`${ALLSMSVERIFY_BASE_URL}/order`, {
-        api_key: SECOND_SMS_API_KEY,
-        country: countryShort,
-        service: serviceId,
-        operator: operatorId
+      const res = await axios.get(ALLSMSVERIFY_BASE_URL, {
+        ...robustAxiosConfig,
+        params: {
+          action: 'getNumber',
+          api_key: SECOND_SMS_API_KEY,
+          service: serviceId,
+          country: countryShort
+        }
       });
-      return res.data;
+
+      const respText = String(res.data).trim();
+      if (respText.startsWith('ACCESS_NUMBER')) {
+        const parts = respText.split(':');
+        return { success: true, data: { order_id: parts[1], number: parts[2] } };
+      }
+      return { success: false, message: respText || 'AllSMSVerify stock unavailable.' };
     } catch (err) {
-      return { success: false, message: err.response?.data?.message || 'Allsmsverify purchase failed.' };
+      return { success: false, message: 'AllSMSVerify request failed.' };
     }
   } else {
     try {
@@ -167,7 +229,8 @@ async function executePurchase(provider, countryId, countryShort, serviceId, ope
       if (operatorId && operatorId !== '0') payload.operator_id = operatorId;
 
       const res = await axios.post(`${LOGSDOMAIN_BASE_URL}/numbers/orders`, payload, {
-        headers: { 'Authorization': `Bearer ${SMS_API_KEY}` }
+        ...robustAxiosConfig,
+        headers: { ...robustAxiosConfig.headers, 'Authorization': `Bearer ${SMS_API_KEY}` }
       });
       return res.data;
     } catch (err) {
@@ -179,13 +242,19 @@ async function executePurchase(provider, countryId, countryShort, serviceId, ope
 async function checkSmsCode(provider, orderId) {
   try {
     if (provider === 'a' || provider === 'allsmsverify') {
-      const res = await axios.get(`${ALLSMSVERIFY_BASE_URL}/check`, {
-        params: { api_key: SECOND_SMS_API_KEY, order_id: orderId }
+      const res = await axios.get(ALLSMSVERIFY_BASE_URL, {
+        ...robustAxiosConfig,
+        params: { action: 'getStatus', api_key: SECOND_SMS_API_KEY, id: orderId }
       });
-      return res.data;
+      const respText = String(res.data).trim();
+      if (respText.startsWith('STATUS_OK')) {
+        return { success: true, data: { code: respText.split(':')[1] } };
+      }
+      return { success: false };
     } else {
       const res = await axios.post(`${LOGSDOMAIN_BASE_URL}/numbers/orders/${orderId}/check`, {}, {
-        headers: { 'Authorization': `Bearer ${SMS_API_KEY}` }
+        ...robustAxiosConfig,
+        headers: { ...robustAxiosConfig.headers, 'Authorization': `Bearer ${SMS_API_KEY}` }
       });
       return res.data;
     }
@@ -197,10 +266,14 @@ async function checkSmsCode(provider, orderId) {
 async function cancelOrder(provider, orderId) {
   try {
     if (provider === 'a' || provider === 'allsmsverify') {
-      await axios.post(`${ALLSMSVERIFY_BASE_URL}/cancel`, { api_key: SECOND_SMS_API_KEY, order_id: orderId });
+      await axios.get(ALLSMSVERIFY_BASE_URL, {
+        ...robustAxiosConfig,
+        params: { action: 'setStatus', api_key: SECOND_SMS_API_KEY, id: orderId, status: 8 }
+      });
     } else {
       await axios.post(`${LOGSDOMAIN_BASE_URL}/numbers/orders/${orderId}/cancel`, {}, {
-        headers: { 'Authorization': `Bearer ${SMS_API_KEY}` }
+        ...robustAxiosConfig,
+        headers: { ...robustAxiosConfig.headers, 'Authorization': `Bearer ${SMS_API_KEY}` }
       });
     }
   } catch (err) {
@@ -208,7 +281,7 @@ async function cancelOrder(provider, orderId) {
   }
 }
 
-// ------------------- ELSA CONVERSATIONAL BOT FLOW -------------------
+// ------------------- ELSA BOT FLOW -------------------
 
 bot.start((ctx) => {
   const userId = ctx.from.id;
@@ -243,7 +316,7 @@ bot.on('text', async (ctx) => {
 
   const countries = await getCountries();
 
-  // Smart Parsing: Detect combined input like "USA WhatsApp" or "Nigeria Telegram"
+  // Multi-word input detection ("USA WhatsApp")
   if (countries.length > 0) {
     const words = lowerText.split(/\s+/);
     let matchedCountry = null;
@@ -315,10 +388,9 @@ bot.on('text', async (ctx) => {
 });
 
 async function processServiceSelection(ctx, session, serviceQuery) {
-  const lowerQuery = serviceQuery.toLowerCase();
   const availableServers = await fetchCombinedServices(session.country);
 
-  const filtered = availableServers.filter(s => s.service_name.toLowerCase().includes(lowerQuery));
+  const filtered = availableServers.filter(s => matchesServiceQuery(s.service_name, serviceQuery));
 
   if (filtered.length === 0) {
     ctx.reply(`Eya! Stock for *${serviceQuery}* (${session.country.name}) don finish across all servers! 💔\nTry another app or country.`, { parse_mode: 'Markdown' });
@@ -330,7 +402,6 @@ async function processServiceSelection(ctx, session, serviceQuery) {
     const pCode = srv.provider === 'allsmsverify' ? 'a' : 'l';
     const opCode = srv.operator_id || '0';
     
-    // Short string format to keep callback data strictly under 64 bytes
     const cbData = `b|${pCode}|${session.country.id}|${srv.service_id}|${opCode}`;
 
     return [Markup.button.callback(`🖥️ ${srv.server_name} (${srv.stock} left) — ₦${finalPrice}`, cbData)];
@@ -345,11 +416,11 @@ async function processServiceSelection(ctx, session, serviceQuery) {
   );
 }
 
-// ------------------- SERVER BUTTON CALLBACK -------------------
+// ------------------- BUTTON ACTIONS -------------------
 
 bot.action(/^b\|(.+)\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
   ctx.answerCbQuery();
-  const pCode = ctx.match[1]; // 'a' or 'l'
+  const pCode = ctx.match[1];
   const countryId = ctx.match[2];
   const serviceId = ctx.match[3];
   const operatorId = ctx.match[4] === '0' ? null : ctx.match[4];
