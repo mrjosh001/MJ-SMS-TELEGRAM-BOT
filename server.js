@@ -1,79 +1,107 @@
 const express = require('express');
-const { Telegraf } = require('telegraf');
-const axios = require('axios');
+const { Telegraf, Markup } = require('telegraf');
 
-// Load environment variables
-const BOT_TOKEN = process.env.BOT_TOKEN;
+const app = express();
+app.use(express.json());
+
 const PORT = process.env.PORT || 3000;
-const EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL; // e.g. https://your-service.onrender.com
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const SERVER_URL = process.env.RENDER_EXTERNAL_URL;
 
 if (!BOT_TOKEN) {
-  console.error('Error: BOT_TOKEN environment variable is not set. The bot cannot run without it.');
+  console.error("FATAL ERROR: BOT_TOKEN is missing!");
   process.exit(1);
 }
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// Greeting in Nigerian Pidgin English on /start
+// --- MAIN MENU KEYBOARD ---
+const mainKeyboard = Markup.inlineKeyboard([
+  [Markup.button.callback('📱 Buy Virtual Number', 'buy_number')],
+  [Markup.button.callback('💳 Fund Wallet', 'fund_wallet'), Markup.button.callback('📜 My Orders', 'order_history')],
+  [Markup.button.callback('📊 Check Balance', 'check_balance'), Markup.button.callback('❓ Help & Support', 'support')]
+]);
+
+// --- WELCOME COMMAND ---
 bot.start((ctx) => {
-  return ctx.reply('How far boss! 👋 Welcome to MJ Services Bot. Which app or service you wan verify today?');
+  ctx.reply(
+    `Welcome to *MJ SMS*! 🚀\n\nYour automated hub for instant virtual numbers and SMS verification codes.\n\nPlease choose an option below to get started:`,
+    { parse_mode: 'Markdown', ...mainKeyboard }
+  );
 });
 
-// Example handler for text messages (extend as needed)
-bot.on('text', (ctx) => {
-  const text = ctx.message.text || '';
-  // Simple echo for now; you can expand to handle verification commands
-  if (!text.startsWith('/')) {
-    return ctx.reply(`I hear you: "${text}". I fit help you verify apps or services.`);
-  }
+// --- MENU BUTTON ACTION HANDLERS ---
+bot.action('buy_number', (ctx) => {
+  ctx.answerCbQuery();
+  const countryKeyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('🇺🇸 United States', 'country_us'), Markup.button.callback('🇬🇧 United Kingdom', 'country_uk')],
+    [Markup.button.callback('🇨🇦 Canada', 'country_ca'), Markup.button.callback('🇳🇬 Nigeria', 'country_ng')],
+    [Markup.button.callback('🔙 Back to Main Menu', 'main_menu')]
+  ]);
+  ctx.editMessageText('Select the country for your virtual number:', countryKeyboard);
 });
 
-// Express setup
-const app = express();
-app.use(express.json());
-
-// Webhook endpoint
-app.post('/webhook/telegram', async (req, res) => {
-  try {
-    // Optionally set webhook when receiving a request (if not already set)
-    if (EXTERNAL_URL) {
-      const webhookUrl = `${EXTERNAL_URL.replace(/\/$/, '')}/webhook/telegram`;
-      try {
-        await bot.telegram.setWebhook(webhookUrl);
-        console.log('Webhook set to', webhookUrl);
-      } catch (err) {
-        console.warn('Failed to set webhook on request:', err && err.message ? err.message : err);
-      }
-    } else {
-      console.warn('RENDER_EXTERNAL_URL not set; skipping webhook set on request.');
-    }
-
-    // Let Telegraf handle the incoming update
-    await bot.handleUpdate(req.body);
-
-    // Respond to Telegram
-    return res.sendStatus(200);
-  } catch (err) {
-    console.error('Error handling webhook update:', err);
-    return res.sendStatus(500);
-  }
+bot.action('fund_wallet', (ctx) => {
+  ctx.answerCbQuery();
+  ctx.reply('To fund your wallet, enter the amount in NGN or tap below to generate a deposit link.', 
+    Markup.inlineKeyboard([[Markup.button.callback('🔙 Back to Main Menu', 'main_menu')]])
+  );
 });
 
-// Start server and attempt to set webhook on startup
-(async () => {
-  if (EXTERNAL_URL) {
-    const webhookUrl = `${EXTERNAL_URL.replace(/\/$/, '')}/webhook/telegram`;
-    try {
-      await bot.telegram.setWebhook(webhookUrl);
-      console.log('Webhook set to', webhookUrl);
-    } catch (err) {
-      console.warn('Failed to set webhook on startup:', err && err.message ? err.message : err);
-    }
-  } else {
-    console.log('RENDER_EXTERNAL_URL not provided; skipping automatic webhook setup on startup.');
-  }
-
-  app.listen(PORT, () => {
-    console.log(`Server listening on port ${PORT}`);
+bot.action('order_history', (ctx) => {
+  ctx.answerCbQuery();
+  ctx.reply('📜 *Your Order History*\n\nYou currently have no active virtual numbers.', {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([[Markup.button.callback('🔙 Back to Main Menu', 'main_menu')]])
   });
-})();
+});
+
+bot.action('check_balance', (ctx) => {
+  ctx.answerCbQuery();
+  ctx.reply('💰 *Wallet Balance:* ₦0.00\n\nPlease fund your wallet to purchase virtual numbers.', {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([[Markup.button.callback('💳 Fund Wallet', 'fund_wallet'), Markup.button.callback('🔙 Back to Main Menu', 'main_menu')]])
+  });
+});
+
+bot.action('support', (ctx) => {
+  ctx.answerCbQuery();
+  ctx.reply('💬 *MJ SMS Support*\n\nIf you need assistance with an order or account funding, please contact support.', {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([[Markup.button.callback('🔙 Back to Main Menu', 'main_menu')]])
+  });
+});
+
+bot.action('main_menu', (ctx) => {
+  ctx.answerCbQuery();
+  ctx.editMessageText(
+    `Welcome to *MJ SMS*! 🚀\n\nSelect an option below:`,
+    { parse_mode: 'Markdown', ...mainKeyboard }
+  );
+});
+
+// Fallback for general text messages
+bot.on('text', (ctx) => {
+  ctx.reply('Please use the menu buttons below to navigate MJ SMS:', mainKeyboard);
+});
+
+// --- WEBHOOK & SERVER SETUP ---
+const WEBHOOK_PATH = `/webhook/telegram`;
+app.use(bot.webhookCallback(WEBHOOK_PATH));
+
+app.get('/', (req, res) => {
+  res.send('MJ SMS Bot Server is active!');
+});
+
+app.listen(PORT, async () => {
+  console.log(`Server listening on port ${PORT}`);
+  if (SERVER_URL) {
+    const fullWebhookUrl = `${SERVER_URL}${WEBHOOK_PATH}`;
+    try {
+      await bot.telegram.setWebhook(fullWebhookUrl);
+      console.log(`Webhook auto-configured to: ${fullWebhookUrl}`);
+    } catch (err) {
+      console.error("Webhook error:", err.message);
+    }
+  }
+});
