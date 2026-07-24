@@ -12,6 +12,7 @@ const SERVER_URL = process.env.RENDER_EXTERNAL_URL;
 const JUICYSMS_API_KEY = process.env.JUICYSMS_API_KEY;
 const SMSOTPSTORES_API_KEY = process.env.SMSOTPSTORES_API_KEY;
 const AUTHPADI_API_KEY = process.env.AUTHPADI_API_KEY;
+const ALLSMSVERIFY_API_KEY = process.env.ALLSMSVERIFY_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 
 const SUPABASE_REST_URL = process.env.SUPABASE_REST_URL;
@@ -198,9 +199,17 @@ const AUTHPADI_COUNTRIES = [
   { id: 'ca', name: 'Canada (CA)', short: 'ca' }
 ];
 
+const ALLSMSVERIFY_COUNTRIES = [
+  { id: 'us', name: 'United States (US)', short: 'us' },
+  { id: 'ng', name: 'Nigeria (NG)', short: 'ng' },
+  { id: 'uk', name: 'United Kingdom (UK)', short: 'uk' },
+  { id: 'ca', name: 'Canada (CA)', short: 'ca' }
+];
+
 const JUICYSMS_BASE_URL = 'https://juicysms.com/api';
 const SMSOTPSTORES_BASE_URL = 'https://smsotpstores.com';
 const AUTHPADI_BASE_URL = 'https://dashboard.authpadi.com';
+const ALLSMSVERIFY_BASE_URL = 'https://allsmsverify.com';
 
 const COMMON_SERVICE_SYNONYMS = {
   'whatsapp': ['whatsapp', 'wa', 'whats app'],
@@ -304,7 +313,46 @@ async function getAuthPadiServices(countryId) {
       is_ngn: true
     })).filter(s => s.service_id);
   } catch (err) {
-    console.error("AuthPadi Services Error:", err.message);
+    return [];
+  }
+}
+
+async function getAllSmsVerifyServices(countryId) {
+  try {
+    const cleanApiKey = ALLSMSVERIFY_API_KEY ? ALLSMSVERIFY_API_KEY.trim() : '';
+    if (!cleanApiKey) return [];
+
+    const res = await axios.get(`${ALLSMSVERIFY_BASE_URL}/stubs/handler_api.php`, {
+      ...robustAxiosConfig,
+      params: { api_key: cleanApiKey, action: 'getServices', country: countryId }
+    });
+
+    const data = res.data;
+    let list = [];
+    if (data && Array.isArray(data.services)) {
+      list = data.services;
+    } else if (Array.isArray(data)) {
+      list = data;
+    } else if (data && typeof data === 'object') {
+      list = Object.keys(data).map(k => {
+        const item = data[k];
+        return {
+          id: item.id || item.service_id || k,
+          name: item.name || item.service_name || item.title || k,
+          stock: item.count || item.stock || item.quantity || item.total || 100,
+          price: item.price || item.cost || item.rate || 0
+        };
+      });
+    }
+
+    return list.map(item => ({
+      service_id: String(item.id || item.service_id || item.code || ''),
+      service_name: String(item.name || item.title || item.service_name || ''),
+      stock: parseInt(item.stock || item.count || 100, 10),
+      price: parseFloat(item.price || 0),
+      is_ngn: true
+    })).filter(s => s.service_id);
+  } catch (err) {
     return [];
   }
 }
@@ -368,11 +416,59 @@ async function fetchCombinedServices(country) {
     }
   }
 
+  const allSmsMatch = ALLSMSVERIFY_COUNTRIES.find(c => c.id.toLowerCase() === countryObj.id.toLowerCase());
+  if (allSmsMatch && ALLSMSVERIFY_API_KEY) {
+    const allSmsData = await getAllSmsVerifyServices(allSmsMatch.id);
+    if (Array.isArray(allSmsData)) {
+      allSmsData.forEach(s => {
+        results.push({
+          provider: 'allsmsverify',
+          service_id: s.service_id,
+          service_name: s.service_name,
+          server_label: 'Server Four',
+          stock: s.stock || 100,
+          price: s.price,
+          is_ngn: true
+        });
+      });
+    }
+  }
+
   return results;
 }
 
 async function executeOrder(provider, serviceId, countryId) {
-  if (provider === 'authpadi') {
+  if (provider === 'allsmsverify') {
+    try {
+      const cleanApiKey = ALLSMSVERIFY_API_KEY ? ALLSMSVERIFY_API_KEY.trim() : '';
+      const res = await axios.get(`${ALLSMSVERIFY_BASE_URL}/stubs/handler_api.php`, {
+        ...robustAxiosConfig,
+        params: { api_key: cleanApiKey, action: 'getNumber', service: serviceId, country: countryId }
+      });
+      const data = res.data;
+      
+      let respStr = typeof data === 'string' ? data.trim() : JSON.stringify(data);
+      if (respStr.startsWith('ACCESS_NUMBER')) {
+        const parts = respStr.split(':');
+        if (parts.length >= 3) {
+          return { success: true, data: { order_id: parts[1], number: parts[2] } };
+        }
+      }
+
+      if (data && (data.success || data.status === 'success' || data.order_id || data.id)) {
+        return { 
+          success: true, 
+          data: { 
+            order_id: String(data.order_id || data.id || data.activation_id), 
+            number: String(data.phone_number || data.number || data.phone) 
+          } 
+        };
+      }
+      return { success: false, message: data?.message || respStr || 'Stock unavailable or insufficient balance on AllSMSVerify.' };
+    } catch (err) {
+      return { success: false, message: 'AllSMSVerify request failed.' };
+    }
+  } else if (provider === 'authpadi') {
     try {
       const cleanApiKey = AUTHPADI_API_KEY ? AUTHPADI_API_KEY.trim() : '';
       const res = await axios.get(`${AUTHPADI_BASE_URL}/stubs/handler_api.php`, {
@@ -443,7 +539,32 @@ async function executeOrder(provider, serviceId, countryId) {
 }
 
 async function checkSmsCode(provider, orderId) {
-  if (provider === 'authpadi') {
+  if (provider === 'allsmsverify') {
+    try {
+      const cleanApiKey = ALLSMSVERIFY_API_KEY ? ALLSMSVERIFY_API_KEY.trim() : '';
+      const res = await axios.get(`${ALLSMSVERIFY_BASE_URL}/stubs/handler_api.php`, {
+        ...robustAxiosConfig,
+        params: { api_key: cleanApiKey, action: 'getStatus', id: orderId }
+      });
+      const data = res.data;
+      let respStr = typeof data === 'string' ? data.trim() : JSON.stringify(data);
+      
+      if (respStr.startsWith('STATUS_OK')) {
+        const parts = respStr.split(':');
+        if (parts.length >= 2) {
+          return { success: true, data: { code: parts[1] } };
+        }
+      }
+
+      if (data && (data.code || data.sms_code || data.status === 'completed' || data.otp)) {
+        const code = data.code || data.sms_code || data.otp;
+        if (code) return { success: true, data: { code: String(code) } };
+      }
+      return { success: false };
+    } catch (err) {
+      return { success: false };
+    }
+  } else if (provider === 'authpadi') {
     try {
       const cleanApiKey = AUTHPADI_API_KEY ? AUTHPADI_API_KEY.trim() : '';
       const res = await axios.get(`${AUTHPADI_BASE_URL}/stubs/handler_api.php`, {
@@ -503,7 +624,15 @@ async function checkSmsCode(provider, orderId) {
 }
 
 async function cancelOrder(provider, orderId) {
-  if (provider === 'authpadi') {
+  if (provider === 'allsmsverify') {
+    try {
+      const cleanApiKey = ALLSMSVERIFY_API_KEY ? ALLSMSVERIFY_API_KEY.trim() : '';
+      await axios.get(`${ALLSMSVERIFY_BASE_URL}/stubs/handler_api.php`, {
+        ...robustAxiosConfig,
+        params: { api_key: cleanApiKey, action: 'setStatus', id: orderId, status: 8 }
+      });
+    } catch (err) {}
+  } else if (provider === 'authpadi') {
     try {
       const cleanApiKey = AUTHPADI_API_KEY ? AUTHPADI_API_KEY.trim() : '';
       await axios.get(`${AUTHPADI_BASE_URL}/stubs/handler_api.php`, {
@@ -545,6 +674,7 @@ bot.start(async (ctx) => {
     `Just type what you need naturally! For example: *'US WhatsApp'* or *'Canadian Facebook'*. 🚀\n` +
     `• Type */orders* to view your order history!\n` +
     `• Type */fund* to top up your wallet balance!\n` +
+    `• Type */privacy* to view our privacy policy!\n` +
     `• Type *support* anytime for customer care.`,
     { parse_mode: 'Markdown' }
   );
@@ -588,6 +718,19 @@ bot.command(['orders', 'history_orders'], async (ctx) => {
   ).join('\n\n');
 
   ctx.reply(`📦 *YOUR RECENT ORDER HISTORY*\n\n${recentOrders}`, { parse_mode: 'Markdown' });
+});
+
+bot.command(['privacy', 'privacypolicy'], (ctx) => {
+  ctx.reply(
+    `🔒 *MJ SMS — PRIVACY POLICY*\n\n` +
+    `We value your privacy and are committed to protecting your personal information. Here is a brief summary of how we handle your data:\n\n` +
+    `• *Data Collected:* We store your Telegram ID, username, and wallet balance to manage your account.\n` +
+    `• *Transactions:* Payment records and order histories are safely logged for your convenience.\n` +
+    `• *Security:* Your data is securely protected via Supabase and encrypted APIs.\n` +
+    `• *Third Parties:* We use Paystack for secure wallet funding and partner SMS servers strictly to provision numbers.\n\n` +
+    `If you have any questions or concerns, reach out to our customer support via the support menu! ✨`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
 // Admin command to manually credit a user: /credit <user_id> <amount>
@@ -707,7 +850,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  const allSupportedCountries = [...JUICYSMS_COUNTRIES, ...SMSOTPSTORES_COUNTRIES, ...AUTHPADI_COUNTRIES];
+  const allSupportedCountries = [...JUICYSMS_COUNTRIES, ...SMSOTPSTORES_COUNTRIES, ...AUTHPADI_COUNTRIES, ...ALLSMSVERIFY_COUNTRIES];
 
   const getNormalizedCountry = (input) => {
     const cleanInput = input.toLowerCase().trim();
