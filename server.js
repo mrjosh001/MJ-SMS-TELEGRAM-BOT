@@ -134,7 +134,9 @@ async function updateOrderStatusInDb(orderId, newStatus) {
 const USD_TO_NGN_RATE = 1500; 
 
 function calculateFinalPrice(rawPrice, isAlreadyNgn = false) {
-  const baseCostNgn = isAlreadyNgn ? rawPrice : (rawPrice * USD_TO_NGN_RATE);
+  const numericPrice = parseFloat(rawPrice) || 0;
+  const baseCostNgn = isAlreadyNgn ? numericPrice : (numericPrice * USD_TO_NGN_RATE);
+  if (baseCostNgn <= 0) return 500; // safety fallback if price is missing
   if (baseCostNgn < 3500) {
     return Math.ceil(baseCostNgn + 3000);
   } else {
@@ -161,7 +163,6 @@ const SMSOTPSTORES_BASE_URL = 'https://smsotpstores.com';
 const AUTHPADI_BASE_URL = 'https://dashboard.authpadi.com';
 const ALLSMSVERIFY_BASE_URL = 'https://allsmsverify.com';
 
-// Universal translation dictionaries for service and country normalization
 const SERVICE_ALIASES = {
   'wa': 'whatsapp', 'whats': 'whatsapp', 'whats app': 'whatsapp', 'whatsup': 'whatsapp', 'app': 'whatsapp',
   'tg': 'telegram', 'tele': 'telegram', 'telegram': 'telegram',
@@ -212,11 +213,8 @@ function intelligentTranslateCountry(rawCountry) {
   if (COUNTRY_ALIASES[cleaned]) {
     return COUNTRY_ALIASES[cleaned];
   }
-  // Fallback: create dynamic country object if not in alias map
   return { id: cleaned.substring(0, 2), name: rawCountry.toUpperCase() };
 }
-
-// --- API FETCHERS WITH DIAGNOSTIC LOGGING ---
 
 async function getJuicySmsServices(countryId) {
   try {
@@ -228,17 +226,14 @@ async function getJuicySmsServices(countryId) {
     if (Array.isArray(data)) {
       return data.map(item => ({
         service_id: String(item.id || item.serviceId || item.code || ''),
-        service_name: String(item.title || item.name || item.service_id || ''),
+        service_name: String(item.title || item.name || item.service_name || item.service_id || ''),
         stock: parseInt(item.count || item.stock || item.quantity || 100, 10),
         price: parseFloat(item.price || item.cost || 0),
         is_ngn: false
       })).filter(s => s.service_id);
     }
     return [];
-  } catch (err) {
-    console.error("JuicySMS Error:", err.message);
-    return [];
-  }
+  } catch (err) { return []; }
 }
 
 async function getSmsOtpStoresServices(countryId) {
@@ -254,15 +249,12 @@ async function getSmsOtpStoresServices(countryId) {
     let list = Array.isArray(data?.services) ? data.services : (Array.isArray(data) ? data : []);
     return list.map(item => ({
       service_id: String(item.id || item.service_id || item.code || ''),
-      service_name: String(item.name || item.title || item.service_name || ''),
+      service_name: String(item.name || item.title || item.service_name || item.id || ''),
       stock: parseInt(item.stock || item.count || 100, 10),
-      price: parseFloat(item.price || 0),
+      price: parseFloat(item.price || item.cost || 0),
       is_ngn: true
     })).filter(s => s.service_id);
-  } catch (err) {
-    console.error("SMSOTPStores Error:", err.message);
-    return [];
-  }
+  } catch (err) { return []; }
 }
 
 async function getAuthPadiServices(countryId) {
@@ -271,7 +263,7 @@ async function getAuthPadiServices(countryId) {
     if (!cleanApiKey) return [];
     const res = await axios.get(`${AUTHPADI_BASE_URL}/stubs/handler_api.php`, {
       ...robustAxiosConfig,
-      params: { api_key: cleanApiKey, action: 'getServices', country: countryId }
+      params: { api_key: cleanApiKey, action: 'getServicesList', country: countryId }
     });
     const data = res.data;
     let list = [];
@@ -282,15 +274,12 @@ async function getAuthPadiServices(countryId) {
     }
     return list.map(item => ({
       service_id: String(item.id || item.service_id || item.code || ''),
-      service_name: String(item.name || item.title || item.service_name || ''),
-      stock: parseInt(item.stock || item.count || 100, 10),
-      price: parseFloat(item.price || 0),
+      service_name: String(item.name || item.title || item.service_name || item.service || item.id || ''),
+      stock: parseInt(item.stock || item.count || item.quantity || 100, 10),
+      price: parseFloat(item.price || item.cost || 0),
       is_ngn: true
     })).filter(s => s.service_id);
-  } catch (err) {
-    console.error("AuthPadi Error:", err.message);
-    return [];
-  }
+  } catch (err) { return []; }
 }
 
 async function getAllSmsVerifyServices(countryId) {
@@ -299,7 +288,7 @@ async function getAllSmsVerifyServices(countryId) {
     if (!cleanApiKey) return [];
     const res = await axios.get(`${ALLSMSVERIFY_BASE_URL}/stubs/handler_api.php`, {
       ...robustAxiosConfig,
-      params: { api_key: cleanApiKey, action: 'getServices', country: countryId }
+      params: { api_key: cleanApiKey, action: 'getServicesList', country: countryId }
     });
     const data = res.data;
     let list = [];
@@ -310,15 +299,12 @@ async function getAllSmsVerifyServices(countryId) {
     }
     return list.map(item => ({
       service_id: String(item.id || item.service_id || item.code || ''),
-      service_name: String(item.name || item.title || item.service_name || ''),
-      stock: parseInt(item.stock || item.count || 100, 10),
-      price: parseFloat(item.price || 0),
+      service_name: String(item.name || item.title || item.service_name || item.service || item.id || ''),
+      stock: parseInt(item.stock || item.count || item.quantity || 100, 10),
+      price: parseFloat(item.price || item.cost || 0),
       is_ngn: true
     })).filter(s => s.service_id);
-  } catch (err) {
-    console.error("AllSMSVerify Error:", err.message);
-    return [];
-  }
+  } catch (err) { return []; }
 }
 
 async function fetchCombinedServices(country) {
@@ -451,28 +437,28 @@ bot.command('servers', async (ctx) => {
   const adminId = String(ctx.from.id);
   if (adminId !== ADMIN_TELEGRAM_ID) return ctx.reply(`❌ Unauthorized.`);
 
-  ctx.reply(`Checking all servers (1 to 4) status & balances... ⏳`);
+  ctx.reply(`Checking all servers status & balances... ⏳`);
   let statusReport = `🖥️ *BACKEND SERVER STATUS REPORT*\n\n`;
 
   try {
     const res = await axios.get(`${JUICYSMS_BASE_URL}/balance`, { ...robustAxiosConfig, params: { key: JUICYSMS_API_KEY } });
-    statusReport += `• *Server One (JuicySMS):* ✅ ONLINE (Bal: ${res.data?.balance || 'Active'})\n`;
-  } catch (e) { statusReport += `• *Server One (JuicySMS):* ❌ OFFLINE (${e.message})\n`; }
+    statusReport += `• *Server One:* ✅ ONLINE (Bal: ${res.data?.balance || 'Active'})\n`;
+  } catch (e) { statusReport += `• *Server One:* ❌ OFFLINE\n`; }
 
   try {
     const res = await axios.get(`${SMSOTPSTORES_BASE_URL}/api.php`, { ...robustAxiosConfig, params: { api_key: SMSOTPSTORES_API_KEY, action: 'balance' } });
-    statusReport += `• *Server Two (SMSOTPStores):* ✅ ONLINE (Bal: ${res.data?.balance || 'Active'})\n`;
-  } catch (e) { statusReport += `• *Server Two (SMSOTPStores):* ❌ OFFLINE (${e.message})\n`; }
+    statusReport += `• *Server Two:* ✅ ONLINE (Bal: ${res.data?.balance || 'Active'})\n`;
+  } catch (e) { statusReport += `• *Server Two:* ❌ OFFLINE\n`; }
 
   try {
     const res = await axios.get(`${AUTHPADI_BASE_URL}/stubs/handler_api.php`, { ...robustAxiosConfig, params: { api_key: AUTHPADI_API_KEY, action: 'getBalance' } });
-    statusReport += `• *Server Three (AuthPadi):* ✅ ONLINE (${res.data || 'Active'})\n`;
-  } catch (e) { statusReport += `• *Server Three (AuthPadi):* ❌ OFFLINE (${e.message})\n`; }
+    statusReport += `• *Server Three:* ✅ ONLINE (${res.data || 'Active'})\n`;
+  } catch (e) { statusReport += `• *Server Three:* ❌ OFFLINE\n`; }
 
   try {
     const res = await axios.get(`${ALLSMSVERIFY_BASE_URL}/stubs/handler_api.php`, { ...robustAxiosConfig, params: { api_key: ALLSMSVERIFY_API_KEY, action: 'getBalance' } });
-    statusReport += `• *Server Four (AllSMSVerify):* ✅ ONLINE (${res.data || 'Active'})\n`;
-  } catch (e) { statusReport += `• *Server Four (AllSMSVerify):* ❌ OFFLINE (${e.message})\n`; }
+    statusReport += `• *Server Four:* ✅ ONLINE (${res.data || 'Active'})\n`;
+  } catch (e) { statusReport += `• *Server Four:* ❌ OFFLINE\n`; }
 
   ctx.reply(statusReport, { parse_mode: 'Markdown' });
 });
@@ -482,7 +468,7 @@ bot.start(async (ctx) => {
   const session = await getUserSession(userId);
   session.state = 'AWAITING_INPUT';
   await saveUserSession(userId, session);
-  ctx.reply(`Oya boss! Welcome to *MJ SMS*! Type any country and service name naturally in one go (e.g., *Ghana WhatsApp*, *USA Telegram*, *Germany Facebook*). ✨`, { parse_mode: 'Markdown' });
+  ctx.reply(`Oya boss! Welcome to *MJ SMS*! Type any country and service name naturally in one go (e.g., *Ghana WhatsApp*, *USA Telegram*). ✨`, { parse_mode: 'Markdown' });
 });
 
 bot.command(['balance', 'bal'], async (ctx) => {
@@ -504,7 +490,6 @@ bot.command('orders', async (ctx) => {
   ctx.reply(`📦 *YOUR ORDERS*\n\n${history}`, { parse_mode: 'Markdown' });
 });
 
-// FULLY UNIFIED TEXT HANDLER: Automatically translates ANY country and service input instantly
 bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
   const rawText = ctx.message.text.trim();
@@ -514,7 +499,7 @@ bot.on('text', async (ctx) => {
   if (['/start', 'change country', 'back'].some(k => lowerText === k)) {
     session.state = 'AWAITING_INPUT';
     await saveUserSession(userId, session);
-    return ctx.reply(`No p boss! Type any country and service name naturally (e.g., *USA WhatsApp*).`);
+    return ctx.reply(`No p boss! Type any country and service name naturally.`);
   }
 
   if (session.state === 'AWAITING_DEPOSIT_AMOUNT') {
@@ -529,7 +514,6 @@ bot.on('text', async (ctx) => {
     return ctx.reply(`❌ Payment link error.`);
   }
 
-  // Smart parsing: Split input words to detect country first, then service
   const words = lowerText.split(/\s+/);
   let matchedCountry = null;
   let serviceQueryWords = [];
@@ -557,7 +541,6 @@ bot.on('text', async (ctx) => {
     }
   }
 
-  // If user typed both country and service in one go
   if (matchedCountry && serviceQueryWords.length > 0) {
     let rawService = serviceQueryWords.join(' ');
     session.country = matchedCountry;
@@ -566,40 +549,34 @@ bot.on('text', async (ctx) => {
     return await promptServerSelection(ctx, session);
   }
 
-  // If user typed ONLY a country name
   if (COUNTRY_ALIASES[lowerText]) {
     session.country = COUNTRY_ALIASES[lowerText];
     session.state = 'AWAITING_SERVICE';
     await saveUserSession(userId, session);
-    return ctx.reply(`Ehen! You select *${session.country.name}*. Which app or service you wan verify?`, { parse_mode: 'Markdown' });
+    return ctx.reply(`Ehen! You select *${session.country.name}*. Which service you wan verify?`, { parse_mode: 'Markdown' });
   }
 
-  // If bot was waiting for service after user previously picked a country
   if (session.state === 'AWAITING_SERVICE' && session.country) {
     session.selectedServiceQuery = intelligentTranslateService(rawText);
     await saveUserSession(userId, session);
     return await promptServerSelection(ctx, session);
   }
 
-  // Default intelligent fallback: treat first word as country, remainder as service
   if (words.length >= 2) {
-    const possibleCountry = intelligentTranslateCountry(words[0]);
-    const possibleService = intelligentTranslateService(words.slice(1).join(' '));
-    session.country = possibleCountry;
-    session.selectedServiceQuery = possibleService;
+    session.country = intelligentTranslateCountry(words[0]);
+    session.selectedServiceQuery = intelligentTranslateService(words.slice(1).join(' '));
     await saveUserSession(userId, session);
     return await promptServerSelection(ctx, session);
   }
 
-  ctx.reply(`Oya boss, specify both country and app name naturally (e.g., *USA WhatsApp* or *Ghana Telegram*). ✨`, { parse_mode: 'Markdown' });
+  ctx.reply(`Oya boss, specify both country and app name naturally (e.g., *USA WhatsApp*). ✨`, { parse_mode: 'Markdown' });
 });
 
 async function promptServerSelection(ctx, session) {
-  ctx.reply(`Translating and fetching live stock across all servers... ⏳`);
+  ctx.reply(`Translating and fetching live stock across servers... ⏳`);
   const availableServers = await fetchCombinedServices(session.country);
   const q = (session.selectedServiceQuery || '').toLowerCase().trim();
 
-  // Smart fuzzy matching against all backend service names and IDs
   const filtered = availableServers.filter(s => {
     const sName = String(s.service_name || '').toLowerCase();
     const sId = String(s.service_id || '').toLowerCase();
@@ -620,7 +597,8 @@ async function promptServerSelection(ctx, session) {
 
   const serverButtons = [];
   uniqueServersMap.forEach((srv, label) => {
-    serverButtons.push([Markup.button.callback(`🖥️ ${label} (${srv.provider})`, `server|${srv.provider}|${srv.server_label}`)]);
+    // Clean server labels without showing internal provider tags
+    serverButtons.push([Markup.button.callback(`🖥️ ${label}`, `server|${srv.provider}|${srv.server_label}`)]);
   });
   serverButtons.push([Markup.button.callback('🔄 Choose Another Country', 'reset_flow')]);
 
@@ -639,7 +617,8 @@ bot.action(/^server\|(.+)\|(.+)$/, async (ctx) => {
 
   const buttons = filtered.map(srv => {
     const finalPrice = calculateFinalPrice(srv.price, srv.is_ngn);
-    return [Markup.button.callback(`💰 ${srv.server_label} (${srv.service_name}) - ₦${finalPrice.toLocaleString()} (${srv.stock} left)`, `buy|${srv.provider}|${session.country.id}|${srv.service_id}`)];
+    const displayName = srv.service_name && srv.service_name !== 'undefined' ? srv.service_name : session.selectedServiceQuery;
+    return [Markup.button.callback(`💰 ${srv.server_label} (${displayName}) - ₦${finalPrice.toLocaleString()} (${srv.stock} left)`, `buy|${srv.provider}|${session.country.id}|${srv.service_id}`)];
   });
   buttons.push([Markup.button.callback('⬅️ Back', 'back_to_servers')]);
 
@@ -659,7 +638,7 @@ bot.action('reset_flow', async (ctx) => {
   session.country = null;
   session.selectedServiceQuery = null;
   await saveUserSession(ctx.from.id, session);
-  ctx.reply(`🔄 Flow reset! Type any country and app name naturally (e.g., *Nigeria WhatsApp*).`);
+  ctx.reply(`🔄 Flow reset! Type any country and app name naturally.`);
 });
 
 bot.action(/^buy\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
