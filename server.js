@@ -189,13 +189,6 @@ async function fetchCombinedServices(country) {
   return results;
 }
 
-function matchesServiceQuery(serviceName, query) {
-  if (!serviceName) return false;
-  const sName = String(serviceName).toLowerCase();
-  const q = String(query).toLowerCase().trim();
-  return sName === q || sName.includes(q) || q.includes(sName);
-}
-
 // ------------------- PURCHASE & STATUS LOGIC (ALLSMSVERIFY) -------------------
 async function executePurchase(serviceId, countryId) {
   try {
@@ -250,13 +243,14 @@ bot.start(async (ctx) => {
   const userId = ctx.from.id;
   const session = getUserSession(userId);
   session.state = 'AWAITING_COUNTRY';
+  session.country = null;
   saveSessions();
 
   ctx.reply(
     `How far boss! 👋 Welcome to *MJ SMS*! ✨\n\n` +
     `💰 *Your Balance:* ₦${(session.balance || 0).toLocaleString()}\n\n` +
     `I dey here to help you get virtual numbers fast fast! 🚀\n` +
-    `• Type a country name or server ID (e.g., _Usa WhatsApp_)\n` +
+    `• Type a country name or server ID (e.g., _Usa_ or _Usa WhatsApp_)\n` +
     `• Type */fund* to top up your wallet balance!\n` +
     `• Type *support* anytime to speak to customer care.`,
     { parse_mode: 'Markdown' }
@@ -300,20 +294,31 @@ bot.on('text', async (ctx) => {
   const lowerText = rawText.toLowerCase();
   const session = getUserSession(userId);
 
-  if (['support', 'customer care', 'speak to support', 'admin', 'contact'].some(k => lowerText.includes(k))) {
+  // 1. Support triggers
+  if (['support', 'customer care', 'speak to support', 'admin', 'contact', 'i want to speak with support'].some(k => lowerText.includes(k))) {
     sendCustomerSupportMessage(ctx);
     return;
   }
 
-  if (['fund', 'deposit', 'topup', 'top up'].includes(lowerText)) {
+  // 2. Fund / Wallet triggers
+  if (['fund', 'deposit', 'wallet', 'balance', 'topup', 'top up', 'what\'s my balance', 'i want to fund my wallet'].some(k => lowerText.includes(k))) {
     session.state = 'AWAITING_DEPOSIT_AMOUNT';
     saveSessions();
     ctx.reply(
       `💳 *MJ SMS WALLET TOP-UP*\n\n` +
       `💰 *Current Balance:* ₦${(session.balance || 0).toLocaleString()}\n\n` +
-      `Enter the amount you want to deposit in Naira:`,
+      `Enter the amount you want to deposit in Naira (e.g., *1000*, *2000*):`,
       { parse_mode: 'Markdown' }
     );
+    return;
+  }
+
+  // 3. Reset country flow triggers
+  if (['/start', 'change country', 'countries', 'back'].some(k => lowerText.includes(k))) {
+    session.state = 'AWAITING_COUNTRY';
+    session.country = null;
+    saveSessions();
+    ctx.reply(`No p boss! Which country number you wan check now? (e.g., type *Usa* or *Nigeria*)`, { parse_mode: 'Markdown' });
     return;
   }
 
@@ -357,13 +362,13 @@ bot.on('text', async (ctx) => {
              cleanInput.includes(cName) || 
              cId === cleanInput || 
              cShort === cleanInput ||
-             (cleanInput === 'usa' && (cName.includes('united states') || cId === '1' || cShort === 'us')) ||
-             (cleanInput === 'uk' && (cName.includes('united kingdom') || cShort === 'gb')) ||
-             (cleanInput === 'nigeria' && cName.includes('nigeria'));
+             (cleanInput.includes('usa') && (cName.includes('united states') || cId === '1' || cShort === 'us')) ||
+             (cleanInput.includes('uk') && (cName.includes('united kingdom') || cShort === 'gb')) ||
+             (cleanInput.includes('nigeria') && cName.includes('nigeria'));
     });
   };
 
-  // 1. Combined Input Handling ("Usa WhatsApp")
+  // 4. Combined Input Handling ("Usa WhatsApp")
   if (countries.length > 0) {
     const words = lowerText.split(/\s+/);
     let matchedCountry = null;
@@ -390,7 +395,7 @@ bot.on('text', async (ctx) => {
     }
   }
 
-  // 2. Single Country Input ("United States", "Usa")
+  // 5. Single Country Input ("United States", "Usa")
   const matchedCountryDirect = getNormalizedCountry(lowerText);
   if (matchedCountryDirect) {
     session.country = matchedCountryDirect;
@@ -398,28 +403,40 @@ bot.on('text', async (ctx) => {
     saveSessions();
     ctx.reply(
       `Ehen! You select *${matchedCountryDirect.name}* 👌\n\n` +
-      `Which app or service you wan verify? (e.g., _WhatsApp_, _Telegram_)`,
+      `Which app or service you wan verify? (e.g., _WhatsApp_, _Telegram_, _Twitter_)`,
       { parse_mode: 'Markdown' }
     );
     return;
   }
 
-  // 3. Service Query when state is already AWAITING_SERVICE
+  // 6. Service Query when state is already AWAITING_SERVICE
   if (session.state === 'AWAITING_SERVICE' && session.country) {
     ctx.reply(`Oya wait make we check available servers for *${rawText}* (${session.country.name})... 🔎`, { parse_mode: 'Markdown' });
     await processServiceSelection(ctx, session, rawText);
     return;
   }
 
-  ctx.reply(`Please state your country server name or ID first (e.g., type "Usa" or "Usa WhatsApp").`, { parse_mode: 'Markdown' });
+  ctx.reply(`Please state your country server name first (e.g., type *Usa* or *Usa WhatsApp*).`, { parse_mode: 'Markdown' });
 });
 
 async function processServiceSelection(ctx, session, serviceQuery) {
   const availableServers = await fetchCombinedServices(session.country);
-  const filtered = availableServers.filter(s => matchesServiceQuery(s.service_name, serviceQuery));
+  
+  const q = serviceQuery.toLowerCase().trim();
+  const filtered = availableServers.filter(s => {
+    const sName = String(s.service_name || '').toLowerCase();
+    const sId = String(s.service_id || '').toLowerCase();
+    return sName === q || sName.includes(q) || q.includes(sName) || sId === q || sId.includes(q);
+  });
 
   if (filtered.length === 0) {
-    ctx.reply(`Eya! Stock for *${serviceQuery}* don finish! 💔\nTry another app or country.`, { parse_mode: 'Markdown' });
+    const topServices = availableServers.slice(0, 10).map(s => `• ${s.service_name} (${s.stock} left)`).join('\n');
+    ctx.reply(
+      `Eya! No stock found for *${serviceQuery}* right now. 💔\n\n` +
+      `Here are some available services on this server:\n${topServices || 'None available'}\n\n` +
+      `Type another app name or type *change country* to switch.`,
+      { parse_mode: 'Markdown' }
+    );
     return;
   }
 
@@ -492,6 +509,7 @@ bot.action('reset_flow', (ctx) => {
   const userId = ctx.from.id;
   const session = getUserSession(userId);
   session.state = 'AWAITING_COUNTRY';
+  session.country = null;
   saveSessions();
   ctx.reply(`No p boss! Which country number you wan check now?`);
 });
