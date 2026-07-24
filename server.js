@@ -2,7 +2,6 @@ const express = require('express');
 const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
 const https = require('https');
-const { Pool } = require('pg');
 
 const app = express();
 app.use(express.json());
@@ -14,11 +13,19 @@ const SERVER_URL = process.env.RENDER_EXTERNAL_URL;
 const JUICYSMS_API_KEY = process.env.JUICYSMS_API_KEY || process.env.SECOND_SMS_API_KEY;
 const PLUSVERIFY_API_KEY = process.env.PLUSVERIFY_API_KEY || process.env.PLUS_VERIFY_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
-const DATABASE_URL = process.env.DATABASE_URL;
+const DATABASE_URL = process.env.DATABASE_URL; // e.g. postgresql://postgres:pass@db.xyz.supabase.co:5432/postgres
 
-// API Base URLs
-const JUICYSMS_BASE_URL = 'https://juicysms.com/api';
-const PLUSVERIFY_BASE_URL = 'https://plusverify.com.ng/api/v1';
+// Parse Supabase REST URL & Service Key from DATABASE_URL if available, or use direct REST variables
+let SUPABASE_REST_URL = process.env.SUPABASE_REST_URL;
+let SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+
+if (DATABASE_URL && !SUPABASE_REST_URL) {
+  // Extract project ref from postgresql://postgres:pass@db.REF.supabase.co:5432/postgres
+  const match = DATABASE_URL.match(/@db\.([a-z0-9]+)\.supabase\.co/);
+  if (match && match[1]) {
+    SUPABASE_REST_URL = `https://${match[1]}.supabase.co/rest/v1`;
+  }
+}
 
 if (!BOT_TOKEN) {
   console.error("FATAL ERROR: BOT_TOKEN environment variable is missing!");
@@ -27,75 +34,38 @@ if (!BOT_TOKEN) {
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// ------------------- SUPABASE / POSTGRESQL DATABASE SETUP -------------------
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: DATABASE_URL ? { rejectUnauthorized: false } : false
-});
-
-async function initDatabase() {
-  if (!DATABASE_URL) {
-    console.error("FATAL ERROR: DATABASE_URL environment variable is missing!");
-    process.exit(1);
-  }
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        user_id BIGINT PRIMARY KEY,
-        balance NUMERIC DEFAULT 0,
-        state TEXT DEFAULT 'AWAITING_COUNTRY',
-        country JSONB DEFAULT NULL,
-        selected_service_query TEXT DEFAULT NULL,
-        chosen_provider TEXT DEFAULT NULL
-      );
-    `);
-
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS orders (
-        id SERIAL PRIMARY KEY,
-        user_id BIGINT REFERENCES users(user_id),
-        order_id TEXT,
-        provider TEXT,
-        service_name TEXT,
-        phone_number TEXT,
-        price NUMERIC,
-        status TEXT,
-        date TEXT
-      );
-    `);
-
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS transactions (
-        id SERIAL PRIMARY KEY,
-        user_id BIGINT REFERENCES users(user_id),
-        amount NUMERIC,
-        date TEXT
-      );
-    `);
-    console.log("Database tables successfully initialized.");
-  } catch (err) {
-    console.error("Error initializing database tables:", err.message);
-  }
+// ------------------- SUPABASE REST API STORAGE HELPERS -------------------
+async function getSupabaseHeaders() {
+  // If service key is not explicitly provided, we can look for it or use standard anon/service key from env
+  const apiKey = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY || '';
+  return {
+    'apikey': apiKey,
+    'Authorization': `Bearer ${apiKey}`,
+    'Content-Type': 'application/json',
+    'Prefer': 'return=representation'
+  };
 }
 
-initDatabase();
-
 async function getUserSession(userId) {
+  if (!SUPABASE_REST_URL) {
+    return { balance: 0, state: 'AWAITING_COUNTRY', country: null, orders: [], transactions: [] };
+  }
   try {
-    let userRes = await pool.query('SELECT * FROM users WHERE user_id = $1', [userId]);
+    const headers = await getSupabaseHeaders();
+    const userRes = await axios.get(`${SUPABASE_REST_URL}/users?user_id=eq.${userId}`, { headers });
+    
     let user;
-    if (userRes.rows.length === 0) {
-      await pool.query(
-        'INSERT INTO users (user_id, balance, state, country, selected_service_query, chosen_provider) VALUES ($1, $2, $3, $4, $5, $6)',
-        [userId, 0, 'AWAITING_COUNTRY', null, null, null]
-      );
-      user = { user_id: userId, balance: 0, state: 'AWAITING_COUNTRY', country: null, selected_service_query: null, chosen_provider: null };
+    if (!userRes.data || userRes.data.length === 0) {
+      // Create user
+      const newUserData = { user_id: userId, balance: 0, state: 'AWAITING_COUNTRY', country: null, selected_service_query: null, chosen_provider: null };
+      await axios.post(`${SUPABASE_REST_URL}/users`, newUserData, { headers });
+      user = newUserData;
     } else {
-      user = userRes.rows[0];
+      user = userRes.data[0];
     }
 
-    const ordersRes = await pool.query('SELECT order_id AS "orderId", provider, service_name AS "serviceName", phone_number AS "phoneNumber", price, status, date FROM orders WHERE user_id = $1', [userId]);
-    const txRes = await pool.query('SELECT amount, date FROM transactions WHERE user_id = $1', [userId]);
+    const ordersRes = await axios.get(`${SUPABASE_REST_URL}/orders?user_id=eq.${userId}&select=*`, { headers });
+    const txRes = await axios.get(`${SUPABASE_REST_URL}/transactions?user_id=eq.${userId}&select=*`, { headers });
 
     return {
       balance: parseFloat(user.balance || 0),
@@ -103,50 +73,84 @@ async function getUserSession(userId) {
       country: user.country || null,
       selectedServiceQuery: user.selected_service_query || null,
       chosenProvider: user.chosen_provider || null,
-      orders: ordersRes.rows,
-      transactions: txRes.rows
+      orders: (ordersRes.data || []).map(o => ({
+        orderId: o.order_id,
+        provider: o.provider,
+        serviceName: o.service_name,
+        phoneNumber: o.phone_number,
+        price: parseFloat(o.price || 0),
+        status: o.status,
+        date: o.date
+      })),
+      transactions: (txRes.data || []).map(t => ({
+        amount: parseFloat(t.amount || 0),
+        date: t.date
+      }))
     };
   } catch (err) {
-    console.error("Error getting user session from DB:", err.message);
+    console.error("Error fetching user session via REST:", err.message);
     return { balance: 0, state: 'AWAITING_COUNTRY', country: null, orders: [], transactions: [] };
   }
 }
 
 async function saveUserSession(userId, session) {
+  if (!SUPABASE_REST_URL) return;
   try {
-    await pool.query(
-      `UPDATE users SET balance = $1, state = $2, country = $3, selected_service_query = $4, chosen_provider = $5 WHERE user_id = $6`,
-      [session.balance, session.state, session.country ? JSON.stringify(session.country) : null, session.selectedServiceQuery, session.chosenProvider, userId]
-    );
+    const headers = await getSupabaseHeaders();
+    await axios.patch(`${SUPABASE_REST_URL}/users?user_id=eq.${userId}`, {
+      balance: session.balance,
+      state: session.state,
+      country: session.country,
+      selected_service_query: session.selectedServiceQuery,
+      chosen_provider: session.chosenProvider
+    }, { headers });
   } catch (err) {
-    console.error("Error saving user session to DB:", err.message);
+    console.error("Error saving user session via REST:", err.message);
   }
 }
 
 async function addOrderToDb(userId, orderRecord) {
+  if (!SUPABASE_REST_URL) return;
   try {
-    await pool.query(
-      `INSERT INTO orders (user_id, order_id, provider, service_name, phone_number, price, status, date) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [userId, orderRecord.orderId, orderRecord.provider, orderRecord.serviceName, orderRecord.phoneNumber, orderRecord.price, orderRecord.status, orderRecord.date]
-    );
+    const headers = await getSupabaseHeaders();
+    await axios.post(`${SUPABASE_REST_URL}/orders`, {
+      user_id: userId,
+      order_id: orderRecord.orderId,
+      provider: orderRecord.provider,
+      service_name: orderRecord.serviceName,
+      phone_number: orderRecord.phoneNumber,
+      price: orderRecord.price,
+      status: orderRecord.status,
+      date: orderRecord.date
+    }, { headers });
   } catch (err) {
-    console.error("Error adding order to DB:", err.message);
+    console.error("Error adding order via REST:", err.message);
   }
 }
 
 async function updateOrderStatusInDb(orderId, newStatus) {
+  if (!SUPABASE_REST_URL) return;
   try {
-    await pool.query(`UPDATE orders SET status = $1 WHERE order_id = $2`, [newStatus, orderId]);
+    const headers = await getSupabaseHeaders();
+    await axios.patch(`${SUPABASE_REST_URL}/orders?order_id=eq.${orderId}`, {
+      status: newStatus
+    }, { headers });
   } catch (err) {
-    console.error("Error updating order status in DB:", err.message);
+    console.error("Error updating order status via REST:", err.message);
   }
 }
 
 async function addTransactionToDb(userId, amount, date) {
+  if (!SUPABASE_REST_URL) return;
   try {
-    await pool.query(`INSERT INTO transactions (user_id, amount, date) VALUES ($1, $2, $3)`, [userId, amount, date]);
+    const headers = await getSupabaseHeaders();
+    await axios.post(`${SUPABASE_REST_URL}/transactions`, {
+      user_id: userId,
+      amount: amount,
+      date: date
+    }, { headers });
   } catch (err) {
-    console.error("Error adding transaction to DB:", err.message);
+    console.error("Error adding transaction via REST:", err.message);
   }
 }
 
@@ -165,7 +169,6 @@ const USD_TO_NGN_RATE = 1500;
 // ------------------- PRICING CALCULATION LOGIC -------------------
 function calculateFinalPrice(rawPrice, isAlreadyNgn = false) {
   const baseCostNgn = isAlreadyNgn ? rawPrice : (rawPrice * USD_TO_NGN_RATE);
-  
   if (baseCostNgn < 3500) {
     return Math.ceil(baseCostNgn + 3000);
   } else {
@@ -212,6 +215,9 @@ const PLUSVERIFY_COUNTRIES = [
   { id: 'ng', name: 'Nigeria (NG)', short: 'ng' }
 ];
 
+const JUICYSMS_BASE_URL = 'https://juicysms.com/api';
+const PLUSVERIFY_BASE_URL = 'https://plusverify.com.ng/api/v1';
+
 async function getJuicySmsServices(countryId) {
   try {
     const params = { country: countryId || 'NL' };
@@ -237,7 +243,6 @@ async function getJuicySmsServices(countryId) {
   }
 }
 
-// Fixed PlusVerify services payload & endpoint handling
 async function getPlusVerifyServices() {
   try {
     const cleanApiKey = PLUSVERIFY_API_KEY ? PLUSVERIFY_API_KEY.trim() : '';
