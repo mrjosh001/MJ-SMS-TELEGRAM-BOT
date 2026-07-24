@@ -5,10 +5,13 @@ const axios = require('axios');
 const app = express();
 app.use(express.json());
 
+// Environment variables provided by Render
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SERVER_URL = process.env.RENDER_EXTERNAL_URL;
-const SMS_API_KEY = process.env.SMS_API_KEY || '';
+const SMS_API_KEY = process.env.SMS_API_KEY;
+
+const BASE_URL = 'https://logsdomain.com/api/v1';
 
 if (!BOT_TOKEN) {
   console.error("FATAL ERROR: BOT_TOKEN is missing!");
@@ -17,191 +20,303 @@ if (!BOT_TOKEN) {
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// User sessions to track natural conversation states
+// User sessions memory store to maintain Pidgin chat context
 const userSessions = {};
 
-// Dictionary for common country names
-const COUNTRY_MAP = {
-  'usa': 'United States 🇺🇸',
-  'us': 'United States 🇺🇸',
-  'united states': 'United States 🇺🇸',
-  'uk': 'United Kingdom 🇬🇧',
-  'england': 'United Kingdom 🇬🇧',
-  'united kingdom': 'United Kingdom 🇬🇧',
-  'canada': 'Canada 🇨🇦',
-  'nigeria': 'Nigeria 🇳🇬',
-  'australia': 'Australia 🇦🇺',
-  'sudan': 'Sudan 🇸🇩',
-  'germany': 'Germany 🇩🇪',
-  'brazil': 'Brazil 🇧🇷',
-  'ghana': 'Ghana 🇬🇭',
-  'india': 'India 🇮🇳',
-  'china': 'China 🇨🇳',
-  'france': 'France 🇫🇷'
-};
-
-// Dictionary for common services
-const SERVICE_MAP = {
-  'whatsapp': 'WhatsApp',
-  'telegram': 'Telegram',
-  'facebook': 'Facebook',
-  'bamboo': 'Bamboo',
-  'tiktok': 'TikTok',
-  'google': 'Google / Gmail',
-  'gmail': 'Google / Gmail',
-  'instagram': 'Instagram',
-  'twitter': 'X (Twitter)',
-  'x': 'X (Twitter)',
-  'tinder': 'Tinder',
-  'netflix': 'Netflix'
-};
-
-// Helper function to check virtual number status from provider
-async function checkProviderStock(country, service) {
-  // If no API key configured yet, return simulated success
-  if (!SMS_API_KEY) {
-    return { available: true, priceNgn: 1500, stock: 35 };
+// Axios instance configured for logsdomain.com API
+const api = axios.create({
+  baseURL: BASE_URL,
+  headers: {
+    'Accept': 'application/json',
+    'Authorization': `Bearer ${SMS_API_KEY}`
   }
+});
+
+// ------------------- DYNAMIC PROFIT MARGIN CONFIG -------------------
+
+// Default margin for general services (1.4 = 40% markup)
+const DEFAULT_MARGIN = 1.4;
+
+// Custom high-demand pricing rules (Minimum price floor & multiplier)
+const SERVICE_PRICING_RULES = {
+  'whatsapp': {
+    minPrice: 6000,    // Sell WhatsApp for at least ₦6,000
+    multiplier: 1.8    // 80% markup if base cost is high
+  },
+  'telegram': {
+    minPrice: 3500,
+    multiplier: 1.6
+  },
+  'facebook': {
+    minPrice: 2000,
+    multiplier: 1.5
+  },
+  'bamboo': {
+    minPrice: 4000,
+    multiplier: 1.7
+  }
+};
+
+// Calculates final retail price in NGN
+function calculateRetailPrice(serviceName, providerPriceNgn) {
+  const serviceKey = serviceName.toLowerCase();
+  const rule = SERVICE_PRICING_RULES[serviceKey];
+
+  let calculatedPrice = providerPriceNgn * DEFAULT_MARGIN;
+  let minPrice = 0;
+
+  if (rule) {
+    calculatedPrice = providerPriceNgn * (rule.multiplier || DEFAULT_MARGIN);
+    minPrice = rule.minPrice || 0;
+  }
+
+  const finalPrice = Math.max(calculatedPrice, minPrice);
+  return Math.ceil(finalPrice);
+}
+
+// ------------------- API INTEGRATION FUNCTIONS -------------------
+
+// 1. Fetch available countries
+async function getCountries() {
   try {
-    const res = await axios.get(`https://5sim.net/v1/guest/prices?country=${country}&product=${service}`);
-    return { available: true, priceNgn: 1800, stock: 15 };
+    const res = await api.get('/numbers/countries');
+    return res.data.success ? res.data.data : [];
   } catch (err) {
-    return { available: false };
+    console.error("Error fetching countries:", err.response?.data || err.message);
+    return [];
   }
 }
 
-// 1. WELCOME COMMAND (/start)
+// 2. Fetch available services for a country
+async function getServices(countryId) {
+  try {
+    const res = await api.get(`/numbers/services?country_id=${countryId}`);
+    return res.data.success ? res.data.data : [];
+  } catch (err) {
+    console.error("Error fetching services:", err.response?.data || err.message);
+    return [];
+  }
+}
+
+// 3. Purchase a number order
+async function purchaseNumber(countryId, serviceId) {
+  try {
+    const idempotencyKey = `mj-order-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const res = await api.post('/numbers/orders', {
+      country_id: parseInt(countryId),
+      service_id: parseInt(serviceId),
+      idempotency_key: idempotencyKey
+    });
+    return res.data;
+  } catch (err) {
+    console.error("Error purchasing number:", err.response?.data || err.message);
+    return err.response?.data || { success: false, message: 'Purchase failed.' };
+  }
+}
+
+// 4. Check for received SMS OTP code
+async function checkSmsCode(orderId) {
+  try {
+    const res = await api.post(`/numbers/orders/${orderId}/check`);
+    return res.data;
+  } catch (err) {
+    console.error("Error checking code:", err.response?.data || err.message);
+    return { success: false };
+  }
+}
+
+// 5. Cancel order
+async function cancelOrder(orderId) {
+  try {
+    const res = await api.post(`/numbers/orders/${orderId}/cancel`);
+    return res.data;
+  } catch (err) {
+    console.error("Error cancelling order:", err.response?.data || err.message);
+    return { success: false };
+  }
+}
+
+// ------------------- TELEGRAM CONVERSATIONAL FLOW -------------------
+
+// /start command
 bot.start((ctx) => {
   const userId = ctx.from.id;
-  userSessions[userId] = { state: 'IDLE' };
+  userSessions[userId] = { state: 'AWAITING_COUNTRY' };
 
   ctx.reply(
     `How far boss! 👋 My name na MJ, welcome to *MJ SMS*.\n\n` +
-    `I dey here to help you get virtual numbers for any app or country standard fast fast. 🚀\n\n` +
-    `Tell me, which country number you dey look for today? (e.g. _USA_, _Sudan_, _UK_, _Nigeria_)`,
+    `I dey here to help you get virtual numbers for any app or country fast fast! 🚀\n\n` +
+    `Which country number you dey look for today? (e.g. _United States_, _Nigeria_, _United Kingdom_, _Sudan_)`,
     { parse_mode: 'Markdown' }
   );
 });
 
-// 2. CONVERSATIONAL TEXT HANDLER
+// Main conversational message handler in Pidgin
 bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
   const rawText = ctx.message.text.trim();
   const lowerText = rawText.toLowerCase();
 
   if (!userSessions[userId]) {
-    userSessions[userId] = { state: 'IDLE' };
+    userSessions[userId] = { state: 'AWAITING_COUNTRY' };
   }
 
   const session = userSessions[userId];
 
-  // Greetings handler
+  // Friendly greetings
   if (['hi', 'hello', 'hey', 'awfa', 'howfar', 'how far', 'xup'].some(g => lowerText.includes(g))) {
     ctx.reply(`How far my boss! 😊\nWhich country virtual number you wan buy today? Just drop the country name for me.`);
     session.state = 'AWAITING_COUNTRY';
     return;
   }
 
-  // Quick One-Liner Check (e.g., "USA WhatsApp", "Sudan Facebook")
-  const words = lowerText.split(/\s+/);
-  let detectedCountry = null;
-  let detectedService = null;
+  // STEP 1: Process Country
+  if (session.state === 'AWAITING_COUNTRY' || session.state === 'IDLE') {
+    ctx.reply(`Hold on boss, make I check available countries... 🔎`);
+    const countries = await getCountries();
 
-  for (const w of words) {
-    if (COUNTRY_MAP[w]) detectedCountry = w;
-    if (SERVICE_MAP[w]) detectedService = w;
-  }
+    if (!countries.length) {
+      ctx.reply(`Eya! Network issue dey to fetch countries right now. Try typing the country name again.`);
+      return;
+    }
 
-  if (detectedCountry && detectedService) {
-    session.country = COUNTRY_MAP[detectedCountry];
-    session.service = SERVICE_MAP[detectedService];
-    await handleAvailabilityCheck(ctx, session);
-    return;
-  }
+    const matchedCountry = countries.find(c => 
+      c.name.toLowerCase().includes(lowerText) || 
+      c.short.toLowerCase() === lowerText
+    );
 
-  // Conversation Flow State Machine
-  switch (session.state) {
-
-    case 'IDLE':
-    case 'AWAITING_COUNTRY':
-      const countryName = COUNTRY_MAP[lowerText] || rawText.toUpperCase();
-      session.country = countryName;
+    if (matchedCountry) {
+      session.country = matchedCountry;
       session.state = 'AWAITING_SERVICE';
 
       ctx.reply(
-        `Ehen! You select *${countryName}* 👌\n\n` +
-        `Which app or service you wan verify with this number? (e.g. _WhatsApp_, _Telegram_, _Bamboo_, _Facebook_)`,
+        `Ehen! You select *${matchedCountry.name}* 👌\n\n` +
+        `Which app or service you wan verify with this number? (e.g. _WhatsApp_, _Telegram_, _Facebook_, _Bamboo_)`,
         { parse_mode: 'Markdown' }
       );
-      break;
-
-    case 'AWAITING_SERVICE':
-      const serviceName = SERVICE_MAP[lowerText] || rawText;
-      session.service = serviceName;
-      await handleAvailabilityCheck(ctx, session);
-      break;
-
-    default:
+    } else {
       ctx.reply(
-        `I hear you boss! Drop the name of the country or service you wan verify, or say "start again" make we restart.`,
+        `I no find "*${rawText}*" for list of available countries boss. 😅\n\n` +
+        `Try type popular countries like _United States_, _United Kingdom_, _Nigeria_, _Canada_, or _Sudan_!`,
         { parse_mode: 'Markdown' }
       );
-      break;
+    }
+    return;
+  }
+
+  // STEP 2: Process Service & Calculate Price with Profit Margin
+  if (session.state === 'AWAITING_SERVICE') {
+    ctx.reply(`Oya wait make I check live price and stock for *${rawText}* (${session.country.name})... 🔎`, { parse_mode: 'Markdown' });
+
+    const services = await getServices(session.country.id);
+
+    if (!services.length) {
+      ctx.reply(`No services found for *${session.country.name}* right now. Try typing another country!`, { parse_mode: 'Markdown' });
+      session.state = 'AWAITING_COUNTRY';
+      return;
+    }
+
+    const matchedService = services.find(s => 
+      s.service_name.toLowerCase().includes(lowerText)
+    );
+
+    if (matchedService) {
+      if (matchedService.available_quantity < 1) {
+        ctx.reply(`Eya! Stock for *${matchedService.service_name}* (${session.country.name}) don finish for market! 💔\nTry type another app name or country.`, { parse_mode: 'Markdown' });
+        return;
+      }
+
+      const rawProviderPrice = parseFloat(matchedService.price);
+      const finalRetailPrice = calculateRetailPrice(matchedService.service_name, rawProviderPrice);
+
+      session.selectedService = matchedService;
+      session.finalPrice = finalRetailPrice;
+
+      const actionButtons = Markup.inlineKeyboard([
+        [Markup.button.callback(`💳 Buy Number (₦${finalRetailPrice})`, `buy_${session.country.id}_${matchedService.service_id}`)],
+        [Markup.button.callback('🔄 Choose Another Country', 'reset_flow')]
+      ]);
+
+      ctx.reply(
+        `Omo sharp! Line dey available! 🔥\n\n` +
+        `📌 *Country:* ${session.country.name}\n` +
+        `📌 *App:* ${matchedService.service_name}\n` +
+        `📊 *Success Rate:* ${matchedService.success_rate}%\n` +
+        `📦 *In Stock:* ${matchedService.available_quantity} numbers\n` +
+        `💰 *Price:* ₦${finalRetailPrice}\n\n` +
+        `Tap button below to buy this number now:`,
+        { parse_mode: 'Markdown', ...actionButtons }
+      );
+    } else {
+      ctx.reply(`I no see *${rawText}* under ${session.country.name}. Try typing another app name like _WhatsApp_, _Telegram_, or _Facebook_.`);
+    }
   }
 });
 
-// Helper: Perform the stock check & respond in Pidgin
-async function handleAvailabilityCheck(ctx, session) {
-  const userId = ctx.from.id;
-  ctx.reply(`Oya wait make I quickly check stock for *${session.service}* (${session.country}) line... 🔎`, { parse_mode: 'Markdown' });
+// ------------------- BUTTON ACTIONS & ORDER PROCESSING -------------------
 
-  const result = await checkProviderStock(session.country, session.service);
+bot.action(/^buy_(\d+)_(\d+)$/, async (ctx) => {
+  ctx.answerCbQuery();
+  const countryId = ctx.match[1];
+  const serviceId = ctx.match[2];
 
-  if (result.available) {
-    session.state = 'AWAITING_PAYMENT';
-    session.price = result.priceNgn;
+  ctx.reply(`Processing your number purchase... Please wait ⏳`);
 
-    const actionButtons = Markup.inlineKeyboard([
-      [Markup.button.callback(`💳 Pay ₦${result.priceNgn} Now`, 'confirm_pay')],
-      [Markup.button.callback('🔄 Choose Another Service', 'reset_flow')]
-    ]);
+  const response = await purchaseNumber(countryId, serviceId);
+
+  if (response.success && response.data) {
+    const order = response.data;
+    const orderId = order.order_id;
+    const phoneNumber = order.number;
 
     ctx.reply(
-      `Omo sharp! Line dey fully available! 🔥\n\n` +
-      `📌 *Country:* ${session.country}\n` +
-      `📌 *App:* ${session.service}\n` +
-      `💰 *Price:* ₦${result.priceNgn}\n\n` +
-      `You wan make I process this number for you now?`,
-      { parse_mode: 'Markdown', ...actionButtons }
-    );
-  } else {
-    session.state = 'AWAITING_COUNTRY';
-    ctx.reply(
-      `Eya! Line for *${session.service}* (${session.country}) don finish for market currently. 💔\n\n` +
-      `Which other country or app you go like try instead?`,
+      `🎉 *NUMBER PURCHASED SUCCESSFULLY!*\n\n` +
+      `📞 *Phone Number:* \`${phoneNumber}\`\n` +
+      `📱 *Service:* ${order.service_name}\n` +
+      `🌍 *Country:* ${order.country_name}\n\n` +
+      `👉 Copy the number above and enter it into your app.\n` +
+      `⏳ I dey wait for your SMS verification code now... (I go send am here automatically as e enter)`,
       { parse_mode: 'Markdown' }
     );
-  }
-}
 
-// Inline button responses
-bot.action('confirm_pay', (ctx) => {
-  ctx.answerCbQuery();
-  ctx.reply(
-    `No p! To complete this order, make sure say money dey your *MJ SMS Wallet*.\n\n` +
-    `Tap /fund to top up your wallet or message support if you need help!`,
-    { parse_mode: 'Markdown' }
-  );
+    // Poll for SMS verification code (Every 7 seconds up to 10 minutes)
+    let pollCount = 0;
+    const maxPolls = 80;
+
+    const intervalId = setInterval(async () => {
+      pollCount++;
+      const checkRes = await checkSmsCode(orderId);
+
+      if (checkRes.success && checkRes.data && checkRes.data.code) {
+        clearInterval(intervalId);
+        ctx.reply(
+          `🔥🔥 *SMS CODE RECEIVED!* 🔥🔥\n\n` +
+          `📞 *Number:* \`${phoneNumber}\`\n` +
+          `🔑 *Verification Code:* \`${checkRes.data.code}\`\n\n` +
+          `Thank you for using *MJ SMS*! 🚀`,
+          { parse_mode: 'Markdown' }
+        );
+      } else if (pollCount >= maxPolls) {
+        clearInterval(intervalId);
+        await cancelOrder(orderId);
+        ctx.reply(`⏰ *Time Out:* Code no enter after 10 minutes. Order don cancel & money don refund to your wallet!`);
+      }
+    }, 7000);
+
+  } else {
+    ctx.reply(`❌ *Purchase Failed:* ${response.message || 'Insufficient wallet balance on provider or line out of stock.'}`);
+  }
 });
 
 bot.action('reset_flow', (ctx) => {
   ctx.answerCbQuery();
   const userId = ctx.from.id;
   userSessions[userId] = { state: 'AWAITING_COUNTRY' };
-  ctx.reply(`No wahala boss! Which country number you wan check now?`);
+  ctx.reply(`No p boss! Which country number you wan check now?`);
 });
 
-// Webhook & Server Express Listener
+// ------------------- SERVER WEBHOOK SETUP -------------------
+
 const WEBHOOK_PATH = `/webhook/telegram`;
 app.use(bot.webhookCallback(WEBHOOK_PATH));
 
