@@ -161,78 +161,60 @@ const SMSOTPSTORES_BASE_URL = 'https://smsotpstores.com';
 const AUTHPADI_BASE_URL = 'https://dashboard.authpadi.com';
 const ALLSMSVERIFY_BASE_URL = 'https://allsmsverify.com';
 
-const COMMON_SERVICE_SYNONYMS = {
-  'whatsapp': ['whatsapp', 'wa', 'whats app'],
-  'telegram': ['telegram', 'tg', 'tele'],
-  'facebook': ['facebook', 'fb', 'meta'],
-  'google': ['google', 'gmail', 'youtube', 'g-mail'],
-  'tiktok': ['tiktok', 'tik tok'],
-  'instagram': ['instagram', 'ig', 'insta'],
-  'twitter': ['twitter', 'x', 'tweet'],
-  'netflix': ['netflix'],
-  'snapchat': ['snapchat', 'snap']
+// Smart translation dictionary: Maps any buyer slang/shorthand/typo to canonical backend keys
+const SMART_TRANSLATIONS = {
+  'wa': 'whatsapp', 'whats': 'whatsapp', 'whats app': 'whatsapp', 'whatsup': 'whatsapp', 'app': 'whatsapp',
+  'tg': 'telegram', 'tele': 'telegram', 'telegram': 'telegram',
+  'fb': 'facebook', 'meta': 'facebook', 'face': 'facebook',
+  'ig': 'instagram', 'insta': 'instagram', 'gram': 'instagram',
+  'tik': 'tiktok', 'tok': 'tiktok', 'tiktok': 'tiktok',
+  'x': 'twitter', 'tweet': 'twitter', 'twitter': 'twitter',
+  'Gmail': 'google', 'gmail': 'google', 'g-mail': 'google', 'youtube': 'google',
+  'snap': 'snapchat', 'snapchat': 'snapchat',
+  'net': 'netflix', 'flix': 'netflix', 'netflix': 'netflix'
 };
 
-async function fetchAllCountries() {
-  const countryMap = new Map();
+const COUNTRY_ALIASES = {
+  'usa': { id: 'us', name: 'United States (US)' },
+  'us': { id: 'us', name: 'United States (US)' },
+  'united states': { id: 'us', name: 'United States (US)' },
+  'uk': { id: 'uk', name: 'United Kingdom (UK)' },
+  'united kingdom': { id: 'uk', name: 'United Kingdom (UK)' },
+  'england': { id: 'uk', name: 'United Kingdom (UK)' },
+  'ng': { id: 'ng', name: 'Nigeria (NG)' },
+  'nigeria': { id: 'ng', name: 'Nigeria (NG)' },
+  'canada': { id: 'ca', name: 'Canada (CA)' },
+  'ca': { id: 'ca', name: 'Canada (CA)' },
+  'russia': { id: 'ru', name: 'Russia (RU)' },
+  'ru': { id: 'ru', name: 'Russia (RU)' },
+  'ghana': { id: 'gh', name: 'Ghana (GH)' },
+  'gh': { id: 'gh', name: 'Ghana (GH)' },
+  'india': { id: 'in', name: 'India (IN)' },
+  'in': { id: 'in', name: 'India (IN)' }
+};
 
-  for (const [providerName, baseUrl, apiKey] of [
-    ['Server Three (AuthPadi)', AUTHPADI_BASE_URL, AUTHPADI_API_KEY],
-    ['Server Four (AllSMSVerify)', ALLSMSVERIFY_BASE_URL, ALLSMSVERIFY_API_KEY]
-  ]) {
-    if (apiKey) {
-      try {
-        const res = await axios.get(`${baseUrl}/stubs/handler_api.php`, {
-          ...robustAxiosConfig,
-          params: { api_key: apiKey.trim(), action: 'getCountries' }
-        });
-        const data = res.data;
-        if (data && typeof data === 'object') {
-          const list = Array.isArray(data) ? data : Object.keys(data).map(k => ({ id: k, ...data[k] }));
-          list.forEach(c => {
-            const id = String(c.id || c.country_id || c.code || '');
-            const name = String(c.name || c.country_name || c.title || id);
-            if (id) {
-              countryMap.set(id.toLowerCase(), { id, name, provider: providerName });
-            }
-          });
-        }
-      } catch (err) {}
+function intelligentTranslateService(rawQuery) {
+  let cleaned = rawQuery.toLowerCase().trim();
+  for (const [alias, canonical] of Object.entries(SMART_TRANSLATIONS)) {
+    if (cleaned === alias || cleaned.includes(alias)) {
+      return canonical;
     }
   }
-
-  const defaults = [
-    { id: 'us', name: 'United States (US)' },
-    { id: 'ng', name: 'Nigeria (NG)' },
-    { id: 'uk', name: 'United Kingdom (UK)' },
-    { id: 'ca', name: 'Canada (CA)' },
-    { id: 'ru', name: 'Russia (RU)' },
-    { id: 'nl', name: 'Netherlands (NL)' },
-    { id: 'de', name: 'Germany (DE)' },
-    { id: 'in', name: 'India (IN)' },
-    { id: 'za', name: 'South Africa (ZA)' }
-  ];
-  defaults.forEach(d => {
-    if (!countryMap.has(d.id.toLowerCase())) {
-      countryMap.set(d.id.toLowerCase(), d);
-    }
-  });
-
-  return Array.from(countryMap.values());
+  return cleaned;
 }
 
 async function getJuicySmsServices(countryId) {
   try {
-    const params = { country: countryId || 'USA' };
+    const params = { country: countryId || 'US' };
     if (JUICYSMS_API_KEY) params.key = JUICYSMS_API_KEY.trim();
     const res = await axios.get(`${JUICYSMS_BASE_URL}/services`, { ...robustAxiosConfig, params });
     let data = res.data;
     if (data && data.services) data = data.services;
     if (Array.isArray(data)) {
       return data.map(item => ({
-        service_id: item.id || item.serviceId || item.code || '',
-        service_name: item.title || item.name || item.service_id || '',
-        stock: parseInt(item.count || item.stock || item.quantity || 10, 10),
+        service_id: String(item.id || item.serviceId || item.code || ''),
+        service_name: String(item.title || item.name || item.service_id || ''),
+        stock: parseInt(item.count || item.stock || item.quantity || 100, 10),
         price: parseFloat(item.price || item.cost || 0),
         is_ngn: false
       })).filter(s => s.service_id);
@@ -245,9 +227,10 @@ async function getSmsOtpStoresServices(countryId) {
   try {
     const cleanApiKey = SMSOTPSTORES_API_KEY ? SMSOTPSTORES_API_KEY.trim() : '';
     if (!cleanApiKey) return [];
+    const targetCountry = countryId === 'us' ? 'usa' : countryId;
     const res = await axios.get(`${SMSOTPSTORES_BASE_URL}/api.php`, {
       ...robustAxiosConfig,
-      params: { api_key: cleanApiKey, action: 'services', country: countryId }
+      params: { api_key: cleanApiKey, action: 'services', country: targetCountry }
     });
     const data = res.data;
     let list = Array.isArray(data?.services) ? data.services : (Array.isArray(data) ? data : []);
@@ -317,22 +300,17 @@ async function fetchCombinedServices(country) {
   if (!countryObj || !countryObj.id) return results;
   const cId = countryObj.id;
 
-  if (JUICYSMS_API_KEY) {
-    const juicyData = await getJuicySmsServices(cId);
-    juicyData.forEach(s => results.push({ provider: 'juicysms', server_label: 'Server One', ...s }));
-  }
-  if (SMSOTPSTORES_API_KEY) {
-    const storeData = await getSmsOtpStoresServices(cId);
-    storeData.forEach(s => results.push({ provider: 'smsotpstores', server_label: 'Server Two', ...s }));
-  }
-  if (AUTHPADI_API_KEY) {
-    const authData = await getAuthPadiServices(cId);
-    authData.forEach(s => results.push({ provider: 'authpadi', server_label: 'Server Three', ...s }));
-  }
-  if (ALLSMSVERIFY_API_KEY) {
-    const allSmsData = await getAllSmsVerifyServices(cId);
-    allSmsData.forEach(s => results.push({ provider: 'allsmsverify', server_label: 'Server Four', ...s }));
-  }
+  const [juicy, store, auth, allsms] = await Promise.allSettled([
+    JUICYSMS_API_KEY ? getJuicySmsServices(cId) : Promise.resolve([]),
+    SMSOTPSTORES_API_KEY ? getSmsOtpStoresServices(cId) : Promise.resolve([]),
+    AUTHPADI_API_KEY ? getAuthPadiServices(cId) : Promise.resolve([]),
+    ALLSMSVERIFY_API_KEY ? getAllSmsVerifyServices(cId) : Promise.resolve([])
+  ]);
+
+  if (juicy.status === 'fulfilled') juicy.value.forEach(s => results.push({ provider: 'juicysms', server_label: 'Server One', ...s }));
+  if (store.status === 'fulfilled') store.value.forEach(s => results.push({ provider: 'smsotpstores', server_label: 'Server Two', ...s }));
+  if (auth.status === 'fulfilled') auth.value.forEach(s => results.push({ provider: 'authpadi', server_label: 'Server Three', ...s }));
+  if (allsms.status === 'fulfilled') allsms.value.forEach(s => results.push({ provider: 'allsmsverify', server_label: 'Server Four', ...s }));
 
   return results;
 }
@@ -362,12 +340,13 @@ async function executeOrder(provider, serviceId, countryId) {
       }
       return { success: false, message: respStr };
     } else if (provider === 'smsotpstores') {
+      const targetCountry = countryId === 'us' ? 'usa' : countryId;
       const res = await axios.get(`${SMSOTPSTORES_BASE_URL}/api.php`, {
         ...robustAxiosConfig,
-        params: { api_key: SMSOTPSTORES_API_KEY.trim(), action: 'order', service_id: serviceId, country: countryId }
+        params: { api_key: SMSOTPSTORES_API_KEY.trim(), action: 'order', service_id: serviceId, country: targetCountry }
       });
-      if (res.data && res.data.success) {
-        return { success: true, data: { order_id: res.data.order_id, number: res.data.phone_number } };
+      if (res.data && (res.data.success || res.data.order_id)) {
+        return { success: true, data: { order_id: res.data.order_id, number: res.data.phone_number || res.data.number } };
       }
       return { success: false, message: res.data?.message || 'Failed' };
     } else {
@@ -476,7 +455,7 @@ bot.start(async (ctx) => {
   const session = await getUserSession(userId);
   session.state = 'AWAITING_COUNTRY';
   await saveUserSession(userId, session);
-  ctx.reply(`Oya boss! Welcome to *MJ SMS*! Type any country and app naturally (e.g., *Germany WhatsApp* or *India Telegram*). ✨`, { parse_mode: 'Markdown' });
+  ctx.reply(`Oya boss! Welcome to *MJ SMS*! Type any country and app naturally (e.g., *Germany WhatsApp* or *USA Telegram*). ✨`, { parse_mode: 'Markdown' });
 });
 
 bot.command(['balance', 'bal'], async (ctx) => {
@@ -522,80 +501,75 @@ bot.on('text', async (ctx) => {
     return ctx.reply(`❌ Payment link error.`);
   }
 
-  const allCountries = await fetchAllCountries();
-
   let matchedCountry = null;
   let serviceQueryWords = [];
   const words = lowerText.split(/\s+/);
 
   for (let i = 0; i < words.length; i++) {
     const subQuery = words.slice(0, i + 1).join(' ');
-    const found = allCountries.find(c => String(c.name).toLowerCase().includes(subQuery) || String(c.id).toLowerCase() === subQuery);
-    if (found) {
-      matchedCountry = found;
+    if (COUNTRY_ALIASES[subQuery]) {
+      matchedCountry = COUNTRY_ALIASES[subQuery];
       serviceQueryWords = words.slice(i + 1);
       break;
     }
   }
 
-  if (matchedCountry && serviceQueryWords.length > 0) {
-    let rawService = serviceQueryWords.join(' ');
-    for (const [canonical, synonyms] of Object.entries(COMMON_SERVICE_SYNONYMS)) {
-      if (synonyms.some(syn => rawService.includes(syn))) rawService = canonical;
-    }
-    session.country = matchedCountry;
-    session.selectedServiceQuery = rawService;
-    await saveUserSession(userId, session);
-    return await promptServerSelection(ctx, session);
-  }
-
-  for (let i = 0; i < words.length; i++) {
-    const potentialCountry = words.slice(i).join(' ');
-    const found = allCountries.find(c => String(c.name).toLowerCase().includes(potentialCountry) || String(c.id).toLowerCase() === potentialCountry);
-    if (found) {
-      let rawService = words.slice(0, i).join(' ');
-      if (rawService) {
-        session.country = found;
-        session.selectedServiceQuery = rawService;
-        await saveUserSession(userId, session);
-        return await promptServerSelection(ctx, session);
+  if (!matchedCountry) {
+    for (let i = 0; i < words.length; i++) {
+      const potentialCountry = words.slice(i).join(' ');
+      if (COUNTRY_ALIASES[potentialCountry]) {
+        let leftover = words.slice(0, i);
+        if (leftover.length > 0) {
+          matchedCountry = COUNTRY_ALIASES[potentialCountry];
+          serviceQueryWords = leftover;
+          break;
+        }
       }
     }
   }
 
-  const directCountry = allCountries.find(c => String(c.name).toLowerCase() === lowerText || String(c.id).toLowerCase() === lowerText);
-  if (directCountry) {
-    session.country = directCountry;
-    session.state = 'AWAITING_SERVICE';
-    await saveUserSession(userId, session);
-    return ctx.reply(`Ehen! You select *${directCountry.name}*. Which service you wan verify?`, { parse_mode: 'Markdown' });
-  }
-
-  if (session.state === 'AWAITING_SERVICE' && session.country) {
-    session.selectedServiceQuery = rawText;
+  if (matchedCountry && serviceQueryWords.length > 0) {
+    let rawService = serviceQueryWords.join(' ');
+    const translatedService = intelligentTranslateService(rawService);
+    session.country = matchedCountry;
+    session.selectedServiceQuery = translatedService;
     await saveUserSession(userId, session);
     return await promptServerSelection(ctx, session);
   }
 
-  ctx.reply(`Oya boss, specify both country and app name naturally (e.g., *Germany WhatsApp* or *Ghana Telegram*). ✨`, { parse_mode: 'Markdown' });
+  if (COUNTRY_ALIASES[lowerText]) {
+    session.country = COUNTRY_ALIASES[lowerText];
+    session.state = 'AWAITING_SERVICE';
+    await saveUserSession(userId, session);
+    return ctx.reply(`Ehen! You select *${session.country.name}*. Which service you wan verify?`, { parse_mode: 'Markdown' });
+  }
+
+  if (session.state === 'AWAITING_SERVICE' && session.country) {
+    session.selectedServiceQuery = intelligentTranslateService(rawText);
+    await saveUserSession(userId, session);
+    return await promptServerSelection(ctx, session);
+  }
+
+  ctx.reply(`Oya boss, specify both country and app name naturally (e.g., *Usa WhatsApp* or *Ghana Telegram*). ✨`, { parse_mode: 'Markdown' });
 });
 
 async function promptServerSelection(ctx, session) {
-  ctx.reply(`Fetching live stock across Servers 1-4... ⏳`);
+  ctx.reply(`Translating and fetching live stock across Servers 1-4... ⏳`);
   const availableServers = await fetchCombinedServices(session.country);
   const q = (session.selectedServiceQuery || '').toLowerCase().trim();
 
+  // Smart matching against backend service names & IDs
   const filtered = availableServers.filter(s => {
     const sName = String(s.service_name || '').toLowerCase();
     const sId = String(s.service_id || '').toLowerCase();
-    return sName.includes(q) || q.includes(sName) || sId.includes(q);
+    return sName.includes(q) || q.includes(sName) || sId.includes(q) || sName.replace(/[^a-z0-9]/g, '').includes(q.replace(/[^a-z0-9]/g, ''));
   });
 
   const userId = ctx.from.id;
   if (filtered.length === 0) {
     session.state = 'AWAITING_SERVICE';
     await saveUserSession(userId, session);
-    return ctx.reply(`💔 No stock found for *${session.selectedServiceQuery}* in *${session.country.name}*. Try another app!`, { parse_mode: 'Markdown' });
+    return ctx.reply(`💔 No stock found for *${session.selectedServiceQuery}* in *${session.country.name}*. Try another app name!`, { parse_mode: 'Markdown' });
   }
 
   const uniqueServersMap = new Map();
@@ -696,7 +670,6 @@ app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
 
-// Launch bot using polling for immediate stability
 bot.launch().then(() => {
   console.log("Bot is live and polling for messages...");
 }).catch((err) => {
