@@ -11,6 +11,7 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const SERVER_URL = process.env.RENDER_EXTERNAL_URL;
 const JUICYSMS_API_KEY = process.env.JUICYSMS_API_KEY;
 const SMSOTPSTORES_API_KEY = process.env.SMSOTPSTORES_API_KEY;
+const AUTHPADI_API_KEY = process.env.AUTHPADI_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 
 const SUPABASE_REST_URL = process.env.SUPABASE_REST_URL;
@@ -187,8 +188,16 @@ const SMSOTPSTORES_COUNTRIES = [
   { id: 'ca', name: 'Canada (CA)', short: 'ca' }
 ];
 
+const AUTHPADI_COUNTRIES = [
+  { id: 'us', name: 'United States (US)', short: 'us' },
+  { id: 'ng', name: 'Nigeria (NG)', short: 'ng' },
+  { id: 'uk', name: 'United Kingdom (UK)', short: 'uk' },
+  { id: 'ca', name: 'Canada (CA)', short: 'ca' }
+];
+
 const JUICYSMS_BASE_URL = 'https://juicysms.com/api';
 const SMSOTPSTORES_BASE_URL = 'https://smsotpstores.com';
+const AUTHPADI_BASE_URL = 'https://dashboard.authpadi.com';
 
 async function getJuicySmsServices(countryId) {
   try {
@@ -230,6 +239,44 @@ async function getSmsOtpStoresServices(countryId) {
       list = data.services;
     } else if (Array.isArray(data)) {
       list = data;
+    }
+
+    return list.map(item => ({
+      service_id: item.id || item.service_id || item.code || '',
+      service_name: item.name || item.title || item.service_name || '',
+      stock: parseInt(item.stock || item.count || 100, 10),
+      price: parseFloat(item.price || 0),
+      is_ngn: true
+    })).filter(s => s.service_id);
+  } catch (err) {
+    return [];
+  }
+}
+
+async function getAuthPadiServices(countryId) {
+  try {
+    const cleanApiKey = AUTHPADI_API_KEY ? AUTHPADI_API_KEY.trim() : '';
+    if (!cleanApiKey) return [];
+
+    const res = await axios.get(`${AUTHPADI_BASE_URL}/stubs/handler_api.php`, {
+      ...robustAxiosConfig,
+      params: { api_key: cleanApiKey, action: 'getServices', country: countryId }
+    });
+
+    const data = res.data;
+    let list = [];
+    if (data && Array.isArray(data.services)) {
+      list = data.services;
+    } else if (Array.isArray(data)) {
+      list = data;
+    } else if (data && typeof data === 'object') {
+      // Handle key-value service maps if returned by standard stubs api format
+      list = Object.keys(data).map(k => ({
+        id: k,
+        name: data[k].name || k,
+        stock: data[k].count || data[k].stock || 100,
+        price: data[k].price || 0
+      }));
     }
 
     return list.map(item => ({
@@ -287,11 +334,61 @@ async function fetchCombinedServices(country) {
     }
   }
 
+  // Server Three: AuthPadi
+  const authMatch = AUTHPADI_COUNTRIES.find(c => c.id.toLowerCase() === countryObj.id.toLowerCase());
+  if (authMatch && AUTHPADI_API_KEY) {
+    const authData = await getAuthPadiServices(authMatch.id);
+    if (Array.isArray(authData)) {
+      authData.forEach(s => {
+        results.push({
+          provider: 'authpadi',
+          service_id: s.service_id,
+          service_name: s.service_name,
+          server_label: 'Server Three',
+          stock: s.stock || 100,
+          price: s.price,
+          is_ngn: true
+        });
+      });
+    }
+  }
+
   return results;
 }
 
 async function executeOrder(provider, serviceId, countryId) {
-  if (provider === 'smsotpstores') {
+  if (provider === 'authpadi') {
+    try {
+      const cleanApiKey = AUTHPADI_API_KEY ? AUTHPADI_API_KEY.trim() : '';
+      const res = await axios.get(`${AUTHPADI_BASE_URL}/stubs/handler_api.php`, {
+        ...robustAxiosConfig,
+        params: { api_key: cleanApiKey, action: 'getNumber', service: serviceId, country: countryId }
+      });
+      const data = res.data;
+      
+      // Handle standard text response format (e.g. ACCESS_NUMBER:id:number) or JSON responses
+      let respStr = typeof data === 'string' ? data.trim() : JSON.stringify(data);
+      if (respStr.startsWith('ACCESS_NUMBER')) {
+        const parts = respStr.split(':');
+        if (parts.length >= 3) {
+          return { success: true, data: { order_id: parts[1], number: parts[2] } };
+        }
+      }
+
+      if (data && (data.success || data.status === 'success' || data.order_id || data.id)) {
+        return { 
+          success: true, 
+          data: { 
+            order_id: String(data.order_id || data.id || data.activation_id), 
+            number: String(data.phone_number || data.number || data.phone) 
+          } 
+        };
+      }
+      return { success: false, message: data?.message || respStr || 'Stock unavailable or insufficient balance on AuthPadi.' };
+    } catch (err) {
+      return { success: false, message: 'AuthPadi request failed.' };
+    }
+  } else if (provider === 'smsotpstores') {
     try {
       const cleanApiKey = SMSOTPSTORES_API_KEY ? SMSOTPSTORES_API_KEY.trim() : '';
       const res = await axios.get(`${SMSOTPSTORES_BASE_URL}/api.php`, {
@@ -332,7 +429,32 @@ async function executeOrder(provider, serviceId, countryId) {
 }
 
 async function checkSmsCode(provider, orderId) {
-  if (provider === 'smsotpstores') {
+  if (provider === 'authpadi') {
+    try {
+      const cleanApiKey = AUTHPADI_API_KEY ? AUTHPADI_API_KEY.trim() : '';
+      const res = await axios.get(`${AUTHPADI_BASE_URL}/stubs/handler_api.php`, {
+        ...robustAxiosConfig,
+        params: { api_key: cleanApiKey, action: 'getStatus', id: orderId }
+      });
+      const data = res.data;
+      let respStr = typeof data === 'string' ? data.trim() : JSON.stringify(data);
+      
+      if (respStr.startsWith('STATUS_OK')) {
+        const parts = respStr.split(':');
+        if (parts.length >= 2) {
+          return { success: true, data: { code: parts[1] } };
+        }
+      }
+
+      if (data && (data.code || data.sms_code || data.status === 'completed' || data.otp)) {
+        const code = data.code || data.sms_code || data.otp;
+        if (code) return { success: true, data: { code: String(code) } };
+      }
+      return { success: false };
+    } catch (err) {
+      return { success: false };
+    }
+  } else if (provider === 'smsotpstores') {
     try {
       const cleanApiKey = SMSOTPSTORES_API_KEY ? SMSOTPSTORES_API_KEY.trim() : '';
       const res = await axios.get(`${SMSOTPSTORES_BASE_URL}/api.php`, {
@@ -367,7 +489,15 @@ async function checkSmsCode(provider, orderId) {
 }
 
 async function cancelOrder(provider, orderId) {
-  if (provider === 'smsotpstores') {
+  if (provider === 'authpadi') {
+    try {
+      const cleanApiKey = AUTHPADI_API_KEY ? AUTHPADI_API_KEY.trim() : '';
+      await axios.get(`${AUTHPADI_BASE_URL}/stubs/handler_api.php`, {
+        ...robustAxiosConfig,
+        params: { api_key: cleanApiKey, action: 'setStatus', id: orderId, status: 8 }
+      });
+    } catch (err) {}
+  } else if (provider === 'smsotpstores') {
     try {
       const cleanApiKey = SMSOTPSTORES_API_KEY ? SMSOTPSTORES_API_KEY.trim() : '';
       await axios.get(`${SMSOTPSTORES_BASE_URL}/api.php`, {
@@ -544,7 +674,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  const allSupportedCountries = [...JUICYSMS_COUNTRIES, ...SMSOTPSTORES_COUNTRIES];
+  const allSupportedCountries = [...JUICYSMS_COUNTRIES, ...SMSOTPSTORES_COUNTRIES, ...AUTHPADI_COUNTRIES];
 
   const getNormalizedCountry = (input) => {
     const cleanInput = input.toLowerCase().trim();
@@ -650,11 +780,10 @@ async function promptServerSelection(ctx, session) {
   });
 
   const countryName = typeof session.country === 'object' ? session.country.name : session.country;
-  const countryId = typeof session.country === 'object' ? session.country.id : session.country;
 
   const serverButtons = [];
   uniqueServersMap.forEach((srv, label) => {
-    serverButtons.push([Markup.button.callback(`🖥️ ${label}`, `server|${srv.provider}|${countryId}`)]);
+    serverButtons.push([Markup.button.callback(`🖥️ ${label}`, `server|${srv.provider}|${srv.server_label}`)]);
   });
   serverButtons.push([Markup.button.callback('🔄 Choose Another Country', 'reset_flow')]);
 
@@ -670,7 +799,6 @@ bot.action(/^server\|(.+)\|(.+)$/, async (ctx) => {
   const userId = ctx.from.id;
   const session = await getUserSession(userId);
   const provider = ctx.match[1];
-  const countryId = ctx.match[2];
 
   session.chosenProvider = provider;
   await saveUserSession(userId, session);
@@ -689,7 +817,7 @@ bot.action(/^server\|(.+)\|(.+)$/, async (ctx) => {
     return;
   }
 
-  const countryIdCode = typeof session.country === 'object' ? session.country.id : countryId;
+  const countryIdCode = typeof session.country === 'object' ? session.country.id : session.country;
 
   const buttons = filtered.map((srv) => {
     const finalPrice = calculateFinalPrice(srv.price, srv.is_ngn);
