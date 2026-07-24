@@ -199,6 +199,19 @@ const JUICYSMS_BASE_URL = 'https://juicysms.com/api';
 const SMSOTPSTORES_BASE_URL = 'https://smsotpstores.com';
 const AUTHPADI_BASE_URL = 'https://dashboard.authpadi.com';
 
+// Smart natural language translation dictionary for common services
+const COMMON_SERVICE_SYNONYMS = {
+  'whatsapp': ['whatsapp', 'wa', 'whats app'],
+  'telegram': ['telegram', 'tg', 'tele'],
+  'facebook': ['facebook', 'fb', 'meta'],
+  'google': ['google', 'gmail', 'youtube', 'g-mail'],
+  'tiktok': ['tiktok', 'tik tok'],
+  'instagram': ['instagram', 'ig', 'insta'],
+  'twitter': ['twitter', 'x', 'tweet'],
+  'netflix': ['netflix'],
+  'snapchat': ['snapchat', 'snap']
+};
+
 async function getJuicySmsServices(countryId) {
   try {
     const params = { country: countryId || 'NL' };
@@ -270,17 +283,20 @@ async function getAuthPadiServices(countryId) {
     } else if (Array.isArray(data)) {
       list = data;
     } else if (data && typeof data === 'object') {
-      list = Object.keys(data).map(k => ({
-        id: k,
-        name: data[k].name || data[k].service_name || k,
-        stock: data[k].count || data[k].stock || data[k].quantity || 100,
-        price: data[k].price || data[k].cost || 0
-      }));
+      list = Object.keys(data).map(k => {
+        const item = data[k];
+        return {
+          id: item.id || item.service_id || k,
+          name: item.name || item.service_name || item.title || k,
+          stock: item.count || item.stock || item.quantity || item.total || 100,
+          price: item.price || item.cost || item.rate || 0
+        };
+      });
     }
 
     return list.map(item => ({
-      service_id: item.id || item.service_id || item.code || '',
-      service_name: item.name || item.title || item.service_name || '',
+      service_id: String(item.id || item.service_id || item.code || ''),
+      service_name: String(item.name || item.title || item.service_name || ''),
       stock: parseInt(item.stock || item.count || 100, 10),
       price: parseFloat(item.price || 0),
       is_ngn: true
@@ -527,12 +543,10 @@ bot.start(async (ctx) => {
   ctx.reply(
     `How far boss! 👋 Welcome to *MJ SMS*! ✨\n\n` +
     `💰 *Your Balance:* ₦${(session.balance || 0).toLocaleString()}\n\n` +
-    `I dey here to help you get virtual numbers fast fast! 🚀\n` +
-    `• Type a country code (e.g., _US_, _NG_, _NL_, _UK_, _CA_)\n` +
-    `• Type */orders* to view your order history & tracking IDs!\n` +
-    `• Type */history* to check your wallet funding records!\n` +
+    `Just type what you need naturally! For example: *'US WhatsApp'* or *'Canadian Facebook'*. 🚀\n` +
+    `• Type */orders* to view your order history!\n` +
     `• Type */fund* to top up your wallet balance!\n` +
-    `• Type *support* anytime to speak to customer care.`,
+    `• Type *support* anytime for customer care.`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -561,7 +575,7 @@ bot.command(['orders', 'history_orders'], async (ctx) => {
   const userId = ctx.from.id;
   const session = await getUserSession(userId);
   if (!session.orders || session.orders.length === 0) {
-    ctx.reply(`📭 You don't have any order history yet. Buy a number to see it here!`, { parse_mode: 'Markdown' });
+    ctx.reply(`📭 You don't have any order history yet.`, { parse_mode: 'Markdown' });
     return;
   }
 
@@ -575,22 +589,6 @@ bot.command(['orders', 'history_orders'], async (ctx) => {
   ).join('\n\n');
 
   ctx.reply(`📦 *YOUR RECENT ORDER HISTORY*\n\n${recentOrders}`, { parse_mode: 'Markdown' });
-});
-
-bot.command(['history', 'funding_history', 'transactions'], async (ctx) => {
-  const userId = ctx.from.id;
-  const session = await getUserSession(userId);
-  if (!session.transactions || session.transactions.length === 0) {
-    ctx.reply(`📭 No wallet funding history found yet.`, { parse_mode: 'Markdown' });
-    return;
-  }
-
-  const recentTx = session.transactions.slice(-10).reverse().map(t =>
-    `• *Credited:* ₦${t.amount.toLocaleString()}\n` +
-    `  🕒 *Date:* ${t.date}`
-  ).join('\n\n');
-
-  ctx.reply(`💳 *WALLET FUNDING HISTORY*\n\n${recentTx}`, { parse_mode: 'Markdown' });
 });
 
 bot.command(['support', 'help', 'customercare'], (ctx) => sendCustomerSupportMessage(ctx));
@@ -637,13 +635,13 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  if (['/start', 'change country', 'countries', 'back'].some(k => lowerText.includes(k))) {
+  if (['/start', 'change country', 'countries', 'back', 'start'].some(k => lowerText === k)) {
     session.state = 'AWAITING_COUNTRY';
     session.country = null;
     session.selectedServiceQuery = null;
     session.chosenProvider = null;
     await saveUserSession(userId, session);
-    ctx.reply(`No p boss! Which country you wan check now? (Type *US*, *NG*, *NL*, *UK*, *CA*, or *DE*)`, { parse_mode: 'Markdown' });
+    ctx.reply(`No p boss! Just type what you need naturally (e.g., *US WhatsApp* or *Canada Facebook*).`, { parse_mode: 'Markdown' });
     return;
   }
 
@@ -696,29 +694,61 @@ bot.on('text', async (ctx) => {
     });
   };
 
-  if (allSupportedCountries.length > 0) {
-    const words = lowerText.split(/\s+/);
-    let matchedCountry = null;
-    let serviceQueryWords = [];
+  // Smart Natural Language Translation Parser
+  const words = lowerText.split(/\s+/);
+  let matchedCountry = null;
+  let serviceQueryWords = [];
 
-    for (let i = 0; i < words.length; i++) {
-      const subQuery = words.slice(0, i + 1).join(' ');
-      const found = getNormalizedCountry(subQuery);
-      if (found) {
-        matchedCountry = found;
-        serviceQueryWords = words.slice(i + 1);
+  for (let i = 0; i < words.length; i++) {
+    const subQuery = words.slice(0, i + 1).join(' ');
+    const found = getNormalizedCountry(subQuery);
+    if (found) {
+      matchedCountry = found;
+      serviceQueryWords = words.slice(i + 1);
+      break;
+    }
+  }
+
+  // If user typed country first followed by service (e.g., "US WhatsApp" or "Canadian Facebook")
+  if (matchedCountry && serviceQueryWords.length > 0) {
+    let rawServiceQuery = serviceQueryWords.join(' ');
+    
+    // Translate synonyms if any match
+    for (const [canonical, synonyms] of Object.entries(COMMON_SERVICE_SYNONYMS)) {
+      if (synonyms.some(syn => rawServiceQuery.includes(syn))) {
+        rawServiceQuery = canonical;
         break;
       }
     }
 
-    if (matchedCountry && serviceQueryWords.length > 0) {
-      const serviceQuery = serviceQueryWords.join(' ');
-      session.country = matchedCountry;
-      session.selectedServiceQuery = serviceQuery;
-      session.state = 'AWAITING_SERVER_SELECTION';
-      await saveUserSession(userId, session);
-      await promptServerSelection(ctx, session);
-      return;
+    session.country = matchedCountry;
+    session.selectedServiceQuery = rawServiceQuery;
+    session.state = 'AWAITING_SERVER_SELECTION';
+    await saveUserSession(userId, session);
+    await promptServerSelection(ctx, session);
+    return;
+  }
+
+  // If user typed service first followed by country (e.g., "WhatsApp USA" or "Facebook Canada")
+  for (let i = 0; i < words.length; i++) {
+    const potentialCountryQuery = words.slice(i).join(' ');
+    const foundCountry = getNormalizedCountry(potentialCountryQuery);
+    if (foundCountry) {
+      let rawServiceQuery = words.slice(0, i).join(' ');
+      for (const [canonical, synonyms] of Object.entries(COMMON_SERVICE_SYNONYMS)) {
+        if (synonyms.some(syn => rawServiceQuery.includes(syn))) {
+          rawServiceQuery = canonical;
+          break;
+        }
+      }
+      if (rawServiceQuery) {
+        session.country = foundCountry;
+        session.selectedServiceQuery = rawServiceQuery;
+        session.state = 'AWAITING_SERVER_SELECTION';
+        await saveUserSession(userId, session);
+        await promptServerSelection(ctx, session);
+        return;
+      }
     }
   }
 
@@ -729,25 +759,32 @@ bot.on('text', async (ctx) => {
     await saveUserSession(userId, session);
     ctx.reply(
       `Ehen! You select *${matchedCountryDirect.name}* 👌\n\n` +
-      `Which app or service you wan verify? (e.g., _WhatsApp_, _Telegram_, _Google_)`,
+      `Which app or service you wan verify? (e.g., _WhatsApp_, _Telegram_, _Facebook_)`,
       { parse_mode: 'Markdown' }
     );
     return;
   }
 
   if (session.state === 'AWAITING_SERVICE' && session.country) {
-    session.selectedServiceQuery = rawText;
+    let rawServiceQuery = rawText;
+    for (const [canonical, synonyms] of Object.entries(COMMON_SERVICE_SYNONYMS)) {
+      if (synonyms.some(syn => rawServiceQuery.toLowerCase().includes(syn))) {
+        rawServiceQuery = canonical;
+        break;
+      }
+    }
+    session.selectedServiceQuery = rawServiceQuery;
     session.state = 'AWAITING_SERVER_SELECTION';
     await saveUserSession(userId, session);
     await promptServerSelection(ctx, session);
     return;
   }
 
-  ctx.reply(`Please state your country code first (e.g., type *US* or *US WhatsApp*).`, { parse_mode: 'Markdown' });
+  ctx.reply(`Oya boss, just tell me what you need naturally like *'US WhatsApp'* or *'Canada Telegram'*! ✨`, { parse_mode: 'Markdown' });
 });
 
 async function promptServerSelection(ctx, session) {
-  ctx.reply(`Checking available servers and stock... ⏳`);
+  ctx.reply(`Checking available servers and translating service codes... ⏳`);
   const availableServers = await fetchCombinedServices(session.country);
   const q = (session.selectedServiceQuery || '').toLowerCase().trim();
   
