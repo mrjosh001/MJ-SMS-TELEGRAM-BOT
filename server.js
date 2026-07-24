@@ -328,7 +328,6 @@ async function getBeeSmsServices(countryId) {
         service_id: String(item.service_code || ''),
         service_name: String(item.service_name || item.service_code || ''),
         stock: parseInt(item.qty || 100, 10),
-        // Bee SMS prices are in cents (e.g., USD cents), convert to dollars then we calculate NGN
         price: parseFloat(item.amount || 0) / 100,
         is_ngn: false
       })).filter(s => s.service_id);
@@ -759,10 +758,13 @@ app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
 
-bot.launch().then(() => {
-  console.log("Bot is live and polling for messages...");
-}).catch((err) => {
-  console.error("Failed to launch bot:", err);
+// Clear potential lingering webhooks before launching polling to prevent unresponsiveness
+bot.telegram.deleteWebhook({ drop_pending_updates: true }).then(() => {
+  bot.launch().then(() => {
+    console.log("Bot is live and polling for messages...");
+  }).catch((err) => {
+    console.error("Failed to launch bot:", err);
+  });
 });
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
