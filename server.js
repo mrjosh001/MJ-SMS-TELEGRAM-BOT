@@ -519,10 +519,25 @@ async function processWithAiAgent(userMessage) {
     const response = await axios.post('https://api.openai.com/v1/chat/completions', {
       model: 'gpt-4o-mini',
       messages: [
-        { role: 'system', content: 'You are the intelligent assistant for MJ SMS, a fast automated SMS verification bot. Analyze the user text and return ONLY a raw JSON object with keys: "intent" ("order", "help", "balance"), "country" (extracted country name or null), "service" (extracted app/service name or null), "reply" (a friendly Nigerian pidgin response if intent is help/chat, otherwise null).' },
+        { 
+          role: 'system', 
+          content: `You are Josh, the owner and operator of MJ SMS. You talk in friendly, confident Nigerian Pidgin mixed with English ("Oya boss", "No wahala", etc.). 
+          Your business is an automated SMS verification platform where people can buy cheap OTP numbers for WhatsApp, Telegram, etc., and fund their wallets via Paystack.
+          
+          Analyze the user message and return ONLY a valid JSON object with keys:
+          - "intent": choose from ["order", "faq", "fund", "greeting", "chat"]
+          - "country": extracted country name if they want to buy a number, otherwise null
+          - "service": extracted app name if they want to buy a number, otherwise null
+          - "reply": your exact text response to the user written like YOU (Josh) are chatting with them personally. Use this if the intent is "faq", "fund", "greeting", or "chat". Set to null if intent is "order".
+
+          Examples of FAQ answers you should give in your voice:
+          - How to fund: "Oya boss, just type /fund or /deposit, put the amount in Naira, and pay through the secure Paystack link. Your balance will land sharp sharp!"
+          - Is it safe/working: "E work perfectly, boss! Just tell me the country and app you want like 'Ghana WhatsApp' and we go run am."
+          - Prices: "Our prices dey very pocket friendly, boss! Just search any service to see live prices."` 
+        },
         { role: 'user', content: userMessage }
       ],
-      temperature: 0.1
+      temperature: 0.3
     }, {
       headers: { Authorization: `Bearer ${OPENAI_API_KEY.trim()}` },
       timeout: 10000
@@ -556,8 +571,15 @@ bot.on('text', async (ctx) => {
   }
 
   const aiResult = await processWithAiAgent(rawText);
-  if (aiResult && aiResult.intent === 'help') {
-    return ctx.reply(aiResult.reply || `Oya boss! I am MJ SMS. Just tell me the country and the app you want (e.g. *Ghana WhatsApp*), and I will fetch live stock for you instantly! ✨`, { parse_mode: 'Markdown' });
+  
+  if (aiResult && aiResult.reply && aiResult.intent !== 'order') {
+    return ctx.reply(aiResult.reply, { parse_mode: 'Markdown' });
+  }
+
+  if (aiResult && aiResult.intent === 'fund') {
+    session.state = 'AWAITING_DEPOSIT_AMOUNT';
+    await saveUserSession(userId, session);
+    return ctx.reply(`💳 Enter the amount you want to deposit in Naira (e.g., *1000*, *2000*):`, { parse_mode: 'Markdown' });
   }
 
   if (aiResult && aiResult.intent === 'order' && aiResult.country && aiResult.service) {
