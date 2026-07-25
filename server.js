@@ -520,7 +520,7 @@ async function processWithAiAgent(userMessage) {
   }
   try {
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY.trim()}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${GEMINI_API_KEY.trim()}`,
       {
         contents: [
           {
@@ -743,7 +743,6 @@ bot.action(/^buy\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
 
 app.get('/', (req, res) => res.send('MJ SMS Bot Active!'));
 
-// Webhook configuration for Render hosting to avoid 409 conflict
 app.use(bot.webhookCallback('/telegram-webhook'));
 
 app.listen(PORT, async () => {
@@ -764,5 +763,9 @@ app.listen(PORT, async () => {
   }
 });
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+process.once('SIGINT', () => {
+  try { bot.stop('SIGINT'); } catch (e) {}
+});
+process.once('SIGTERM', () => {
+  try { bot.stop('SIGTERM'); } catch (e) {}
+});
