@@ -520,7 +520,7 @@ async function processWithAiAgent(userMessage) {
   }
   try {
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY.trim()}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY.trim()}`,
       {
         contents: [
           {
@@ -549,11 +549,7 @@ async function processWithAiAgent(userMessage) {
     );
     
     let content = response.data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
-    if (content.startsWith('```json')) {
-      content = content.replace(/```json/g, '').replace(/```/g, '').trim();
-    } else if (content.startsWith('```')) {
-      content = content.replace(/```/g, '').trim();
-    }
+    content = content.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/, '').trim();
     return JSON.parse(content);
   } catch (err) {
     console.log("[Gemini API Exception Error]:", err.response?.data || err.message);
