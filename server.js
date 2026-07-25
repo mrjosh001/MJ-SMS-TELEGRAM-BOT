@@ -8,7 +8,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const JUICYSMS_API_KEY = process.env.JUICYSMS_API_KEY;
 const SMSOTPSTORES_API_KEY = process.env.SMSOTPSTORES_API_KEY;
 const AUTHPADI_API_KEY = process.env.AUTHPADI_API_KEY;
@@ -514,39 +514,41 @@ bot.command('orders', async (ctx) => {
 });
 
 async function processWithAiAgent(userMessage) {
-  if (!OPENAI_API_KEY) {
-    console.log("[AI Error] OPENAI_API_KEY is missing.");
+  if (!GEMINI_API_KEY) {
+    console.log("[AI Error] GEMINI_API_KEY is missing.");
     return null;
   }
   try {
-    const response = await axios.post('https://api.openai.com/v1/chat/completions', {
-      model: 'gpt-4o-mini',
-      messages: [
-        { 
-          role: 'system', 
-          content: `You are Josh, the owner and operator of MJ SMS. You talk in friendly, confident Nigerian Pidgin mixed with English ("Oya boss", "No wahala", etc.). 
-          Your business is an automated SMS verification platform where people can buy cheap OTP numbers for WhatsApp, Telegram, etc., and fund their wallets via Paystack.
-          
-          Analyze the user message and return ONLY a valid JSON object with keys:
-          - "intent": choose from ["order", "faq", "fund", "greeting", "chat"]
-          - "country": extracted country name if they want to buy a number, otherwise null
-          - "service": extracted app name if they want to buy a number, otherwise null
-          - "reply": your exact text response to the user written like YOU (Josh) are chatting with them personally. Use this if the intent is "faq", "fund", "greeting", or "chat". Set to null if intent is "order".
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY.trim()}`,
+      {
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              {
+                text: `You are Josh, the owner and operator of MJ SMS. You talk in friendly, confident Nigerian Pidgin mixed with English ("Oya boss", "No wahala", etc.). 
+                Your business is an automated SMS verification platform where people can buy cheap OTP numbers for WhatsApp, Telegram, MJ boosters, MJ sms, MJ logs, Mr Josh Exchange, etc., and fund their wallets via Paystack.
+                
+                Analyze the user message and return ONLY a valid JSON object (no markdown formatting blocks, just raw JSON) with keys:
+                - "intent": choose from ["order", "faq", "fund", "greeting", "chat"]
+                - "country": extracted country name if they want to buy a number, otherwise null
+                - "service": extracted app name if they want to buy a number, otherwise null
+                - "reply": your exact text response to the user written like YOU (Josh) are chatting with them personally. Use this if the intent is "faq", "fund", "greeting", or "chat". Set to null if intent is "order".
 
-          Examples of FAQ answers you should give in your voice:
-          - How to fund: "Oya boss, just type /fund or /deposit, put the amount in Naira, and pay through the secure Paystack link. Your balance will land sharp sharp!"
-          - Is it safe/working: "E work perfectly, boss! Just tell me the country and app you want like 'Ghana WhatsApp' and we go run am."
-          - Prices: "Our prices dey very pocket friendly, boss! Just search any service to see live prices."` 
-        },
-        { role: 'user', content: userMessage }
-      ],
-      temperature: 0.3
-    }, {
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY.trim()}` },
-      timeout: 10000
-    });
+                User Message: "${userMessage}"`
+              }
+            ]
+          }
+        ]
+      },
+      {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 10000
+      }
+    );
     
-    let content = response.data.choices[0].message.content.trim();
+    let content = response.data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
     if (content.startsWith('```json')) {
       content = content.replace(/```json/g, '').replace(/```/g, '').trim();
     } else if (content.startsWith('```')) {
@@ -554,7 +556,7 @@ async function processWithAiAgent(userMessage) {
     }
     return JSON.parse(content);
   } catch (err) {
-    console.log("[AI Exception Error]:", err.response?.data || err.message);
+    console.log("[Gemini API Exception Error]:", err.response?.data || err.message);
     return null;
   }
 }
@@ -578,9 +580,9 @@ bot.on('text', async (ctx) => {
     return ctx.reply(`❌ Payment link error.`);
   }
 
-  console.log(`[AI Request] User sent: "${rawText}"`);
+  console.log(`[Gemini Request] User sent: "${rawText}"`);
   const aiResult = await processWithAiAgent(rawText);
-  console.log(`[AI Result]:`, aiResult);
+  console.log(`[Gemini Result]:`, aiResult);
   
   if (aiResult && aiResult.reply) {
     return ctx.reply(aiResult.reply, { parse_mode: 'Markdown' });
@@ -603,7 +605,7 @@ bot.on('text', async (ctx) => {
   const chatKeywords = ['wetin', 'what', 'how', 'hi', 'hello', 'hey', 'help', 'can', 'you', 'bro', 'boss', 'thanks', 'una', 'wan', 'fund', 'wallet'];
   const isChat = chatKeywords.some(kw => lower.includes(kw));
 
-  if (isChat || lower.split(' ').length > 4) {
+  if (isChat || lower.split(' ').length < 2) {
     return ctx.reply(`Oya boss! If you want to buy a number, just type am sharp sharp like *USA WhatsApp* or *Ghana Telegram*. Type /fund if you want deposit money! ✨`, { parse_mode: 'Markdown' });
   }
 
