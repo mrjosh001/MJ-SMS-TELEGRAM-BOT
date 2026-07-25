@@ -520,7 +520,7 @@ async function processWithAiAgent(userMessage) {
   }
   try {
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY.trim()}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY.trim()}`,
       {
         contents: [
           {
@@ -549,11 +549,7 @@ async function processWithAiAgent(userMessage) {
     );
     
     let content = response.data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
-    if (content.startsWith('```json')) {
-      content = content.replace(/```json/g, '').replace(/```/g, '').trim();
-    } else if (content.startsWith('```')) {
-      content = content.replace(/```/g, '').trim();
-    }
+    content = content.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/, '').trim();
     return JSON.parse(content);
   } catch (err) {
     console.log("[Gemini API Exception Error]:", err.response?.data || err.message);
@@ -747,45 +743,26 @@ bot.action(/^buy\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
 
 app.get('/', (req, res) => res.send('MJ SMS Bot Active!'));
 
-app.listen(PORT, () => {
+// Webhook configuration for Render hosting to avoid 409 conflict
+app.use(bot.webhookCallback('/telegram-webhook'));
+
+app.listen(PORT, async () => {
   console.log(`Server listening on port ${PORT}`);
-});
-
-// ====================== SAFER BOT LAUNCH ======================
-async function startBot() {
   try {
-    // Delete any existing webhook first
-    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
-    console.log("✅ Webhook deleted successfully");
+    const webhookUrl = process.env.RENDER_EXTERNAL_URL 
+      ? `${process.env.RENDER_EXTERNAL_URL}/telegram-webhook`
+      : null;
 
-    // Small delay so previous instance can fully die
-    await new Promise(resolve => setTimeout(resolve, 2500));
-
-    await bot.launch({
-      dropPendingUpdates: true
-    });
-
-    console.log("✅ Bot is live and polling for messages...");
-  } catch (err) {
-    console.error("❌ Failed to launch bot:", err.message || err);
-
-    // Handle 409 Conflict specifically
-    if (err.response?.error_code === 409 || (err.message && err.message.includes('409'))) {
-      console.log("⚠️ 409 Conflict detected. Waiting 6 seconds and retrying...");
-      await new Promise(resolve => setTimeout(resolve, 6000));
-
-      try {
-        await bot.telegram.deleteWebhook({ drop_pending_updates: true });
-        await bot.launch({ dropPendingUpdates: true });
-        console.log("✅ Bot launched successfully after retry");
-      } catch (retryErr) {
-        console.error("❌ Retry also failed:", retryErr.message || retryErr);
-      }
+    if (webhookUrl) {
+      await bot.telegram.setWebhook(webhookUrl, { drop_pending_updates: true });
+      console.log(`Webhook successfully set to ${webhookUrl}`);
+    } else {
+      console.log("RENDER_EXTERNAL_URL not detected. Ensure webhook is pointed to your public domain if running in production.");
     }
+  } catch (err) {
+    console.error("Failed to set webhook:", err.message);
   }
-}
-
-startBot();
+});
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
