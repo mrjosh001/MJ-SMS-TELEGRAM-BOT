@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
@@ -8,6 +9,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const JUICYSMS_API_KEY = process.env.JUICYSMS_API_KEY;
 const SMSOTPSTORES_API_KEY = process.env.SMSOTPSTORES_API_KEY;
 const AUTHPADI_API_KEY = process.env.AUTHPADI_API_KEY;
@@ -166,56 +168,24 @@ const AUTHPADI_BASE_URL = 'https://dashboard.authpadi.com';
 const ALLSMSVERIFY_BASE_URL = 'https://allsmsverify.com';
 const BEESMS_BASE_URL = 'https://api.bee-sms.com/v1';
 
-const SERVICE_ALIASES = {
-  'wa': 'whatsapp', 'whats': 'whatsapp', 'whats app': 'whatsapp', 'whatsup': 'whatsapp', 'app': 'whatsapp',
-  'tg': 'telegram', 'tele': 'telegram', 'telegram': 'telegram',
-  'fb': 'facebook', 'meta': 'facebook', 'face': 'facebook',
-  'ig': 'instagram', 'insta': 'instagram', 'gram': 'instagram',
-  'tik': 'tiktok', 'tok': 'tiktok', 'tiktok': 'tiktok',
-  'x': 'twitter', 'tweet': 'twitter', 'twitter': 'twitter',
-  'gmail': 'google', 'g-mail': 'google', 'youtube': 'google',
-  'snap': 'snapchat', 'snapchat': 'snapchat',
-  'net': 'netflix', 'flix': 'netflix', 'netflix': 'netflix'
-};
-
 const COUNTRY_ALIASES = {
   'usa': { id: 'us', name: 'United States (US)' },
   'us': { id: 'us', name: 'United States (US)' },
   'united states': { id: 'us', name: 'United States (US)' },
-  'america': { id: 'us', name: 'United States (US)' },
   'uk': { id: 'gb', name: 'United Kingdom (UK)' },
   'united kingdom': { id: 'gb', name: 'United Kingdom (UK)' },
-  'england': { id: 'gb', name: 'United Kingdom (UK)' },
-  'britain': { id: 'gb', name: 'United Kingdom (UK)' },
   'ng': { id: 'ng', name: 'Nigeria (NG)' },
   'nigeria': { id: 'ng', name: 'Nigeria (NG)' },
   'canada': { id: 'ca', name: 'Canada (CA)' },
   'ca': { id: 'ca', name: 'Canada (CA)' },
-  'russia': { id: 'ru', name: 'Russia (RU)' },
-  'ru': { id: 'ru', name: 'Russia (RU)' },
+  'venezuela': { id: 've', name: 'Venezuela (VE)' },
+  've': { id: 've', name: 'Venezuela (VE)' },
   'ghana': { id: 'gh', name: 'Ghana (GH)' },
-  'gh': { id: 'gh', name: 'Ghana (GH)' },
-  'india': { id: 'in', name: 'India (IN)' },
-  'in': { id: 'in', name: 'India (IN)' },
-  'germany': { id: 'de', name: 'Germany (DE)' },
-  'de': { id: 'de', name: 'Germany (DE)' },
-  'france': { id: 'fr', name: 'France (FR)' },
-  'fr': { id: 'fr', name: 'France (FR)' },
-  'poland': { id: 'pl', name: 'Poland (PL)' },
-  'pl': { id: 'pl', name: 'Poland (PL)' }
+  'gh': { id: 'gh', name: 'Ghana (GH)' }
 };
 
-function intelligentTranslateService(rawQuery) {
-  let cleaned = rawQuery.toLowerCase().trim();
-  for (const [alias, canonical] of Object.entries(SERVICE_ALIASES)) {
-    if (cleaned === alias || cleaned.includes(alias)) {
-      return canonical;
-    }
-  }
-  return cleaned;
-}
-
 function intelligentTranslateCountry(rawCountry) {
+  if (!rawCountry) return { id: 'us', name: 'United States (US)' };
   let cleaned = rawCountry.toLowerCase().trim();
   if (COUNTRY_ALIASES[cleaned]) {
     return COUNTRY_ALIASES[cleaned];
@@ -479,10 +449,10 @@ async function cancelOrder(provider, orderId) {
   } catch (err) {}
 }
 
-bot.command('servers', async (ctx) => {
+bot.command(['servers', 'server'], async (ctx) => {
   const adminId = String(ctx.from.id);
   if (adminId !== ADMIN_TELEGRAM_ID) {
-    return ctx.reply(`❌ Unauthorized. Your ID is ${adminId}, but expected ${ADMIN_TELEGRAM_ID}.`);
+    return ctx.reply(`❌ Unauthorized.`);
   }
 
   ctx.reply(`Checking all servers status & balances... ⏳`);
@@ -544,20 +514,35 @@ bot.command('orders', async (ctx) => {
   ctx.reply(`📦 *YOUR ORDERS*\n\n${history}`, { parse_mode: 'Markdown' });
 });
 
+async function processWithAiAgent(userMessage) {
+  if (!OPENAI_API_KEY) return null;
+  try {
+    const response = await axios.post('https://api.openai.com/v1/chat/completions', {
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: 'You are the intelligent assistant for MJ SMS, a fast automated SMS verification bot. Analyze the user text and return ONLY a raw JSON object with keys: "intent" ("order", "help", "balance"), "country" (extracted country name or null), "service" (extracted app/service name or null), "reply" (a friendly Nigerian pidgin response if intent is help/chat, otherwise null).' },
+        { role: 'user', content: userMessage }
+      ],
+      temperature: 0.1
+    }, {
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY.trim()}` },
+      timeout: 10000
+    });
+    
+    let content = response.data.choices[0].message.content.trim();
+    if (content.startsWith('```json')) content = content.replace(/```json/g, '').replace(/```/g, '').trim();
+    return JSON.parse(content);
+  } catch (err) {
+    return null;
+  }
+}
+
 bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
   const rawText = ctx.message.text.trim();
-  const lowerText = rawText.toLowerCase();
-
   if (rawText.startsWith('/')) return;
 
   const session = await getUserSession(userId);
-
-  if (['change country', 'back'].some(k => lowerText === k)) {
-    session.state = 'AWAITING_INPUT';
-    await saveUserSession(userId, session);
-    return ctx.reply(`No p boss! Type any country and service name naturally.`);
-  }
 
   if (session.state === 'AWAITING_DEPOSIT_AMOUNT') {
     const amount = parseInt(rawText.replace(/[^0-9]/g, ''));
@@ -571,57 +556,22 @@ bot.on('text', async (ctx) => {
     return ctx.reply(`❌ Payment link error.`);
   }
 
-  const words = lowerText.split(/\s+/);
-  let matchedCountry = null;
-  let serviceQueryWords = [];
-
-  for (let i = 0; i < words.length; i++) {
-    const subQuery = words.slice(0, i + 1).join(' ');
-    if (COUNTRY_ALIASES[subQuery]) {
-      matchedCountry = COUNTRY_ALIASES[subQuery];
-      serviceQueryWords = words.slice(i + 1);
-      break;
-    }
+  const aiResult = await processWithAiAgent(rawText);
+  if (aiResult && aiResult.intent === 'help') {
+    return ctx.reply(aiResult.reply || `Oya boss! I am MJ SMS. Just tell me the country and the app you want (e.g. *Ghana WhatsApp*), and I will fetch live stock for you instantly! ✨`, { parse_mode: 'Markdown' });
   }
 
-  if (!matchedCountry) {
-    for (let i = 0; i < words.length; i++) {
-      const potentialCountry = words.slice(i).join(' ');
-      if (COUNTRY_ALIASES[potentialCountry]) {
-        let leftover = words.slice(0, i);
-        if (leftover.length > 0) {
-          matchedCountry = COUNTRY_ALIASES[potentialCountry];
-          serviceQueryWords = leftover;
-          break;
-        }
-      }
-    }
-  }
-
-  if (matchedCountry && serviceQueryWords.length > 0) {
-    let rawService = serviceQueryWords.join(' ');
-    session.country = matchedCountry;
-    session.selectedServiceQuery = intelligentTranslateService(rawService);
+  if (aiResult && aiResult.intent === 'order' && aiResult.country && aiResult.service) {
+    session.country = intelligentTranslateCountry(aiResult.country);
+    session.selectedServiceQuery = aiResult.service.toLowerCase().trim();
     await saveUserSession(userId, session);
     return await promptServerSelection(ctx, session);
   }
 
-  if (COUNTRY_ALIASES[lowerText]) {
-    session.country = COUNTRY_ALIASES[lowerText];
-    session.state = 'AWAITING_SERVICE';
-    await saveUserSession(userId, session);
-    return ctx.reply(`Ehen! You select *${session.country.name}*. Which service you wan verify?`, { parse_mode: 'Markdown' });
-  }
-
-  if (session.state === 'AWAITING_SERVICE' && session.country) {
-    session.selectedServiceQuery = intelligentTranslateService(rawText);
-    await saveUserSession(userId, session);
-    return await promptServerSelection(ctx, session);
-  }
-
+  const words = rawText.toLowerCase().split(/\s+/);
   if (words.length >= 2) {
     session.country = intelligentTranslateCountry(words[0]);
-    session.selectedServiceQuery = intelligentTranslateService(words.slice(1).join(' '));
+    session.selectedServiceQuery = words.slice(1).join(' ');
     await saveUserSession(userId, session);
     return await promptServerSelection(ctx, session);
   }
