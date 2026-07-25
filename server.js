@@ -530,13 +530,11 @@ async function processWithAiAgent(userMessage) {
                 text: `You are Josh, the owner and operator of MJ SMS. You talk in friendly, confident Nigerian Pidgin mixed with English ("Oya boss", "No wahala", etc.). 
                 Your business is an automated SMS verification platform where people can buy cheap OTP numbers for WhatsApp, Telegram, MJ boosters, MJ sms, MJ logs, Mr Josh Exchange, etc., and fund their wallets via Paystack.
                 
-                CRITICAL RULE FOR REPLIES: Keep your text responses EXTREMELY BRIEF, straight to the point, and direct to business. No long talk at all, but maintain your strong Nigerian Pidgin vibe.
-
                 Analyze the user message and return ONLY a valid JSON object (no markdown formatting blocks, just raw JSON) with keys:
                 - "intent": choose from ["order", "faq", "fund", "greeting", "chat"]
                 - "country": extracted country name if they want to buy a number, otherwise null
                 - "service": extracted app name if they want to buy a number, otherwise null
-                - "reply": your short, straight-to-the-point Pidgin text response to the user written like YOU (Josh) are chatting with them personally. Use this if the intent is "faq", "fund", "greeting", or "chat". Set to null if intent is "order".
+                - "reply": your exact text response to the user written like YOU (Josh) are chatting with them personally. Use this if the intent is "faq", "fund", "greeting", or "chat". Set to null if intent is "order".
 
                 User Message: "${userMessage}"`
               }
@@ -551,4 +549,223 @@ async function processWithAiAgent(userMessage) {
     );
     
     let content = response.data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
-    content = content.replace(/^```json\s*/i, '').replace(/^
+    content = content.replace(/^```json/i, '').replace(/^```/i, '').replace(/```$/, '').trim();
+    return JSON.parse(content);
+  } catch (err) {
+    console.log("[Gemini API Exception Error]:", err.response?.data || err.message);
+    return null;
+  }
+}
+
+bot.on('text', async (ctx) => {
+  const userId = ctx.from.id;
+  const rawText = ctx.message.text.trim();
+  if (rawText.startsWith('/')) return;
+
+  const session = await getUserSession(userId);
+
+  if (session.state === 'AWAITING_DEPOSIT_AMOUNT') {
+    const amount = parseInt(rawText.replace(/[^0-9]/g, ''));
+    if (isNaN(amount) || amount < 100) return ctx.reply(`Please enter a valid amount.`);
+    const payment = await initializePaystackPayment(`${userId}@mjsms.com`, amount, userId);
+    if (payment.status && payment.data?.authorization_url) {
+      session.state = 'IDLE';
+      await saveUserSession(userId, session);
+      return ctx.reply(`💳 Tap below to pay:`, Markup.inlineKeyboard([[Markup.button.url('Pay Now', payment.data.authorization_url)]]));
+    }
+    return ctx.reply(`❌ Payment link error.`);
+  }
+
+  console.log(`[Gemini Request] User sent: "${rawText}"`);
+  const aiResult = await processWithAiAgent(rawText);
+  console.log(`[Gemini Result]:`, aiResult);
+  
+  if (aiResult && aiResult.reply) {
+    return ctx.reply(aiResult.reply, { parse_mode: 'Markdown' });
+  }
+
+  if (aiResult && aiResult.intent === 'fund') {
+    session.state = 'AWAITING_DEPOSIT_AMOUNT';
+    await saveUserSession(userId, session);
+    return ctx.reply(`💳 Enter the amount you want to deposit in Naira (e.g., *1000*, *2000*):`, { parse_mode: 'Markdown' });
+  }
+
+  if (aiResult && aiResult.intent === 'order' && aiResult.country && aiResult.service) {
+    session.country = intelligentTranslateCountry(aiResult.country);
+    session.selectedServiceQuery = aiResult.service.toLowerCase().trim();
+    await saveUserSession(userId, session);
+    return await promptServerSelection(ctx, session);
+  }
+
+  const lower = rawText.toLowerCase();
+  const chatKeywords = ['wetin', 'what', 'how', 'hi', 'hello', 'hey', 'help', 'can', 'you', 'bro', 'boss', 'thanks', 'una', 'wan', 'fund', 'wallet'];
+  const isChat = chatKeywords.some(kw => lower.includes(kw));
+
+  if (isChat || lower.split(' ').length < 2) {
+    return ctx.reply(`Oya boss! If you want to buy a number, just type am sharp sharp like *USA WhatsApp* or *Ghana Telegram*. Type /fund if you want deposit money! ✨`, { parse_mode: 'Markdown' });
+  }
+
+  const words = rawText.split(/\s+/);
+  if (words.length >= 2) {
+    session.country = intelligentTranslateCountry(words[0]);
+    session.selectedServiceQuery = words.slice(1).join(' ');
+    await saveUserSession(userId, session);
+    return await promptServerSelection(ctx, session);
+  }
+
+  ctx.reply(`Oya boss, specify both country and app name naturally (e.g., *USA WhatsApp*). ✨`, { parse_mode: 'Markdown' });
+});
+
+async function promptServerSelection(ctx, session) {
+  ctx.reply(`Translating and fetching live stock across servers... ⏳`);
+  const availableServers = await fetchCombinedServices(session.country);
+  const q = (session.selectedServiceQuery || '').toLowerCase().trim();
+
+  const filtered = availableServers.filter(s => {
+    const sName = String(s.service_name || '').toLowerCase();
+    const sId = String(s.service_id || '').toLowerCase();
+    return sName === q || sName.includes(q) || sId === q;
+  });
+
+  const userId = ctx.from.id;
+  if (filtered.length === 0) {
+    session.state = 'AWAITING_SERVICE';
+    await saveUserSession(userId, session);
+    return ctx.reply(`💔 No stock found for *${session.selectedServiceQuery}* in *${session.country.name}*. Try another app name!`, { parse_mode: 'Markdown' });
+  }
+
+  const uniqueServersMap = new Map();
+  filtered.forEach(srv => {
+    if (!uniqueServersMap.has(srv.server_label)) uniqueServersMap.set(srv.server_label, srv);
+  });
+
+  const serverButtons = [];
+  uniqueServersMap.forEach((srv, label) => {
+    serverButtons.push([Markup.button.callback(`🖥️ ${label}`, `server|${srv.provider}|${srv.server_label}`)]);
+  });
+  serverButtons.push([Markup.button.callback('🔄 Choose Another Country', 'reset_flow')]);
+
+  ctx.reply(`Select your preferred server for *${session.selectedServiceQuery}* (${session.country.name}): 👇`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(serverButtons) });
+}
+
+bot.action(/^server\|(.+)\|(.+)$/, async (ctx) => {
+  ctx.answerCbQuery();
+  const userId = ctx.from.id;
+  const session = await getUserSession(userId);
+  const provider = ctx.match[1];
+  const availableServers = await fetchCombinedServices(session.country);
+  const q = (session.selectedServiceQuery || '').toLowerCase().trim();
+
+  const filtered = availableServers.filter(s => {
+    const sName = String(s.service_name || '').toLowerCase();
+    const sId = String(s.service_id || '').toLowerCase();
+    return String(s.provider) === String(provider) && (sName === q || sName.includes(q) || sId === q);
+  });
+
+  const buttons = filtered.map(srv => {
+    const finalPrice = calculateFinalPrice(srv.price, srv.is_ngn);
+    const displayName = srv.service_name && srv.service_name !== 'undefined' ? srv.service_name : session.selectedServiceQuery;
+    return [Markup.button.callback(`💰 ${srv.server_label} (${displayName}) - ₦${finalPrice.toLocaleString()} (${srv.stock} left)`, `buy|${srv.provider}|${session.country.id}|${srv.service_id}`)];
+  });
+  buttons.push([Markup.button.callback('⬅️ Back', 'back_to_servers')]);
+
+  ctx.reply(`Choose pricing option:`, Markup.inlineKeyboard(buttons));
+});
+
+bot.action('back_to_servers', async (ctx) => {
+  ctx.answerCbQuery();
+  const session = await getUserSession(ctx.from.id);
+  if (session.country) await promptServerSelection(ctx, session);
+});
+
+bot.action('reset_flow', async (ctx) => {
+  ctx.answerCbQuery();
+  const session = await getUserSession(ctx.from.id);
+  session.state = 'AWAITING_INPUT';
+  session.country = null;
+  session.selectedServiceQuery = null;
+  await saveUserSession(ctx.from.id, session);
+  ctx.reply(`🔄 Flow reset! Type any country and app name naturally.`);
+});
+
+bot.action(/^buy\|(.+)\|(.+)\|(.+)$/, async (ctx) => {
+  ctx.answerCbQuery();
+  const userId = ctx.from.id;
+  const session = await getUserSession(userId);
+  const [_, provider, countryId, serviceId] = ctx.match;
+
+  const availableServers = await fetchCombinedServices({ id: countryId });
+  const target = availableServers.find(s => s.provider === provider && String(s.service_id) === String(serviceId));
+  const price = target ? calculateFinalPrice(target.price, target.is_ngn) : 0;
+
+  if (price > 0 && session.balance < price) {
+    return ctx.reply(`❌ Insufficient balance! Type */fund* to top up.`, { parse_mode: 'Markdown' });
+  }
+
+  ctx.reply(`Processing order... ⏳`);
+  const response = await executeOrder(provider, serviceId, countryId);
+
+  if (response.success && response.data) {
+    if (price > 0) {
+      session.balance = Math.max(0, session.balance - price);
+      await saveUserSession(userId, session);
+    }
+    const orderId = response.data.order_id;
+    const phoneNumber = response.data.number;
+
+    await addOrderToDb(userId, { orderId, provider, serviceName: target?.service_name || serviceId, phoneNumber, price, status: 'Pending', date: new Date().toLocaleString() });
+
+    ctx.reply(`🎉 *NUMBER BOUGHT!*\n📞 \`${phoneNumber}\`\n🆔 \`${orderId}\`\nWaiting for SMS code...`, { parse_mode: 'Markdown' });
+
+    let polls = 0;
+    const pollInterval = setInterval(async () => {
+      polls++;
+      const check = await checkSmsCode(provider, orderId);
+      if (check.success && check.data?.code) {
+        clearInterval(pollInterval);
+        await updateOrderStatusInDb(orderId, `Completed (${check.data.code})`);
+        ctx.reply(`🔥🔥 *CODE RECEIVED:* \`${check.data.code}\` 🔥🔥`, { parse_mode: 'Markdown' });
+      } else if (polls >= 80) {
+        clearInterval(pollInterval);
+        await cancelOrder(provider, orderId);
+        if (price > 0) {
+          const fresh = await getUserSession(userId);
+          fresh.balance += price;
+          await saveUserSession(userId, fresh);
+        }
+        ctx.reply(`⏰ Timeout! Order canceled and ₦${price} refunded.`);
+      }
+    }, 7000);
+  } else {
+    ctx.reply(`❌ Order failed: ${response.message}`);
+  }
+});
+
+app.get('/', (req, res) => res.send('MJ SMS Bot Active!'));
+
+app.use(bot.webhookCallback('/telegram-webhook'));
+
+app.listen(PORT, async () => {
+  console.log(`Server listening on port ${PORT}`);
+  try {
+    const webhookUrl = process.env.RENDER_EXTERNAL_URL 
+      ? `${process.env.RENDER_EXTERNAL_URL}/telegram-webhook`
+      : null;
+
+    if (webhookUrl) {
+      await bot.telegram.setWebhook(webhookUrl, { drop_pending_updates: true });
+      console.log(`Webhook successfully set to ${webhookUrl}`);
+    } else {
+      console.log("RENDER_EXTERNAL_URL not detected. Ensure webhook is pointed to your public domain if running in production.");
+    }
+  } catch (err) {
+    console.error("Failed to set webhook:", err.message);
+  }
+});
+
+process.once('SIGINT', () => {
+  try { bot.stop('SIGINT'); } catch (e) {}
+});
+process.once('SIGTERM', () => {
+  try { bot.stop('SIGTERM'); } catch (e) {}
+});
