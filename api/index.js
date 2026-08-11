@@ -306,19 +306,19 @@ function matchServices(list, query) {
 
 bot.start(async (ctx) => {
   await ctx.reply(
-    `Welcome to *MJ SMS* (Grizzly · Server 1)\n\nType a country + app, e.g.\n• *USA WhatsApp*\n• *Nigeria Telegram*\n• *UK Google*\n\n/balance — wallet\n/fund — top up\n/orders — history\n/status — supplier status`,
+    `Welcome to *MJ SMS* (Server 1) 🎉\n\nJust type country + app, my guy:\n• *USA WhatsApp*\n• *Nigeria Telegram*\n• *UK Google*\n\nAnd I go show you wetin dey available.\n\n/balance — check your wallet\n/fund — top up\n/orders — your order history\n/status — see if server dey up`,
     { parse_mode: 'Markdown' }
   );
 });
 
 bot.command(['balance', 'bal'], async (ctx) => {
   const s = await getUserSession(ctx.from.id);
-  await ctx.reply(`Balance: *₦${(s.balance || 0).toLocaleString()}*`, { parse_mode: 'Markdown' });
+  await ctx.reply(`Boss your current balance na *₦${(s.balance || 0).toLocaleString()}* ✨`, { parse_mode: 'Markdown' });
 });
 
 bot.command('orders', async (ctx) => {
   const s = await getUserSession(ctx.from.id);
-  if (!s.orders || !s.orders.length) return ctx.reply('No orders yet.');
+  if (!s.orders || !s.orders.length) return ctx.reply('You never order anything before o.');
   const lines = s.orders
     .slice(-10)
     .reverse()
@@ -328,19 +328,19 @@ bot.command('orders', async (ctx) => {
 });
 
 bot.command('status', async (ctx) => {
-  if (!GRIZZLY_KEY) return ctx.reply('GRIZZLYSMS_API_KEY not set on server.');
+  if (!GRIZZLY_KEY) return ctx.reply('Server key never set for backend o — abeg tell admin.');
   const bal = await grizzlyBalance();
-  if (bal == null) return ctx.reply('Grizzly: OFFLINE');
-  await ctx.reply(`*Grizzly (Server 1):* ONLINE\nSupplier balance: \`${bal}\``, {
+  if (bal == null) return ctx.reply('Server 1 dey OFFLINE right now. Try again small time.');
+  await ctx.reply(`*Server 1:* dey ONLINE ✅\nWe get enough stock to serve you.`, {
     parse_mode: 'Markdown'
   });
 });
 
 bot.command('fund', async (ctx) => {
   if (!PAYSTACK_SECRET_KEY) {
-    return ctx.reply('Funding is managed on the MJ HUB website wallet for now. Ask admin if you need a top-up here.');
+    return ctx.reply('E get one way to fund here for now — abeg go MJ HUB website and top up your wallet there, boss.');
   }
-  await ctx.reply('Send amount in Naira, e.g. `5000`', { parse_mode: 'Markdown' });
+  await ctx.reply('Send the amount for Naira, e.g. `5000`', { parse_mode: 'Markdown' });
 });
 
 // Buy callback: buy:countryId:serviceId:priceNgn
@@ -353,13 +353,13 @@ bot.action(/^buy:(\d+):([^:]+):(\d+)$/, async (ctx) => {
   const session = await getUserSession(userId);
 
   if (price > 0 && session.balance < price) {
-    return ctx.reply('Insufficient balance. Use /fund or top up on MJ HUB.');
+    return ctx.reply('E be like say your balance no reach o. Use /fund or top up on MJ HUB first.');
   }
 
-  await ctx.reply('Buying number…');
+  await ctx.reply('Dey buy your number… hold on small.');
   const bought = await grizzlyBuy(serviceId, countryId);
   if (!bought.success) {
-    return ctx.reply(`Failed: ${bought.message || 'No number'}`);
+    return ctx.reply(`E no work o: ${bought.message || 'no number available'}. Try again.`);
   }
 
   if (price > 0) {
@@ -378,7 +378,7 @@ bot.action(/^buy:(\d+):([^:]+):(\d+)$/, async (ctx) => {
   await saveUserSession(userId, session);
 
   await ctx.reply(
-    `Number ready\n📞 \`${bought.number}\`\n🆔 \`${bought.order_id}\`\n\nTap below when the SMS arrives (or every ~10s).`,
+    `Your number don ready! 🎉\n📞 \`${bought.number}\`\n🆔 \`${bought.order_id}\`\n\nTap "Check SMS code" below when the message land (or check am every 10 seconds or so).`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
@@ -400,9 +400,9 @@ bot.action(/^chk:([^:]+):(\d+)$/, async (ctx) => {
       String(o.orderId) === String(orderId) ? { ...o, status: `Code: ${st.code}` } : o
     );
     await saveUserSession(ctx.from.id, session);
-    return ctx.reply(`Code: *${st.code}*`, { parse_mode: 'Markdown' });
+    return ctx.reply(`Code don land! *${st.code}* 🎉`, { parse_mode: 'Markdown' });
   }
-  return ctx.reply(st.waiting ? 'Still waiting for SMS… tap Check again.' : `Status: ${st.message || 'waiting'}`);
+  return ctx.reply(st.waiting ? 'Message never land yet… tap Check again small time.' : `Status: ${st.message || 'still dey wait'}`);
 });
 
 bot.action(/^can:([^:]+):(\d+)$/, async (ctx) => {
@@ -418,7 +418,7 @@ bot.action(/^can:([^:]+):(\d+)$/, async (ctx) => {
     );
     await saveUserSession(ctx.from.id, session);
   }
-  await ctx.reply(price > 0 ? `Cancelled. ₦${price} refunded.` : 'Cancelled.');
+  await ctx.reply(price > 0 ? `Cancelled ✅ ₦${price} don enter your wallet back.` : 'Cancelled ✅');
 });
 
 bot.on('text', async (ctx) => {
@@ -428,15 +428,15 @@ bot.on('text', async (ctx) => {
   const parsed = parseCountryService(text);
   if (!parsed.countryId) {
     return ctx.reply(
-      'Tell me country + app in one message.\nExamples: *USA WhatsApp*, *Nigeria Telegram*, *UK Google*',
+      'Abeg tell me country + app for one message, my guy.\nLike this: *USA WhatsApp*, *Nigeria Telegram*, *UK Google*',
       { parse_mode: 'Markdown' }
     );
   }
 
-  await ctx.reply(`Checking Grizzly for *${parsed.countryName}*…`, { parse_mode: 'Markdown' });
+  await ctx.reply(`Dey check Server 1 for *${parsed.countryName}*… hold on.`, { parse_mode: 'Markdown' });
   let list = await grizzlyPrices(parsed.countryId);
   if (!list.length) {
-    return ctx.reply('No services returned for that country right now. Try another.');
+    return ctx.reply('E no get service for that country right now o. Try another one.');
   }
   if (parsed.serviceCode || parsed.serviceName) {
     list = matchServices(list, parsed.serviceName || parsed.serviceCode);
@@ -456,7 +456,7 @@ bot.on('text', async (ctx) => {
   ]);
 
   await ctx.reply(
-    `*Grizzly · Server 1*\nCountry: ${parsed.countryName} (${parsed.countryId})\nPick a service:`,
+    `*Server 1*\nCountry: ${parsed.countryName} (${parsed.countryId})\nPick the service wey you want:`,
     { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
   );
 });
@@ -513,7 +513,7 @@ module.exports = async (req, res) => {
     if (req.method === 'GET') {
       res.statusCode = 200;
       res.setHeader('Content-Type', 'text/plain');
-      return res.end('MJ SMS Bot (Grizzly Server 1) — Vercel');
+      return res.end('MJ SMS Bot (Server 1) — Vercel');
     }
 
     if (req.method === 'POST') {
