@@ -302,7 +302,48 @@ function matchServices(list, query) {
   return hit.length ? hit.slice(0, 12) : list.slice(0, 12);
 }
 
-// ---------- Bot commands ----------
+// ---------- Gemini AI assistant ----------
+// Used as the fallback when a message doesn't parse as "country + service" —
+// instead of only ever showing the same static hint, it lets the bot answer
+// real questions about MJ HUB / MJ SMS in a natural, conversational way.
+// GEMINI_API_KEY was declared before but never actually called anywhere in
+// this file — this is that wiring. If the key is missing, the call fails,
+// or Gemini is having a bad day, this always falls back to a real, useful
+// static reply (never a raw error, never silence) so the bot keeps working
+// even when the AI layer doesn't.
+
+const GEMINI_SYSTEM_PROMPT = `You are the assistant inside "MJ SMS", a Telegram bot that is part of MJ HUB — a Nigerian website selling temporary/virtual phone numbers for SMS verification (WhatsApp, Telegram, Google, and more), plus other digital services.
+
+How you talk: warm, friendly Nigerian Pidgin naturally mixed with English — like a helpful guy at a shop, not a corporate support bot. Keep replies short (2-4 sentences max), never robotic, never overly formal.
+
+What you know: MJ SMS lets people type a country + app (e.g. "USA WhatsApp", "Nigeria Telegram") to see available numbers and buy one. Commands: /balance (wallet), /fund (top up — done on the MJ HUB website), /orders (order history), /status (is the server up).
+
+Your job here specifically: the user just sent a message that did NOT match the "country + app" format the bot needs to sell them a number. Either:
+1. If they're asking a real question (about the website, how it works, pricing, refunds, anything) — answer it helpfully and briefly, in-character.
+2. If it's unclear what they want, or they just made a typo — gently nudge them toward the right format, with an example like "USA WhatsApp".
+
+Never make up specific prices, balances, or order details — you don't have access to their account data here. For anything account-specific, point them to the right command (/balance, /orders, etc).`;
+
+async function askGemini(userMessage) {
+  if (!GEMINI_API_KEY) return null;
+  try {
+    const res = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        system_instruction: { parts: [{ text: GEMINI_SYSTEM_PROMPT }] },
+        contents: [{ role: 'user', parts: [{ text: userMessage }] }],
+        generationConfig: { maxOutputTokens: 200, temperature: 0.8 }
+      },
+      { timeout: 12000, headers: { 'Content-Type': 'application/json' } }
+    );
+    const reply = res.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    return reply ? reply.trim() : null;
+  } catch (e) {
+    console.error('askGemini', e.response?.data || e.message);
+    return null;
+  }
+}
+
 
 bot.start(async (ctx) => {
   await ctx.reply(
@@ -427,8 +468,13 @@ bot.on('text', async (ctx) => {
 
   const parsed = parseCountryService(text);
   if (!parsed.countryId) {
+    await ctx.sendChatAction('typing').catch(() => {});
+    const aiReply = await askGemini(text);
+    if (aiReply) return ctx.reply(aiReply);
+
+    // Gemini not configured or the call failed — still a real, complete answer.
     return ctx.reply(
-      'Abeg tell me country + app for one message, my guy.\nLike this: *USA WhatsApp*, *Nigeria Telegram*, *UK Google*',
+      'Wagwan My Boss… 👋\n\nAbeg tell me country + service for one message, my guy.\nLike this: *USA WhatsApp*, *Nigeria Telegram*, *UK Google*',
       { parse_mode: 'Markdown' }
     );
   }
