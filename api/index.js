@@ -89,8 +89,15 @@ const sbHeaders = {
 function markupNgn(usdPrice) {
   const n = Number(usdPrice) || 0;
   const ngn = n * USD_TO_NGN;
-  // Same spirit as site: sell above cost (~50% markup midpoint)
-  return Math.ceil(ngn * 1.5);
+  // MUST match lib/pricing.js's applyMarkup() on the main site exactly —
+  // otherwise the same GrizzlySMS number sells at a different price
+  // depending on whether the customer buys through the website or this
+  // bot, which is a real pricing-integrity/profit-control problem, not
+  // just a cosmetic inconsistency. If you ever change the range on the
+  // website (currently 40–85%, updated 2026-08-04), update it here too.
+  const percent = 40 + Math.random() * 45;
+  const finalPrice = Math.ceil(ngn * (1 + percent / 100));
+  return Math.ceil(finalPrice / 50) * 50;
 }
 
 async function getUserSession(userId) {
@@ -255,15 +262,25 @@ function parseCountryService(text) {
   let serviceCode = null;
   let serviceName = null;
 
-  for (const [name, id] of Object.entries(COUNTRY_MAP)) {
-    if (t.includes(name)) {
+  // Word-boundary matching, not substring .includes() — this function reads
+  // every free-text message a user sends (see bot.on('text', ...)), and
+  // short 2-letter codes like 'in', 'us', 'ng', 'ca' as raw substrings would
+  // false-match inside completely unrelated words ('finish', 'joining',
+  // 'buying', 'canada'... wait even 'canada' contains 'ca' — exactly this
+  // class of bug). \b ensures 'us' matches the standalone word "us", not
+  // the middle of "trust" or "custom". Longer names are checked first so
+  // e.g. "united states" wins over a shorter unrelated partial match.
+  const countryEntries = Object.entries(COUNTRY_MAP).sort((a, b) => b[0].length - a[0].length);
+  for (const [name, id] of countryEntries) {
+    if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(t)) {
       countryId = id;
       countryName = name;
       break;
     }
   }
-  for (const [name, code] of Object.entries(SERVICE_MAP)) {
-    if (t.includes(name)) {
+  const serviceEntries = Object.entries(SERVICE_MAP).sort((a, b) => b[0].length - a[0].length);
+  for (const [name, code] of serviceEntries) {
+    if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(t)) {
       serviceCode = code;
       serviceName = name;
       break;
@@ -453,17 +470,44 @@ module.exports = async (req, res) => {
     const host = req.headers['x-forwarded-host'] || req.headers.host || '';
     const proto = req.headers['x-forwarded-proto'] || 'https';
     const base = `${proto}://${host}`;
+    const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 
     if (req.method === 'GET' && (req.url === '/setup-webhook' || req.url?.startsWith('/setup-webhook'))) {
       if (!BOT_TOKEN) {
         res.statusCode = 500;
         return res.end('BOT_TOKEN missing');
       }
+      // This endpoint re-registers where Telegram sends your bot's traffic.
+      // Previously it had zero auth — anyone who found this URL could hit
+      // it (harmless-looking, since it always points back to this same
+      // deployment) but it also silently drops any messages that arrived
+      // in the moments before someone else re-ran it (drop_pending_updates)
+      // — a cheap way to disrupt real users. Now requires WEBHOOK_SECRET as
+      // a query param if that env var is set.
+      if (WEBHOOK_SECRET) {
+        const providedSecret = new URL(base + req.url).searchParams.get('secret');
+        if (providedSecret !== WEBHOOK_SECRET) {
+          res.statusCode = 401;
+          return res.end('Unauthorized — pass ?secret=YOUR_WEBHOOK_SECRET');
+        }
+      }
       const url = `${base}/api`;
-      await bot.telegram.setWebhook(url, { drop_pending_updates: true });
+      await bot.telegram.setWebhook(url, {
+        drop_pending_updates: true,
+        // Telegram echoes this back on every real update as the
+        // X-Telegram-Bot-Api-Secret-Token header — validated below on
+        // every POST, so requests NOT actually from Telegram get rejected
+        // instead of being processed as if a real user sent them.
+        ...(WEBHOOK_SECRET ? { secret_token: WEBHOOK_SECRET } : {})
+      });
       res.statusCode = 200;
       res.setHeader('Content-Type', 'application/json');
-      return res.end(JSON.stringify({ ok: true, webhook: url }));
+      return res.end(JSON.stringify({
+        ok: true,
+        webhook: url,
+        secured: !!WEBHOOK_SECRET,
+        warning: WEBHOOK_SECRET ? undefined : 'WEBHOOK_SECRET is not set — this webhook accepts requests from anyone, not just Telegram. Set WEBHOOK_SECRET and re-run this endpoint.'
+      }));
     }
 
     if (req.method === 'GET') {
@@ -473,6 +517,10 @@ module.exports = async (req, res) => {
     }
 
     if (req.method === 'POST') {
+      if (WEBHOOK_SECRET && req.headers['x-telegram-bot-api-secret-token'] !== WEBHOOK_SECRET) {
+        res.statusCode = 401;
+        return res.end('unauthorized');
+      }
       await bot.handleUpdate(req.body);
       res.statusCode = 200;
       return res.end('ok');
