@@ -1,0 +1,16 @@
+{
+  "name": "mj-sms-telegram-bot",
+  "version": "2.0.0",
+  "description": "MJ SMS Telegram bot — GrizzlySMS only, Vercel webhook",
+  "main": "api/index.js",
+  "scripts": {
+    "start": "node api/index.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "telegraf": "^4.16.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
