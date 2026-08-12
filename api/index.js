@@ -285,7 +285,7 @@ async function grizzlyBalance() {
 // old rigid parseCountryService flow below instead of breaking.
 // ===========================================================================
 
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 const MAX_CONVERSATION_TURNS = 16;
 const MAX_TOOL_ROUNDTRIPS = 6;
@@ -309,7 +309,7 @@ HOW FLOW DEY WORK:
 4) If dem ready to buy, confirm country + app once, then CALL buy_number.
 5) After buy success, give the phone number clear, tell dem go request the code for the app, then dem fit just type "check code" or "e reach?" anytime. You go CALL check_status.
 6) If dem wan cancel, CALL cancel_order. If refund enter, tell dem new balance.
-7) If balance low, CALL get_balance, then offer create_payment with amount dem fit afford (or suggest amount slightly above the number price). Give dem the Paystack link from the tool. After dem pay, dem fit say "I don pay" and you CALL verify_payment.
+7) If balance low, CALL get_balance, then ask how much dem wan fund (minimum ₦1,000, maximum ₦200,000), then CALL create_payment with that amount. Give dem the Paystack link from the tool. After dem pay, dem fit say "I don pay" and you CALL verify_payment.
 8) /balance /orders still work but you handle everything by chat.
 
 TONE AND LANGUAGE RULES (VERY IMPORTANT):
@@ -421,7 +421,7 @@ async function paystackInitialize(amountNgn, telegramUserId, email) {
     console.error('PAYSTACK_SECRET_KEY missing on this deployment');
     return { success: false, message: 'Paystack no dey configured yet. Abeg set PAYSTACK_SECRET_KEY on Vercel and redeploy.' };
   }
-  const amount = Math.max(500, Math.ceil(Number(amountNgn) || 0));
+  const amount = Math.min(200000, Math.max(1000, Math.ceil(Number(amountNgn) || 0)));
   const reference = `MJSMS_${telegramUserId}_${Date.now()}`;
   const mail = (email && String(email).includes('@'))
     ? String(email).trim()
@@ -619,15 +619,19 @@ async function executeGeminiFunction(fnName, args, telegramUserId, session) {
       return { orders: (session.orders || []).slice(-10) };
 
     case 'create_payment': {
-      const amount = Math.max(500, Math.ceil(Number(args.amount_ngn) || 0));
-      if (!amount || amount < 500) {
-        return { error: 'Minimum fund na ₦500.' };
+      let amount = Math.ceil(Number(args.amount_ngn) || 0);
+      if (!amount || amount < 1000) {
+        return { error: 'Minimum fund na ₦1,000. Ask the user how much (1,000 to 200,000).' };
+      }
+      if (amount > 200000) {
+        return { error: 'Maximum fund na ₦200,000 per payment. Ask them to pick within range.' };
       }
       const init = await paystackInitialize(amount, telegramUserId, args.email);
       if (!init.success) return { error: init.message || 'Could not create payment link' };
       session.pending_payment = {
         reference: init.reference,
         amount_ngn: init.amount_ngn,
+        authorization_url: init.authorization_url,
         created_at: new Date().toISOString()
       };
       return {
@@ -635,7 +639,7 @@ async function executeGeminiFunction(fnName, args, telegramUserId, session) {
         amount_ngn: init.amount_ngn,
         reference: init.reference,
         payment_link: init.authorization_url,
-        message: 'Send this Paystack link to the customer. After they pay they should say "I don pay" so you can verify.'
+        message: 'Give customer the payment_link. Tell them to tap Pay here. After payment they should say I don pay.'
       };
     }
 
@@ -820,7 +824,19 @@ bot.command('status', async (ctx) => {
 
 bot.command('fund', async (ctx) => {
   const parts = (ctx.message.text || '').trim().split(/\s+/);
-  const amount = Math.max(500, parseInt(parts[1], 10) || 1000);
+  const raw = parts[1];
+  if (!raw) {
+    return ctx.reply(
+      'How much you wan fund?\n\nMinimum ₦1,000\nMaximum ₦200,000\n\nExample: /fund 5000'
+    );
+  }
+  let amount = parseInt(String(raw).replace(/[^\d]/g, ''), 10) || 0;
+  if (amount < 1000) {
+    return ctx.reply('Minimum fund na ₦1,000. Try again e.g. /fund 1000');
+  }
+  if (amount > 200000) {
+    return ctx.reply('Maximum fund na ₦200,000 for one payment. Try smaller amount.');
+  }
   const session = await getUserSession(ctx.from.id);
   const init = await paystackInitialize(amount, ctx.from.id, null);
   if (!init.success) {
@@ -833,7 +849,10 @@ bot.command('fund', async (ctx) => {
   };
   await saveUserSession(ctx.from.id, session);
   await ctx.reply(
-    `Fund wallet ₦${init.amount_ngn.toLocaleString()}\n\nPay here:\n${init.authorization_url}\n\nAfter payment, type: I don pay\nRef: ${init.reference}`
+    `Fund wallet ₦${init.amount_ngn.toLocaleString()}\n\nTap the button below to pay.\nAfter payment, type: I don pay\nRef: ${init.reference}`,
+    Markup.inlineKeyboard([
+      [Markup.button.url('💳 Pay here', init.authorization_url)]
+    ])
   );
 });
 
@@ -931,12 +950,26 @@ bot.on('text', async (ctx) => {
     // Supabase) doesn't grow unbounded across a long-running conversation.
     session.conversation = contents.slice(-MAX_CONVERSATION_TURNS);
     await saveUserSession(userId, session);
+    // If Mira just created a Paystack link, attach a tappable Pay button
+    const payUrlMatch = String(reply).match(/https:\/\/checkout\.paystack\.com\/\S+/i)
+      || (session.pending_payment && session.pending_payment.authorization_url
+        ? [session.pending_payment.authorization_url]
+        : null);
+    // Also detect link stored from last tool via pending
+    let payUrl = null;
+    if (session.pending_payment && session.pending_payment.authorization_url) {
+      payUrl = session.pending_payment.authorization_url;
+    } else if (payUrlMatch) {
+      payUrl = payUrlMatch[0].replace(/[)\].,]+$/, '');
+    }
+
+    const sendOpts = payUrl
+      ? Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', payUrl)]])
+      : {};
     try {
-      await ctx.reply(reply, { parse_mode: 'Markdown' });
+      await ctx.reply(reply, { parse_mode: 'Markdown', ...sendOpts });
     } catch (_) {
-      // Markdown parse errors (e.g. stray * or _ in the reply) shouldn't
-      // eat the whole reply — retry once as plain text.
-      await ctx.reply(reply);
+      await ctx.reply(reply, sendOpts);
     }
     return;
   }
