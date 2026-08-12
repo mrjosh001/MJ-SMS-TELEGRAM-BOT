@@ -195,6 +195,44 @@ const bot = new Telegraf(BOT_TOKEN || 'missing');
 
 // Fallback store when Supabase session save fails (400/404)
 const pendingPayments = new Map(); // telegramUserId -> { reference, amount_ngn, authorization_url }
+/** In-memory intent (survives within warm serverless instance; backed by Supabase too) */
+const pendingIntent = new Map(); // userId -> { service, countryId, countryName, at }
+
+function setIntent(userId, data) {
+  pendingIntent.set(String(userId), { ...data, at: Date.now() });
+}
+function getIntent(userId) {
+  const p = pendingIntent.get(String(userId));
+  if (!p) return null;
+  if (Date.now() - p.at > 45 * 60 * 1000) {
+    pendingIntent.delete(String(userId));
+    return null;
+  }
+  return p;
+}
+function clearIntent(userId) {
+  pendingIntent.delete(String(userId));
+}
+
+/** If user replied to a bot message, pull service/country hints from that message */
+function contextFromReply(ctx) {
+  const rt = ctx.message?.reply_to_message;
+  if (!rt || !rt.text) return {};
+  const t = String(rt.text);
+  const out = {};
+  const forSvc = t.match(/country for\s+([a-z0-9][a-z0-9\s]{0,30}?)\??$/i)
+    || t.match(/for\s+(whatsapp|telegram|instagram|google|facebook|tiktok|snapchat|discord)\??/i);
+  if (forSvc) out.service = forSvc[1].trim();
+  const appFor = t.match(/app for\s+([a-z][a-z\s]{1,30}?)\??$/i);
+  if (appFor) out.country = appFor[1].trim();
+  const checking = t.match(/Checking\s+([^·\n]+)(?:·\s*(\S+))?/i);
+  if (checking) {
+    out.country = out.country || checking[1].trim();
+    if (checking[2]) out.service = out.service || checking[2].trim();
+  }
+  return out;
+}
+
 const creditedRefs = new Set();
 
 const axiosCfg = {
@@ -2008,7 +2046,9 @@ bot.action(/^buy:(\d+):([^:]+):(\d+)$/, async (ctx) => {
     return ctx.reply(
       /502|503|gateway|unreachable|timeout/i.test(String(bought.message || ''))
         ? 'Supplier temporarily unavailable. Abeg try again in a few minutes.'
-        : `Failed: ${bought.message || 'No number'}`
+        : /NO_NUMBERS/i.test(String(bought.message || ''))
+          ? 'No stock for that country/app right now. Try another country.'
+          : `Failed: ${bought.message || 'No number'}`
     );
   }
 
@@ -2238,9 +2278,11 @@ async function miraShowPricesAndConfirm(ctx, session, userId, countryId, country
   if (!list.length) {
     session.state = 'AWAITING_INPUT';
     session.pendingService = null;
+    clearIntent(userId);
     await saveUserSession(userId, session);
     return ctx.reply(MIRA.noStock);
   }
+  setIntent(userId, { service: serviceQuery, countryId, countryName });
 
   session.country = countryName;
   session.countryId = countryId;
@@ -2282,6 +2324,26 @@ async function miraShowPricesAndConfirm(ctx, session, userId, countryId, country
 async function miraHandleSmartText(ctx, session, userId, textMsg) {
   const lower = String(textMsg || '').trim().toLowerCase();
   let state = session.state || 'AWAITING_INPUT';
+
+  // Merge: memory intent + supabase session + reply-to message
+  const mem = getIntent(userId) || {};
+  const replyCtx = contextFromReply(ctx);
+  if (replyCtx.service && !session.pendingService) {
+    session.pendingService = replyCtx.service;
+    session.serviceQuery = replyCtx.service;
+  }
+  if (mem.service && !session.pendingService) {
+    session.pendingService = mem.service;
+    session.serviceQuery = mem.service;
+  }
+  if (mem.countryId && !session.countryId) {
+    session.countryId = mem.countryId;
+    session.country = mem.countryName || session.country;
+  }
+  if (mem.service && !state.startsWith('AWAITING')) {
+    state = 'AWAITING_COUNTRY';
+    session.state = 'AWAITING_COUNTRY';
+  }
 
   // --- Confirm ---
   if (state === 'AWAITING_CONFIRM') {
@@ -2347,14 +2409,17 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
   }
 
   // --- Waiting for country (service already known) ---
-  if (state === 'AWAITING_COUNTRY' || (session.pendingService || session.serviceQuery)) {
+  {
+    const svcPending = session.pendingService || session.serviceQuery || mem.service || replyCtx.service;
     const c = await resolveCountryStrict(textMsg);
-    if (c && (session.pendingService || session.serviceQuery)) {
-      const svc = session.pendingService || session.serviceQuery || '';
-      return miraShowPricesAndConfirm(ctx, session, userId, c.id, c.name, svc);
+    if (c && svcPending) {
+      return miraShowPricesAndConfirm(ctx, session, userId, c.id, c.name, svcPending);
     }
-    if (state === 'AWAITING_COUNTRY' && !c) {
-      return ctx.reply(`Which country for ${session.pendingService || session.serviceQuery || 'WhatsApp'}?`);
+    if ((state === 'AWAITING_COUNTRY' || svcPending) && !c && !detectServiceOnly(textMsg)) {
+      return ctx.reply(
+        `Which country for ${svcPending || 'the number'}?\n\n_Reply with country name_`,
+        { parse_mode: 'Markdown' }
+      );
     }
   }
 
@@ -2431,19 +2496,31 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
     session.pendingService = svc.serviceName || svc.serviceCode;
     session.serviceQuery = session.pendingService;
     session.state = 'AWAITING_COUNTRY';
-    // keep country if any; don't wipe blindly
+    setIntent(userId, { service: session.pendingService });
     await saveUserSession(userId, session);
-    return ctx.reply(MIRA.askCountry(session.pendingService));
+    // Ask as reply-friendly text so user can reply to this message
+    return ctx.reply(
+      `Which country for ${session.pendingService}?\n\n_Reply to this message with the country_`,
+      { parse_mode: 'Markdown' }
+    );
   }
 
   // Country only (no pending service) → ask service
   if (countryGuess) {
+    // If reply/memory already has service, process now
+    const svcNow = session.pendingService || session.serviceQuery || replyCtx.service || mem.service;
+    if (svcNow) {
+      return miraShowPricesAndConfirm(ctx, session, userId, countryGuess.id, countryGuess.name, svcNow);
+    }
     session.countryId = countryGuess.id;
     session.country = countryGuess.name;
     session.state = 'AWAITING_SERVICE';
-    // do not clear pendingService if somehow set
+    setIntent(userId, { countryId: countryGuess.id, countryName: countryGuess.name });
     await saveUserSession(userId, session);
-    return ctx.reply(`Which app for ${asName(countryGuess.name)}?`);
+    return ctx.reply(
+      `Which app for ${asName(countryGuess.name)}?\n\n_Reply to this message with the app_`,
+      { parse_mode: 'Markdown' }
+    );
   }
 
   if (looksLikeNeedNumber(textMsg)) {
