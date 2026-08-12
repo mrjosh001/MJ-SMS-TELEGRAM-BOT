@@ -1860,13 +1860,29 @@ bot.command('status', async (ctx) => {
 bot.command('fund', async (ctx) => {
   const parts = (ctx.message.text || '').trim().split(/\s+/);
   const raw = parts[1];
-  if (!raw) {
-    return ctx.reply('How much you wan fund?\n\nMin ₦1,000 · Max ₦200,000\n\nExample: /fund 5000');
-  }
-  let amount = parseInt(String(raw).replace(/[^\d]/g, ''), 10) || 0;
-  if (amount < 1000) return ctx.reply('Minimum na ₦1,000. Example: /fund 1000');
-  if (amount > 200000) return ctx.reply('Maximum na ₦200,000 for one payment.');
   const session = await getUserSession(ctx.from.id);
+
+  // /fund with no amount → ask and WAIT for next message as the amount
+  if (!raw) {
+    session.state = 'AWAITING_FUND_AMOUNT';
+    await saveUserSession(ctx.from.id, session);
+    return ctx.reply(
+      'How much you wan fund?\n\nMin ₦1,000 · Max ₦200,000\n\nExample: 5000\n(or type /fund 5000)'
+    );
+  }
+
+  let amount = parseInt(String(raw).replace(/[^\d]/g, ''), 10) || 0;
+  if (amount < 1000) {
+    session.state = 'AWAITING_FUND_AMOUNT';
+    await saveUserSession(ctx.from.id, session);
+    return ctx.reply('Minimum na ₦1,000. Example: 5000 (or /fund 5000)');
+  }
+  if (amount > 200000) {
+    session.state = 'AWAITING_FUND_AMOUNT';
+    await saveUserSession(ctx.from.id, session);
+    return ctx.reply('Maximum na ₦200,000 for one payment. Example: 50000');
+  }
+
   const init = await paystackInitialize(amount, ctx.from.id, null);
   if (!init.success) {
     return ctx.reply(init.message || 'Paystack no gree right now.');
@@ -1878,6 +1894,7 @@ bot.command('fund', async (ctx) => {
     created_at: new Date().toISOString()
   };
   session.pending_payment = pending;
+  session.state = 'AWAITING_INPUT';
   pendingPayments.set(String(ctx.from.id), pending);
   await saveUserSession(ctx.from.id, session);
   await ctx.reply(
