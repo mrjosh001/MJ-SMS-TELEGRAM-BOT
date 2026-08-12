@@ -255,6 +255,93 @@ async function grizzlyGet(params) {
   return res.data;
 }
 
+// Live country cache from Grizzly (full list, not hardcoded map only)
+let _countryCache = null;
+let _countryCacheAt = 0;
+const COUNTRY_CACHE_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+async function grizzlyCountries() {
+  const now = Date.now();
+  if (_countryCache && now - _countryCacheAt < COUNTRY_CACHE_MS) return _countryCache;
+  try {
+    const data = await grizzlyGet({ action: 'getCountries' });
+    const list = [];
+    if (Array.isArray(data)) {
+      for (const c of data) {
+        const id = Number(c.id ?? c.country ?? c.code ?? c.country_id);
+        const name = String(c.eng || c.english || c.name || c.country_name || c.title || '').trim();
+        if (Number.isFinite(id) && id >= 0 && name) list.push({ id, name });
+      }
+    } else if (data && typeof data === 'object') {
+      for (const [k, info] of Object.entries(data)) {
+        const id = Number(info?.id ?? info?.country ?? k);
+        const name = String(info?.eng || info?.english || info?.name || info?.country_name || '').trim();
+        if (Number.isFinite(id) && id >= 0 && name) list.push({ id, name });
+      }
+    }
+    if (list.length) {
+      _countryCache = list;
+      _countryCacheAt = now;
+      console.log('[countries] loaded from Grizzly:', list.length);
+      return list;
+    }
+  } catch (e) {
+    console.error('grizzlyCountries', e.message);
+  }
+  // Fallback: unique ids from COUNTRY_MAP
+  const byId = new Map();
+  for (const [name, id] of Object.entries(COUNTRY_MAP)) {
+    if (name.length <= 2) continue;
+    if (!byId.has(id)) byId.set(id, name);
+  }
+  return [...byId.entries()].map(([id, name]) => ({ id, name }));
+}
+
+async function fetchHubPriceByServiceIds(countryId, serviceIds) {
+  if (!MJ_HUB_REST_URL || !MJ_HUB_SERVICE_KEY) return new Map();
+  const ids = [...new Set((serviceIds || []).map((s) => String(s).trim()).filter(Boolean))];
+  if (!ids.length) return new Map();
+  const priceMap = new Map(); // key: service_id lower -> hub row
+  const select =
+    'id,service_id,service_name,country_id,country_name,price,available_quantity,is_available,supplier_price';
+  // Batch in chunks of 25 to keep URL reasonable
+  for (let i = 0; i < ids.length; i += 25) {
+    const chunk = ids.slice(i, i + 25);
+    const inList = chunk.map((id) => `"${String(id).replace(/"/g, '')}"`).join(',');
+    try {
+      let url =
+        `${MJ_HUB_REST_URL}/number_services?select=${select}` +
+        `&country_id=eq.${encodeURIComponent(countryId)}` +
+        `&service_id=in.(${inList})` +
+        `&price=gt.0&order=price.asc&limit=100`;
+      let res = await axios.get(url, { ...axiosCfg, headers: mjHubHeaders });
+      let rows = Array.isArray(res.data) ? res.data : [];
+      for (const r of rows) {
+        if (r.is_available === false || r.is_available === 'false') continue;
+        const sid = String(r.service_id || '').toLowerCase();
+        const price = Math.ceil(Number(r.price) || 0);
+        if (!(price > 0) || !sid) continue;
+        const prev = priceMap.get(sid);
+        if (!prev || price < prev.price_ngn) {
+          priceMap.set(sid, {
+            service_id: String(r.service_id),
+            service_name: friendlyServiceName(r.service_id, r.service_name),
+            price_ngn: price,
+            stock: Number(r.available_quantity) || 0,
+            price_usd: Number(r.supplier_price) || 0,
+            hub_id: r.id,
+            country_name: r.country_name || null,
+            source: 'hub'
+          });
+        }
+      }
+    } catch (e) {
+      console.error('fetchHubPriceByServiceIds', e.response?.status, e.message);
+    }
+  }
+  return priceMap;
+}
+
 async function grizzlyPrices(countryId) {
   try {
     const data = await grizzlyGet({ action: 'getPricesV3', country: String(countryId) });
@@ -423,23 +510,65 @@ async function fetchHubServices(countryId, serviceFilter) {
 }
 
 async function getSellableServices(countryId, serviceFilter) {
-  const hub = await fetchHubServices(countryId, serviceFilter);
-  if (hub.length) {
-    console.log('[prices] using MJ HUB number_services', countryId, serviceFilter, hub.length, 'rows', hub.map(h => h.service_id + ':' + h.price_ngn).join(','));
-    return hub;
-  }
-  // Fallback only if Hub catalog empty for this country/app
-  console.warn('[prices] HUB empty — falling back to live Grizzly markup', countryId, serviceFilter);
+  // 1) Full service catalog from Grizzly for this country
   let live = await grizzlyPrices(countryId);
   if (serviceFilter) live = matchServices(live, serviceFilter);
-  // Website floor: never sell below ₦1000 on fallback path
+  if (!live.length) {
+    // Secondary: try hub-only list if Grizzly empty
+    const hubOnly = await fetchHubServices(countryId, serviceFilter);
+    if (hubOnly.length) {
+      console.log('[prices] Grizzly empty — using hub-only', countryId, serviceFilter, hubOnly.length);
+      return hubOnly;
+    }
+    return [];
+  }
+
+  // 2) Pull MJ HUB selling prices by exact service_id (+ country_id)
+  const hubMap = await fetchHubPriceByServiceIds(
+    countryId,
+    live.map((s) => s.service_id)
+  );
+
   const MIN_SALE = Number(process.env.MIN_NUMBER_PRICE_NGN) || 1000;
-  return live.map((s) => ({ ...s, price_ngn: Math.max(MIN_SALE, Number(s.price_ngn) || 0) }));
+  const out = live.map((s) => {
+    const sid = String(s.service_id).toLowerCase();
+    const hub = hubMap.get(sid);
+    if (hub) {
+      return {
+        ...s,
+        service_name: hub.service_name || s.service_name,
+        price_ngn: hub.price_ngn,
+        stock: hub.stock > 0 ? hub.stock : s.stock,
+        price_usd: hub.price_usd || s.price_usd,
+        source: 'hub',
+        hub_id: hub.hub_id,
+        country_name: hub.country_name || null
+      };
+    }
+    // No hub row for this service_id → live Grizzly markup (floor)
+    return {
+      ...s,
+      price_ngn: Math.max(MIN_SALE, Number(s.price_ngn) || 0),
+      source: 'live_grizzly'
+    };
+  });
+
+  const hubCount = out.filter((s) => s.source === 'hub').length;
+  console.log(
+    '[prices] grizzly services',
+    live.length,
+    '| hub matched by service_id',
+    hubCount,
+    '| country',
+    countryId,
+    serviceFilter || '(all)'
+  );
+  return out;
 }
 
 function optionButtons(countryId, services) {
   // Telegram inline keyboard: 1 option per row for clarity (Normal vs Virtual)
-  const rows = services.slice(0, 8).map((s) => {
+  const rows = services.slice(0, 12).map((s) => {
     const label = `${s.variant === 'virtual' ? '👻 Virtual' : '📱 Normal'} · ${s.service_name} · ₦${Number(s.price_ngn).toLocaleString()}`;
     // opt:countryId:serviceCode:price
     const data = `opt:${countryId}:${s.service_id}:${s.price_ngn}`;
@@ -521,7 +650,7 @@ const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GE
 const MAX_CONVERSATION_TURNS = 16;
 const MAX_TOOL_ROUNDTRIPS = 6;
 
-const GEMINI_SYSTEM_PROMPT = `You be Mira. You work for MJ SMS under MJ HUB (Server 1 powered by GrizzlySMS). You be real human support and sales for Telegram. You no be AI, robot, or system.
+const GEMINI_SYSTEM_PROMPT = `You be Mira. You work for MJ SMS under MJ HUB. You be real human support and sales for Telegram. You no be AI, robot, or system.
 
 VOICE:
 Natural Nigerian WhatsApp chat. Pidgin + simple English. Short. Fluent. Warm. Street-smart. No essays, no bullet walls, no "As an AI", no re-intro every message. Continue the same conversation.
@@ -531,7 +660,7 @@ MJ HUB na digital services marketplace with one ecosystem:
 1) MJ SMS — temporary real mobile numbers for SMS OTP verification
 2) MJ Logs — premium verified social accounts (website)
 3) MJ Boosters — social growth (Instagram, TikTok, YouTube, etc. on website)
-This Telegram bot handles MJ SMS Server 1 (GrizzlySMS) only.
+This Telegram bot handles MJ SMS number verification only.
 
 MJ SMS HOW E DEY WORK:
 - Customer pick country + app (WhatsApp, Telegram, Google, Instagram, Facebook, TikTok, Snapchat, Discord, Microsoft, Apple, etc.)
@@ -541,7 +670,7 @@ MJ SMS HOW E DEY WORK:
 - SMS code land → dem ask you to check → you give the code
 - One number = one verification cycle. After code, dem free
 - If code never come and still eligible, cancel fit refund wallet
-- Numbers from Grizzly are real mobile routes for OTP (not random VOIP spam lines). Some countries still show more than one option for the same app (e.g. Normal vs Virtual / alternate routes). Prices and stock change live.
+- Numbers are real mobile routes for OTP (not random VOIP spam lines). Some countries still show more than one option for the same app (e.g. Normal vs Virtual / alternate routes). Prices and stock change live.
 
 NORMAL VS VIRTUAL / MULTIPLE OPTIONS (VERY IMPORTANT):
 - For some countries (especially USA and others), one app fit get more than one service option: Normal, Virtual, or alternate routes with different price and stock.
@@ -582,7 +711,7 @@ const GEMINI_TOOLS = [{
   functionDeclarations: [
     {
       name: 'list_countries',
-      description: 'List countries customers commonly buy numbers for.',
+      description: 'List all countries available for number purchases (full catalog).',
       parameters: { type: 'OBJECT', properties: {} }
     },
     {
@@ -605,7 +734,7 @@ const GEMINI_TOOLS = [{
         properties: {
           country: { type: 'STRING' },
           service: { type: 'STRING', description: 'App name e.g. WhatsApp' },
-          service_code: { type: 'STRING', description: 'Exact Grizzly service code from get_prices options e.g. wa' }
+          service_code: { type: 'STRING', description: 'Exact service code from get_prices options e.g. wa' }
         },
         required: ['country', 'service']
       }
@@ -749,32 +878,62 @@ async function paystackVerify(reference) {
   }
 }
 
-function resolveCountry(name) {
+async function resolveCountry(name) {
   const key = String(name || '').toLowerCase().trim();
+  if (!key) return null;
+
+  // Numeric country id
+  if (/^\d+$/.test(key)) {
+    const id = Number(key);
+    const live = await grizzlyCountries();
+    const hit = live.find((c) => c.id === id);
+    return { id, name: hit ? hit.name : key };
+  }
+
+  // Fast path: hardcoded aliases
   if (key in COUNTRY_MAP) return { id: COUNTRY_MAP[key], name: key };
-  // try a loose contains-match as a fallback for phrasing Gemini might use
-  // that isn't an exact key (e.g. "United States of America")
   for (const [k, id] of Object.entries(COUNTRY_MAP)) {
     if (key.includes(k) || k.includes(key)) return { id, name: k };
   }
+
+  // Full Grizzly country list
+  const live = await grizzlyCountries();
+  let hit = live.find((c) => c.name.toLowerCase() === key);
+  if (hit) return { id: hit.id, name: hit.name };
+  hit = live.find((c) => {
+    const n = c.name.toLowerCase();
+    return n.includes(key) || key.includes(n);
+  });
+  if (hit) return { id: hit.id, name: hit.name };
   return null;
 }
 
 async function executeGeminiFunction(fnName, args, telegramUserId, session) {
   switch (fnName) {
     case 'list_countries': {
-      const names = [...new Set(Object.keys(COUNTRY_MAP).filter((k) => k.length > 2))];
-      return { countries: names };
+      const live = await grizzlyCountries();
+      // Prefer proper country names; include popular aliases tip
+      const names = live
+        .map((c) => c.name)
+        .filter(Boolean)
+        .sort((a, b) => a.localeCompare(b));
+      return {
+        total: names.length,
+        countries: names.slice(0, 80),
+        tip: names.length > 80
+          ? 'Showing first 80. Customer can type any country name (e.g. Portugal, UAE, Japan).'
+          : 'Customer can type any country name from this list.'
+      };
     }
 
     case 'get_prices': {
-      const c = resolveCountry(args.country);
+      const c = await resolveCountry(args.country);
       if (!c) return { error: `Unknown country "${args.country}". Ask the user to clarify or try list_countries.` };
       const list = await getSellableServices(c.id, args.service || null);
       if (!list.length) return { error: `No services currently available for ${c.name}.` };
       session.country = c.name;
       session.countryId = c.id;
-      session.last_options = list.slice(0, 8).map((s) => ({
+      session.last_options = list.slice(0, 12).map((s) => ({
         service_code: s.service_id,
         name: s.service_name,
         variant: s.variant || 'normal',
@@ -787,7 +946,7 @@ async function executeGeminiFunction(fnName, args, telegramUserId, session) {
       const hasVariants = new Set(services.map((s) => s.variant)).size > 1;
       return {
         country: c.name,
-        price_source: list[0]?.source === 'hub' ? 'MJ_HUB_catalog' : 'live_grizzly',
+        price_source: 'catalog',
         must_choose: hasMultiple,
         has_normal_and_virtual: hasVariants,
         services,
@@ -798,7 +957,7 @@ async function executeGeminiFunction(fnName, args, telegramUserId, session) {
     }
 
     case 'buy_number': {
-      const c = resolveCountry(args.country);
+      const c = await resolveCountry(args.country);
       if (!c) return { error: `Unknown country "${args.country}".` };
       const list = await getSellableServices(c.id, args.service || null);
       let svc = null;
@@ -813,7 +972,7 @@ async function executeGeminiFunction(fnName, args, telegramUserId, session) {
       if (!svc) {
         const matched = args.service ? matchServices(list, args.service) : list;
         if (matched.length > 1 && !args.service_code) {
-          session.last_options = matched.slice(0, 8).map((s) => ({
+          session.last_options = matched.slice(0, 12).map((s) => ({
             service_code: s.service_id,
             name: s.service_name,
             variant: s.variant,
@@ -836,7 +995,7 @@ async function executeGeminiFunction(fnName, args, telegramUserId, session) {
           error: 'insufficient_balance',
           balance_ngn: session.balance,
           price_ngn: svc.price_ngn,
-          message: `Customer's balance (₦${session.balance}) is below the price (₦${svc.price_ngn}). Tell them to top up their MJ HUB wallet and try again.`
+          message: `Customer's balance (₦${session.balance}) is below the price (₦${svc.price_ngn}). Tell them to top up their wallet and try again.`
         };
       }
 
@@ -1112,8 +1271,8 @@ function matchServices(list, query) {
 
 bot.start(async (ctx) => {
   const greeting = GEMINI_API_KEY
-    ? `How far 👋 Welcome to MJ SMS (Server 1).\n\nI fit get virtual number for WhatsApp, Telegram, Google, Instagram and plenty more. Just talk normal like:\n"I need USA WhatsApp"\n"Nigeria Telegram how much?"\n\n/balance — check wallet\n/fund 2000 — top up with Paystack\n/orders — your history\n\nWetin you need right now?`
-    : `Welcome to *MJ SMS* (Grizzly · Server 1)\n\nType country + app, e.g.\n*USA WhatsApp*\n*Nigeria Telegram*\n*UK Google*\n\n/balance /fund /orders /status`;
+    ? `How far 👋 Welcome to *MJ SMS*.\n\nI fit get virtual number for WhatsApp, Telegram, Google, Instagram and plenty more. Just talk normal like:\n"I need USA WhatsApp"\n"Nigeria Telegram how much?"\n\n/balance — check wallet\n/fund 2000 — top up\n/orders — your history\n\nWetin you need right now?`
+    : `Welcome to *MJ SMS*\n\nType country + app, e.g.\n*USA WhatsApp*\n*Nigeria Telegram*\n*UK Google*\n\n/balance /fund /orders /status`;
   await ctx.reply(greeting, { parse_mode: 'Markdown' });
 });
 
@@ -1176,8 +1335,8 @@ bot.command('orders', async (ctx) => {
 bot.command('status', async (ctx) => {
   if (!GRIZZLY_KEY) return ctx.reply('GRIZZLYSMS_API_KEY not set on server.');
   const bal = await grizzlyBalance();
-  if (bal == null) return ctx.reply('Grizzly: OFFLINE');
-  await ctx.reply(`*Grizzly (Server 1):* ONLINE\nSupplier balance: \`${bal}\``, {
+  if (bal == null) return ctx.reply('Supplier: OFFLINE');
+  await ctx.reply(`*Supplier:* ONLINE\nBalance: \`${bal}\``, {
     parse_mode: 'Markdown'
   });
 });
@@ -1360,7 +1519,7 @@ bot.action(/^buy:(\d+):([^:]+):(\d+)$/, async (ctx) => {
   const session = await getUserSession(userId);
 
   if (price > 0 && session.balance < price) {
-    return ctx.reply('Insufficient balance. Use /fund or top up on MJ HUB.');
+    return ctx.reply('Insufficient balance. Use /fund to top up your wallet.');
   }
 
   await ctx.reply('Buying number…');
@@ -1517,7 +1676,7 @@ bot.on('text', async (ctx) => {
   if (/^(hi|hello|hey|yo|awfa|how far|how you dey|good morning|good evening|sup|wetin|help)\b/i.test(lower)
       || lower === 'menu' || lower === 'start') {
     return ctx.reply(
-      'How far 👋 Welcome to MJ SMS (Server 1).\n\nI fit get number for WhatsApp, Telegram, Google, Instagram and more.\n\nPick country or type like: USA WhatsApp',
+      'How far 👋 Welcome to MJ SMS.\n\nI fit get number for WhatsApp, Telegram, Google, Instagram and more.\n\nPick country or type like: USA WhatsApp',
       Markup.inlineKeyboard([
         [
           Markup.button.callback('🇺🇸 United States', 'cty:12'),
@@ -1721,7 +1880,7 @@ async function showServiceOptions(ctx, session, userId, countryId, countryName, 
   session.country = countryName;
   session.countryId = countryId;
   session.serviceQuery = serviceQuery;
-  session.last_options = list.slice(0, 8).map((s) => ({
+  session.last_options = list.slice(0, 12).map((s) => ({
     service_code: s.service_id,
     name: s.service_name,
     variant: s.variant || 'normal',
@@ -1732,11 +1891,10 @@ async function showServiceOptions(ctx, session, userId, countryId, countryName, 
   session.state = 'AWAITING_INPUT';
   await saveUserSession(userId, session);
 
-  const source = list[0]?.source === 'hub' ? 'MJ Hub price' : 'Live price';
   if (list.length === 1) {
     const s = list[0];
     return ctx.reply(
-      `*${s.service_name}* · ${countryName}\n₦${Number(s.price_ngn).toLocaleString()} · ${source}\n\nTap to buy:`,
+      `*${s.service_name}* · ${countryName}\n₦${Number(s.price_ngn).toLocaleString()}\n\nTap to buy:`,
       {
         parse_mode: 'Markdown',
         ...Markup.inlineKeyboard([
@@ -1752,10 +1910,10 @@ async function showServiceOptions(ctx, session, userId, countryId, countryName, 
 
   // Multiple options — Normal / Virtual style buttons
   return ctx.reply(
-    `*${countryName}* · ${serviceQuery || 'services'}\n${source}\n\nSelect the number type:`,
+    `*${countryName}* · ${serviceQuery || 'services'}\n\nSelect the number type:`,
     {
       parse_mode: 'Markdown',
-      ...optionButtons(countryId, list.slice(0, 8))
+      ...optionButtons(countryId, list.slice(0, 12))
     }
   );
 }
@@ -1812,7 +1970,7 @@ module.exports = async (req, res) => {
     if (req.method === 'GET') {
       res.statusCode = 200;
       res.setHeader('Content-Type', 'text/plain');
-      return res.end('MJ SMS Bot (Grizzly Server 1) — Vercel');
+      return res.end('MJ SMS Bot — online');
     }
 
     // Paystack webhook / callback credit
