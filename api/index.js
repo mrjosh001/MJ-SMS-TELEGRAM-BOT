@@ -154,6 +154,15 @@ const SERVICE_NAMES = {
   wa: 'WhatsApp', we: 'WeChat', wx: 'Apple', ya: 'Yandex'
 };
 
+function asName(v) {
+  if (v == null) return '';
+  if (typeof v === 'string' || typeof v === 'number') return String(v).trim();
+  if (typeof v === 'object') {
+    return String(v.eng || v.english || v.name || v.title || v.country || v.label || '').trim();
+  }
+  return String(v).trim();
+}
+
 function friendlyServiceName(code, rawName) {
   const c = String(code || '').toLowerCase();
   const raw = String(rawName || '').trim();
@@ -312,14 +321,14 @@ async function grizzlyCountries() {
     if (Array.isArray(data)) {
       for (const c of data) {
         const id = Number(c.id ?? c.country ?? c.code ?? c.country_id);
-        const name = String(c.eng || c.english || c.name || c.country_name || c.title || '').trim();
-        if (Number.isFinite(id) && id >= 0 && name) list.push({ id, name });
+        const name = asName(c.eng || c.english || c.name || c.country_name || c.title || c);
+        if (Number.isFinite(id) && id >= 0 && name && name !== '[object Object]') list.push({ id, name });
       }
     } else if (data && typeof data === 'object') {
       for (const [k, info] of Object.entries(data)) {
         const id = Number(info?.id ?? info?.country ?? k);
-        const name = String(info?.eng || info?.english || info?.name || info?.country_name || '').trim();
-        if (Number.isFinite(id) && id >= 0 && name) list.push({ id, name });
+        const name = asName(info?.eng || info?.english || info?.name || info?.country_name || info);
+        if (Number.isFinite(id) && id >= 0 && name && name !== '[object Object]') list.push({ id, name });
       }
     }
     if (list.length) {
@@ -1083,12 +1092,12 @@ async function resolveCountry(name) {
   if (/^\d+$/.test(key)) {
     const id = Number(key);
     const hit = live.find((c) => c.id === id);
-    return { id, name: hit ? hit.name : key };
+    return { id, name: asName(hit ? hit.name : key) || key };
   }
 
   // Exact match on live Grizzly country name
   let hit = live.find((c) => c.name.toLowerCase() === key);
-  if (hit) return { id: hit.id, name: hit.name };
+  if (hit) return { id: hit.id, name: asName(hit.name) || key };
 
   // Starts-with / contains on live names (prefer longer names)
   const ranked = live
@@ -1097,10 +1106,10 @@ async function resolveCountry(name) {
     .sort((a, b) => b.n.length - a.n.length);
 
   hit = ranked.find((c) => c.n.startsWith(key) || key.startsWith(c.n));
-  if (hit) return { id: hit.id, name: hit.name };
+  if (hit) return { id: hit.id, name: asName(hit.name) || key };
 
   hit = ranked.find((c) => c.n.includes(key) || key.includes(c.n));
-  if (hit) return { id: hit.id, name: hit.name };
+  if (hit) return { id: hit.id, name: asName(hit.name) || key };
 
   // Soft alias only if live search missed (ng → Nigeria, etc.)
   if (key in COUNTRY_MAP) {
@@ -1797,14 +1806,15 @@ bot.action(/^opt:(\d+):([^:]+):(\d+)$/, async (ctx) => {
   await saveUserSession(userId, session);
 
   const phone = String(bought.number || '');
+  const cancelLabel = `⏳ Cancel (wait ${Math.round(MIN_CANCEL_MS / 60000)}m)`;
   await ctx.reply(
-    `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n\nUse am for the app to request OTP.\nWhen you ready, tap Check.`,
+    `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n\nUse am for the app to request OTP.\nWhen you ready, tap Check.\n\n_Cancel opens after ~${Math.round(MIN_CANCEL_MS / 60000)} minutes._`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
         [{ text: '📋 Copy number', copy_text: { text: phone } }],
         [Markup.button.callback('Check SMS code', `chk:${bought.order_id}:${price}`)],
-        [Markup.button.callback('Cancel + refund', `can:${bought.order_id}:${price}`)]
+        [Markup.button.callback(cancelLabel.slice(0, 64), `can:${bought.order_id}:${price}`)]
       ])
     }
   );
@@ -1844,14 +1854,15 @@ bot.action(/^buy:(\d+):([^:]+):(\d+)$/, async (ctx) => {
   await saveUserSession(userId, session);
 
   const phone = String(bought.number || '');
+  const cancelLabel = `⏳ Cancel (wait ${Math.round(MIN_CANCEL_MS / 60000)}m)`;
   await ctx.reply(
-    `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n\nTap below when the SMS arrives.`,
+    `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n\nTap below when the SMS arrives.\n\n_Cancel opens after ~${Math.round(MIN_CANCEL_MS / 60000)} minutes._`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
         [{ text: '📋 Copy number', copy_text: { text: phone } }],
         [Markup.button.callback('Check SMS code', `chk:${bought.order_id}:${price}`)],
-        [Markup.button.callback('Cancel + refund', `can:${bought.order_id}:${price}`)]
+        [Markup.button.callback(cancelLabel.slice(0, 64), `can:${bought.order_id}:${price}`)]
       ])
     }
   );
@@ -1888,10 +1899,32 @@ bot.action(/^can:([^:]+):(\d+)$/, async (ctx) => {
   // Local timer aligned with supplier early-cancel window (default 3 minutes)
   const wait = cancelWaitInfo(order);
   if (!wait.allowed) {
-    return ctx.reply(
-      `Too early to cancel.\n\nSupplier needs about ${Math.round(MIN_CANCEL_MS / 60000)} minutes after purchase.\nTry again in *${formatWait(wait.waitSec)}*.`,
-      { parse_mode: 'Markdown' }
-    );
+    const label = `⏳ Cancel in ${formatWait(wait.waitSec)}`.slice(0, 64);
+    try {
+      await ctx.answerCbQuery(
+        `Cancel opens in ${formatWait(wait.waitSec)}`,
+        { show_alert: true }
+      );
+    } catch (_) {}
+    // Update the button itself so countdown is visible next to Cancel
+    try {
+      await ctx.editMessageReplyMarkup(
+        Markup.inlineKeyboard([
+          [{ text: '📋 Copy number', copy_text: { text: String(order.phoneNumber || '') } }],
+          [Markup.button.callback('Check SMS code', `chk:${orderId}:${price}`)],
+          [Markup.button.callback(label, `can:${orderId}:${price}`)]
+        ]).reply_markup
+      );
+    } catch (_) {
+      try {
+        await ctx.editMessageReplyMarkup({
+          inline_keyboard: [[
+            { text: label, callback_data: `can:${orderId}:${price}`.slice(0, 64) }
+          ]]
+        });
+      } catch (__) {}
+    }
+    return;
   }
 
   const result = await grizzlyCancel(orderId);
@@ -2003,26 +2036,31 @@ bot.on('text', async (ctx) => {
   const sessionState = session.state || 'AWAITING_INPUT';
 
   // --- Greetings / help ---
-  if (/^(hi|hello|hey|yo|awfa|how far|how you dey|good morning|good evening|sup|wetin|help)\b/i.test(lower)
-      || lower === 'menu' || lower === 'start') {
+  if (/^(hi|hello|hey|yo|awfa|how far|how you dey|good morning|good evening|sup|wetin)\b/i.test(lower)) {
+    // Short human reply — don't dump the same menu every time
     return ctx.reply(
-      'How far 👋 Welcome to MJ SMS.\n\nI fit get number for WhatsApp, Telegram, Google, Instagram and more.\n\nPick country or type like: USA WhatsApp',
-      Markup.inlineKeyboard([
-        [
-          Markup.button.callback('🇺🇸 United States', 'cty:12'),
-          Markup.button.callback('🇬🇧 United Kingdom', 'cty:16')
-        ],
-        [
-          Markup.button.callback('🇨🇦 Canada', 'cty:36'),
-          Markup.button.callback('🇳🇬 Nigeria', 'cty:19')
-        ],
-        [
-          Markup.button.callback('🇬🇭 Ghana', 'cty:38'),
-          Markup.button.callback('🇰🇪 Kenya', 'cty:8')
-        ],
-        [Markup.button.callback('💳 Fund wallet', 'menu:fund')],
-        [Markup.button.callback('💰 Balance', 'menu:bal')]
-      ])
+      'How far 👋\n\nWetin you need? Type country + app e.g. *USA WhatsApp* or *Nigeria Telegram*.\n\nOr /fund · /balance · /orders',
+      { parse_mode: 'Markdown' }
+    );
+  }
+  if (lower === 'menu' || lower === 'help' || lower === 'start') {
+    return ctx.reply(
+      'Type country + app freely, e.g. *Australia WhatsApp*.\n\nOr pick a shortcut:',
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [
+            Markup.button.callback('🇺🇸 United States', 'cty:12'),
+            Markup.button.callback('🇬🇧 United Kingdom', 'cty:16')
+          ],
+          [
+            Markup.button.callback('🇨🇦 Canada', 'cty:36'),
+            Markup.button.callback('🇳🇬 Nigeria', 'cty:19')
+          ],
+          [Markup.button.callback('💳 Fund wallet', 'menu:fund')],
+          [Markup.button.callback('💰 Balance', 'menu:bal')]
+        ])
+      }
     );
   }
 
@@ -2228,6 +2266,8 @@ bot.on('text', async (ctx) => {
 });
 
 async function showServiceOptions(ctx, session, userId, countryId, countryName, serviceQuery) {
+  countryName = asName(countryName) || `country ${countryId}`;
+  serviceQuery = asName(serviceQuery) || serviceQuery;
   await ctx.reply(`Checking *${countryName}* prices…`, { parse_mode: 'Markdown' });
   let list = await getSellableServices(countryId, serviceQuery);
   if (!list.length) {
