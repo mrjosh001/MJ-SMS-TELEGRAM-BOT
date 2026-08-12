@@ -812,12 +812,52 @@ async function grizzlyCancel(orderId) {
 
 function cancelWaitInfo(order) {
   const boughtAt = order?.date || order?.created_at || order?.bought_at || null;
-  if (!boughtAt) return { allowed: true, waitMs: 0, waitSec: 0 };
-  const elapsed = Date.now() - new Date(boughtAt).getTime();
-  if (!Number.isFinite(elapsed) || elapsed < 0) return { allowed: true, waitMs: 0, waitSec: 0 };
-  if (elapsed >= MIN_CANCEL_MS) return { allowed: true, waitMs: 0, waitSec: 0 };
+  if (!boughtAt) {
+    // No timestamp — still enforce short soft wait from now is not possible; allow API decide
+    return { allowed: true, waitMs: 0, waitSec: 0 };
+  }
+  const t0 = new Date(boughtAt).getTime();
+  if (!Number.isFinite(t0)) return { allowed: true, waitMs: 0, waitSec: 0 };
+  const elapsed = Date.now() - t0;
+  if (elapsed >= MIN_CANCEL_MS) return { allowed: true, waitMs: 0, waitSec: 0, unlockAt: t0 + MIN_CANCEL_MS };
   const waitMs = MIN_CANCEL_MS - elapsed;
-  return { allowed: false, waitMs, waitSec: Math.ceil(waitMs / 1000) };
+  return {
+    allowed: false,
+    waitMs,
+    waitSec: Math.max(1, Math.ceil(waitMs / 1000)),
+    unlockAt: t0 + MIN_CANCEL_MS
+  };
+}
+
+function money(n) {
+  const v = Math.round(Number(n) || 0);
+  return v > 0 ? v : 0;
+}
+
+/** Reload session, debit only if enough funds. Returns { ok, balance, session } */
+async function safeDebit(userId, amount, meta = {}) {
+  const session = await getUserSession(userId);
+  amount = money(amount);
+  const bal = money(session.balance);
+  if (amount <= 0) return { ok: true, balance: bal, session, debited: 0 };
+  if (bal < amount) {
+    return { ok: false, balance: bal, session, debited: 0, need: amount };
+  }
+  session.balance = money(bal - amount);
+  await saveUserSession(userId, session);
+  console.log('[money] debit', userId, amount, '→', session.balance, meta);
+  return { ok: true, balance: session.balance, session, debited: amount };
+}
+
+/** Reload session, credit once. */
+async function safeCredit(userId, amount, meta = {}) {
+  const session = await getUserSession(userId);
+  amount = money(amount);
+  if (amount <= 0) return { ok: true, balance: money(session.balance), session, credited: 0 };
+  session.balance = money(money(session.balance) + amount);
+  await saveUserSession(userId, session);
+  console.log('[money] credit', userId, amount, '→', session.balance, meta);
+  return { ok: true, balance: session.balance, session, credited: amount };
 }
 
 function formatWait(sec) {
@@ -853,61 +893,75 @@ const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GE
 const MAX_CONVERSATION_TURNS = 16;
 const MAX_TOOL_ROUNDTRIPS = 6;
 
-const GEMINI_SYSTEM_PROMPT = `You be Mira. You work for MJ SMS under MJ HUB. You be real human support and sales for Telegram. You no be AI, robot, or system.
+const GEMINI_SYSTEM_PROMPT = `You be Mira, the official MJ SMS Assistant for MJ Hub (mjhub.store).
 
-VOICE:
-Natural Nigerian WhatsApp chat. Pidgin + simple English. Short. Fluent. Warm. Street-smart. No essays, no bullet walls, no "As an AI", no re-intro every message. Continue the same conversation.
+Your main work:
+- Help users get real non-VOIP SMS numbers and OTP codes directly here on Telegram
+- Guide users step by step to buy number
+- Deliver the number and later deliver the code (only via tools — never invent)
+- Answer questions about MJ SMS and MJ Hub
+- Softly sell and grow the brand
+- Talk natural Nigerian Pidgin mixed with clear English (fluent and real, no force Pidgin)
 
-WHAT MJ HUB IS (know this deep):
-MJ HUB na digital services marketplace with one ecosystem:
-1) MJ SMS — temporary real mobile numbers for SMS OTP verification
-2) MJ Logs — premium verified social accounts (website)
-3) MJ Boosters — social growth (Instagram, TikTok, YouTube, etc. on website)
-This Telegram bot handles MJ SMS number verification only.
+Personality:
+- Calm, sharp, helpful, street-smart
+- Talk the way real Nigerians dey talk online
+- Be patient with new users
+- Be fast and clear when dem ready to buy
+- No dey sound like robot or script
+- Always helpful and solution-focused
 
-MJ SMS HOW E DEY WORK:
-- Customer type any country + app freely (e.g. Australia WhatsApp, Portugal Telegram, Japan Google). No fixed country list for them.
-- Dem pay from wallet in Naira (₦)
-- System give phone number
-- Customer use the number for the app to request OTP
-- SMS code land → dem ask you to check → you give the code
-- One number = one verification cycle. After code, dem free
-- If code never come and still eligible, cancel fit refund wallet
-- Numbers are real mobile routes for OTP (not random VOIP spam lines). Some countries still show more than one option for the same app (e.g. Normal vs Virtual / alternate routes). Prices and stock change live.
+About MJ Hub:
+- All-in-one marketplace: MJ Logs (verified accounts), MJ SMS (real numbers for OTP), MJ Boosters (followers/likes/views)
+- One dashboard, one wallet (Naira or USD)
+- Website: mjhub.store
 
-NORMAL VS VIRTUAL / MULTIPLE OPTIONS (VERY IMPORTANT):
-- For some countries (especially USA and others), one app fit get more than one service option: Normal, Virtual, or alternate routes with different price and stock.
-- ANY time get_prices or buy_number return more than one option, briefly list them AND tell the user to tap the buttons below (Normal / Virtual). Telegram will show tappable buttons. Wait for their pick before buy_number.
-- Format options simple, example:
-  "USA WhatsApp get 2 options:
-  1) Normal — ₦3,500 (stock 12)
-  2) Virtual — ₦2,200 (stock 40)
-  Which one you want?"
-- No pick for them. No buy until dem choose.
-- When dem choose, call buy_number with that service_code.
+About MJ SMS (this bot = Server 1 numbers):
+- Real mobile numbers (not VOIP)
+- Works for WhatsApp, Telegram, Instagram, Google, Facebook, TikTok, Snapchat and plenty more
+- Over 200 countries
+- Pay from wallet on this bot (/fund) or mjhub.store
+- OTP usually drops within about 1 minute
+- If code no drop after some time, user fit cancel/refund when supplier allows
 
-SALES + SUPPORT FLOW:
-1) Understand need (country + app)
-2) Call get_prices before any price talk
-3) If multiple options → show all → wait for pick
-4) Soft close once dem choose
-5) buy_number → give phone number → tell dem request OTP on the app
-6) check_status when dem ask for code
-7) cancel_order if dem wan cancel and eligible
-8) If balance low → ask fund amount (min ₦1,000 max ₦200,000) → create_payment → dem tap Pay button → "I don pay" → verify_payment
+How you handle SMS request (step by step):
+1. If dem no mention app → ask which service (WhatsApp, Telegram, Instagram, Google…)
+2. If dem no mention country → ask which country
+3. Confirm: "Alright, [Country] [Service]. You ready make I process am?"
+4. Only when dem confirm OR dem already gave full request (e.g. "USA WhatsApp") → use tools get_prices then buy_number
+5. Never invent number or code. Only tool results.
 
-FUNDING:
-No long Paystack URL dump. Confirm amount, say make dem tap Pay button under the message.
+Important rules:
+1. Never invent price, stock, number, or OTP code
+2. Always use tools for prices, buy, status, cancel, balance, payment
+3. If get_prices returns options, show the price from tool and let dem pick / confirm before buy_number
+4. If balance low → guide /fund — do not promise free number
+5. If no stock → say try another country (do not invent Server 2 stock on this bot unless tool says so)
+6. If dem just dey yarn (hi, how far) → yarn natural, then soft ask wetin dem need
+7. Keep replies short when dem dey buy
+8. After successful number: tell dem use am for OTP; code go show when dem tap Check or when check_status returns it
+9. After code delivered: ask if dem need another number
+10. Never mention Grizzly, suppliers, API, or internal systems to the customer
+11. Never claim you are AI/robot
+12. Cancel: supplier blocks cancel for a few minutes after buy — tell dem the wait time from tool, no fake refund
 
-TOOLS (never invent data):
+Payment:
+- Wallet top-up with /fund AMOUNT (Paystack)
+- Minimum practical top-up around ₦1000
+- If no balance: "You never get enough balance. You fit /fund or fund on mjhub.store. How you wan do am?"
+
+Reply style examples:
+- "I need number" → "Okay. Which service you need the number for? (WhatsApp, Telegram, Instagram, Google…)"
+- Dem say WhatsApp → "Which country you want?"
+- Dem say USA → "Alright, USA WhatsApp. You ready make I get the number for you now?"
+- No stock → "That one no dey available for now. You fit try another country?"
+- Code waiting → "Code never drop yet. Make I check… If e no show after some minutes, you fit cancel for refund when the timer allow."
+- After code → "Your code don drop: XXXXXX. Copy am sharp. You need another number?"
+
+Tools you must use (do not skip):
 list_countries, get_prices, buy_number, check_status, cancel_order, get_balance, get_my_orders, create_payment, verify_payment.
 
-CONVERSATION RULES:
-- No repeat greeting
-- No ask the same question twice
-- If dem say yes/ok, continue last offer
-- Keep replies short and human
-- Market soft, no force
+When user already typed full request like "UK WhatsApp" or "Nigeria Telegram", call get_prices immediately — no need to re-ask.
 `;
 
 const GEMINI_TOOLS = [{
@@ -1219,15 +1273,22 @@ async function executeGeminiFunction(fnName, args, telegramUserId, session) {
       const bought = await grizzlyBuy(svc.service_id, c.id);
       if (!bought.success) return { error: bought.message || 'Purchase failed at the supplier.' };
 
-      if (svc.price_ngn > 0) session.balance = Math.max(0, session.balance - svc.price_ngn);
+      const priceN = money(svc.price_ngn);
+      if (priceN > 0) {
+        const deb = await safeDebit(userId, priceN, { orderId: bought.order_id });
+        Object.assign(session, deb.session);
+      }
       const order = {
         orderId: bought.order_id,
         provider: 'grizzly',
-        serviceName: svc.service_id,
+        service: svc.service_id,
+        serviceName: svc.service_name || svc.service_id,
         phoneNumber: bought.number,
-        price: svc.price_ngn,
-        status: 'Waiting SMS',
-        date: new Date().toISOString()
+        price: money(svc.price_ngn),
+        status: 'Waiting for SMS',
+        date: new Date().toISOString(),
+        charged: true,
+        refunded: false
       };
       session.orders = [...(session.orders || []), order].slice(-30);
 
@@ -1281,19 +1342,29 @@ async function executeGeminiFunction(fnName, args, telegramUserId, session) {
             : 'Cancel failed at supplier. Do NOT tell user they were refunded.'
         };
       }
-      let refunded = 0;
-      if (order && order.price > 0) {
-        refunded = order.price;
-        session.balance = (Number(session.balance) || 0) + refunded;
+      if (order && order.refunded === true) {
+        return {
+          success: true,
+          order_id: orderId,
+          already_refunded: true,
+          new_balance_ngn: money(session.balance)
+        };
+      }
+      const refunded = money(order?.price || 0);
+      if (refunded > 0) {
+        const cr = await safeCredit(userId, refunded, { orderId, reason: 'cancel' });
+        Object.assign(session, cr.session);
       }
       session.orders = (session.orders || []).map((o) =>
-        String(o.orderId) === String(orderId) ? { ...o, status: 'Cancelled' } : o
+        String(o.orderId) === String(orderId)
+          ? { ...o, status: 'Cancelled', refunded: true, refunded_amount: refunded }
+          : o
       );
       return {
         success: true,
         order_id: orderId,
         refunded_ngn: refunded,
-        new_balance_ngn: session.balance
+        new_balance_ngn: money(session.balance)
       };
     }
 
@@ -1577,12 +1648,40 @@ function dedupeServices(list) {
 
 
 // ---------- Bot commands ----------
+async function registerBotMenu() {
+  try {
+    await bot.telegram.setMyCommands([
+      { command: 'start', description: 'Start the bot · talk to Mira' },
+      { command: 'balance', description: 'Check your wallet balance' },
+      { command: 'fund', description: 'Top up your wallet (e.g. /fund 2000)' },
+      { command: 'orders', description: 'View numbers you bought' },
+      { command: 'privacy', description: 'View our privacy policy' },
+      { command: 'support', description: 'Contact customer care / help' }
+    ]);
+  } catch (e) {
+    console.error('setMyCommands', e.message);
+  }
+}
+registerBotMenu();
+
+
 
 bot.start(async (ctx) => {
-  const greeting = GEMINI_API_KEY
-    ? `How far 👋 Welcome to *MJ SMS*.\n\nI fit get virtual number for WhatsApp, Telegram, Google, Instagram and plenty more. Just talk normal like:\n"I need USA WhatsApp"\n"Nigeria Telegram how much?"\n\n/balance — check wallet\n/fund 2000 — top up\n/orders — your history\n\nWetin you need right now?`
-    : `Welcome to *MJ SMS*\n\nType country + app, e.g.\n*USA WhatsApp*\n*Nigeria Telegram*\n*UK Google*\n\n/balance /fund /orders /status`;
-  await ctx.reply(greeting, { parse_mode: 'Markdown' });
+  await getUserSession(ctx.from.id);
+  await ctx.reply(
+    `How far 👋 I be *Mira* — MJ SMS assistant.\n\n` +
+      `I fit get real number for WhatsApp, Telegram, Instagram, Google and more.\n\n` +
+      `Just type like:\n` +
+      `• *USA WhatsApp*\n` +
+      `• *Nigeria Telegram*\n` +
+      `• or say *I need number*\n\n` +
+      `/balance — wallet\n` +
+      `/fund 2000 — top up\n` +
+      `/orders — numbers you bought\n` +
+      `/support — help\n\n` +
+      `Wetin you need right now?`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
 bot.command('hubtest', async (ctx) => {
@@ -1625,20 +1724,70 @@ bot.command('hubtest', async (ctx) => {
   }
 });
 
+
+bot.command('privacy', async (ctx) => {
+  await ctx.reply(
+    `*MJ SMS Privacy Policy*\n\n` +
+      `• We only use your Telegram ID to run your wallet and orders on this bot.\n` +
+      `• Phone numbers you buy are for your OTP use; we do not sell your personal chat data.\n` +
+      `• Payments are processed securely via Paystack.\n` +
+      `• Order history is stored so you can check numbers and status.\n` +
+      `• You can request support anytime with /support.\n\n` +
+      `Website: mjhub.store`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.command('support', async (ctx) => {
+  await ctx.reply(
+    `*MJ SMS Support*\n\n` +
+      `I be *Mira* — I fit help you buy number and check OTP here.\n\n` +
+      `For human support:\n` +
+      `• Website: mjhub.store\n` +
+      `• Telegram / WhatsApp support (use the contacts on the site)\n\n` +
+      `Quick commands:\n` +
+      `/balance — wallet\n` +
+      `/fund 2000 — top up\n` +
+      `/orders — your numbers\n\n` +
+      `Or just type e.g. *USA WhatsApp*`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+
 bot.command(['balance', 'bal'], async (ctx) => {
   const s = await getUserSession(ctx.from.id);
-  await ctx.reply(`Balance: *₦${(s.balance || 0).toLocaleString()}*`, { parse_mode: 'Markdown' });
+  await ctx.reply(`Balance: *₦${money(s.balance).toLocaleString()}*`, { parse_mode: 'Markdown' });
 });
 
 bot.command('orders', async (ctx) => {
   const s = await getUserSession(ctx.from.id);
-  if (!s.orders || !s.orders.length) return ctx.reply('No orders yet.');
-  const lines = s.orders
-    .slice(-10)
+  const list = (s.orders || []).filter((o) => o && o.orderId && o.type !== '_meta');
+  if (!list.length) {
+    return ctx.reply('No orders yet.\n\nType country + app e.g. *USA WhatsApp* to buy.', {
+      parse_mode: 'Markdown'
+    });
+  }
+  const lines = list
+    .slice(-15)
     .reverse()
-    .map((o) => `• ${o.serviceName || o.service} | \`${o.phoneNumber}\` | ₦${o.price} | ${o.status}`)
-    .join('\n');
-  await ctx.reply(lines, { parse_mode: 'Markdown' });
+    .map((o, i) => {
+      const phone = String(o.phoneNumber || o.number || o.phone || '').trim() || '—';
+      const svc = o.serviceName || o.service || 'SMS';
+      const price = money(o.price);
+      const st = o.status || '—';
+      const id = o.orderId || '';
+      const when = o.date ? new Date(o.date).toLocaleString('en-GB', { timeZone: 'Africa/Lagos' }) : '';
+      return (
+        `*${i + 1}. ${svc}*\n` +
+        `📞 \`${phone}\`\n` +
+        `🆔 \`${id}\`\n` +
+        `₦${price.toLocaleString()} · ${st}` +
+        (when ? `\n${when}` : '')
+      );
+    })
+    .join('\n\n');
+  await ctx.reply(`*Your recent orders*\n\n${lines}`, { parse_mode: 'Markdown' });
 });
 
 bot.command('status', async (ctx) => {
@@ -1791,7 +1940,12 @@ bot.action(/^opt:(\d+):([^:]+):(\d+)$/, async (ctx) => {
     return ctx.reply(/502|503|gateway|unreachable|timeout/i.test(String(bought.message || '')) ? 'Supplier temporarily unavailable. Abeg try again in a few minutes.' : `E no work: ${bought.message || 'No number available. Try another option.'}`);
   }
 
-  if (price > 0) session.balance = Math.max(0, session.balance - price);
+  // charge only after supplier success (already past bought.success)
+  {
+    const deb = await safeDebit(ctx.from.id, price, { orderId: bought.order_id });
+    session.balance = deb.balance;
+    Object.assign(session, deb.session);
+  }
   const order = {
     orderId: bought.order_id,
     provider: 'grizzly',
@@ -1828,27 +1982,37 @@ bot.action(/^buy:(\d+):([^:]+):(\d+)$/, async (ctx) => {
   const price = parseInt(ctx.match[3], 10) || 0;
   const session = await getUserSession(userId);
 
-  if (price > 0 && session.balance < price) {
-    return ctx.reply('Insufficient balance. Use /fund to top up your wallet.');
+  const priceN = money(price);
+  if (priceN > 0 && money(session.balance) < priceN) {
+    return ctx.reply(
+      `Balance no reach. Need ₦${priceN.toLocaleString()} · you get ₦${money(session.balance).toLocaleString()}.\nUse /fund to top up.`
+    );
   }
 
-  await ctx.reply('Buying number…');
+  await ctx.reply('I dey grab the number… hold on.');
   const bought = await grizzlyBuy(serviceId, countryId);
   if (!bought.success) {
-    return ctx.reply(`Failed: ${bought.message || 'No number'}`);
+    return ctx.reply(
+      /502|503|gateway|unreachable|timeout/i.test(String(bought.message || ''))
+        ? 'Supplier temporarily unavailable. Abeg try again in a few minutes.'
+        : `Failed: ${bought.message || 'No number'}`
+    );
   }
 
-  if (price > 0) {
-    session.balance = Math.max(0, session.balance - price);
-  }
+  const deb = await safeDebit(userId, priceN, { orderId: bought.order_id, service: serviceId });
+  session.balance = deb.balance;
+  Object.assign(session, deb.session);
   const order = {
     orderId: bought.order_id,
     provider: 'grizzly',
+    service: serviceId,
     serviceName: serviceId,
     phoneNumber: bought.number,
-    price,
-    status: 'Waiting SMS',
-    date: new Date().toISOString()
+    price: priceN,
+    status: 'Waiting for SMS',
+    date: new Date().toISOString(),
+    charged: deb.ok,
+    refunded: false
   };
   session.orders = [...(session.orders || []), order].slice(-30);
   await saveUserSession(userId, session);
@@ -1896,35 +2060,47 @@ bot.action(/^can:([^:]+):(\d+)$/, async (ctx) => {
     return ctx.reply('This order already cancelled.');
   }
 
-  // Local timer aligned with supplier early-cancel window (default 3 minutes)
-  const wait = cancelWaitInfo(order);
+  // Dynamic countdown from order.date (default 3 min window)
+  const wait = cancelWaitInfo(order || { date: null });
   if (!wait.allowed) {
-    const label = `⏳ Cancel in ${formatWait(wait.waitSec)}`.slice(0, 64);
+    const remain = formatWait(wait.waitSec);
+    const label = `⏳ ${remain} left`.slice(0, 64);
     try {
-      await ctx.answerCbQuery(
-        `Cancel opens in ${formatWait(wait.waitSec)}`,
-        { show_alert: true }
-      );
+      await ctx.answerCbQuery(`⏳ Cancel opens in ${remain}`, { show_alert: true });
     } catch (_) {}
-    // Update the button itself so countdown is visible next to Cancel
+    // Refresh buttons with live remaining time
+    const phone = String(order?.phoneNumber || '');
+    const kb = {
+      inline_keyboard: [
+        phone ? [{ text: '📋 Copy number', copy_text: { text: phone } }] : [],
+        [{ text: 'Check SMS code', callback_data: `chk:${orderId}:${price}`.slice(0, 64) }],
+        [{ text: label, callback_data: `can:${orderId}:${price}`.slice(0, 64) }]
+      ].filter((row) => row.length)
+    };
     try {
-      await ctx.editMessageReplyMarkup(
-        Markup.inlineKeyboard([
-          [{ text: '📋 Copy number', copy_text: { text: String(order.phoneNumber || '') } }],
-          [Markup.button.callback('Check SMS code', `chk:${orderId}:${price}`)],
-          [Markup.button.callback(label, `can:${orderId}:${price}`)]
-        ]).reply_markup
-      );
-    } catch (_) {
-      try {
-        await ctx.editMessageReplyMarkup({
-          inline_keyboard: [[
-            { text: label, callback_data: `can:${orderId}:${price}`.slice(0, 64) }
-          ]]
-        });
-      } catch (__) {}
-    }
+      await ctx.editMessageReplyMarkup(kb);
+    } catch (_) {}
+    // Also edit message text footer with countdown if possible
+    try {
+      const base = (ctx.callbackQuery?.message?.text || '').split('\n\n⏳')[0];
+      if (base) {
+        await ctx.editMessageText(
+          `${base}\n\n⏳ Cancel available in *${remain}*\n(Tap Cancel again to refresh timer)`,
+          { parse_mode: 'Markdown', reply_markup: kb }
+        );
+      }
+    } catch (_) {}
     return;
+  }
+
+  // Fresh session before any money move
+  let sess = await getUserSession(ctx.from.id);
+  const ord = (sess.orders || []).find((o) => String(o.orderId) === String(orderId));
+
+  if (ord && (/cancelled/i.test(ord.status || '') || ord.refunded === true)) {
+    return ctx.reply(
+      `This order already cancelled.\nBalance: ₦${money(sess.balance).toLocaleString()}`
+    );
   }
 
   const result = await grizzlyCancel(orderId);
@@ -1936,334 +2112,352 @@ bot.action(/^can:([^:]+):(\d+)$/, async (ctx) => {
     );
   }
 
-  let refunded = 0;
-  if (price > 0) {
-    refunded = price;
-    session.balance = (Number(session.balance) || 0) + price;
+  // Refund ONLY the order's recorded price (never trust button alone), once
+  const refundAmt = money(ord?.price ?? price);
+  let newBal = money(sess.balance);
+
+  if (refundAmt > 0 && ord && ord.refunded !== true) {
+    const credited = await safeCredit(ctx.from.id, refundAmt, { orderId, reason: 'cancel' });
+    sess = credited.session;
+    newBal = credited.balance;
+    sess.orders = (sess.orders || []).map((o) =>
+      String(o.orderId) === String(orderId)
+        ? { ...o, status: 'Cancelled', refunded: true, refunded_amount: refundAmt }
+        : o
+    );
+    await saveUserSession(ctx.from.id, sess);
+  } else {
+    sess.orders = (sess.orders || []).map((o) =>
+      String(o.orderId) === String(orderId) ? { ...o, status: 'Cancelled', refunded: true } : o
+    );
+    await saveUserSession(ctx.from.id, sess);
+    newBal = money(sess.balance);
   }
-  session.orders = (session.orders || []).map((o) =>
-    String(o.orderId) === String(orderId) ? { ...o, status: 'Cancelled' } : o
-  );
-  await saveUserSession(ctx.from.id, session);
+
+  // Re-read for display truth
+  const finalS = await getUserSession(ctx.from.id);
   await ctx.reply(
-    refunded > 0
-      ? `Cancelled ✅\n₦${refunded.toLocaleString()} refunded.\nBalance: ₦${Number(session.balance).toLocaleString()}`
-      : 'Cancelled ✅'
+    refundAmt > 0
+      ? `Cancelled ✅\n₦${refundAmt.toLocaleString()} refunded.\nBalance: ₦${money(finalS.balance).toLocaleString()}`
+      : `Cancelled ✅\nBalance: ₦${money(finalS.balance).toLocaleString()}`
   );
 });
 
-bot.on('text', async (ctx) => {
-  const text = (ctx.message.text || '').trim();
-  if (text.startsWith('/')) return;
 
-  const userId = ctx.from.id;
-  const session = await getUserSession(userId);
+// ---------- Mira smart flow (works without Gemini) ----------
+const MIRA = {
+  askService:
+    'Okay. Which service you need the number for?\n(WhatsApp, Telegram, Instagram, Google, Facebook, TikTok…)',
+  askCountry: (svc) =>
+    svc
+      ? `Alright. Which country you want for *${svc}*?`
+      : 'Which country you want?',
+  confirm: (country, svc, priceLine) =>
+    `Alright, *${country}* ${svc || ''}.${priceLine ? `\n${priceLine}` : ''}\n\nYou ready make I get the number for you now?`.trim(),
+  noStock: 'That particular one no dey available for now.\nYou fit try another country?',
+  lowBal: (need, bal) =>
+    `You never get enough balance.\nNeed about ₦${Number(need).toLocaleString()} · you get ₦${Number(bal).toLocaleString()}.\n\nYou fit /fund or fund on mjhub.store.\nHow you wan do am?`,
+  greet:
+    'How far 👋 I be *Mira* — MJ SMS assistant.\n\nI fit get real number for WhatsApp, Telegram, Instagram, Google and more.\n\nWetin you need? Type like *USA WhatsApp* or tell me the app first.',
+  yarn: 'I dey here. Wetin you need — number for which app?',
+};
 
-  if (GEMINI_API_KEY) {
-    try {
-      await ctx.sendChatAction('typing');
-    } catch (_) {}
-    const geminiResult = await callGeminiWithTools(session, userId, text);
-
-    // Quota / model failure → fall through to classic keyword flow so bot still works
-    if (!(geminiResult.quota || geminiResult.modelFail || geminiResult.reply === 'QUOTA_EXCEEDED' || geminiResult.reply === 'MODEL_UNAVAILABLE')) {
-      const { reply, contents } = geminiResult;
-      const slim = [];
-      for (const c of (contents || []).slice(-MAX_CONVERSATION_TURNS)) {
-        const texts = (c.parts || []).map((p) => p.text).filter(Boolean);
-        if (!texts.length) continue;
-        slim.push({ role: c.role, parts: [{ text: texts.join('\n') }] });
-      }
-      session.conversation = slim.slice(-MAX_CONVERSATION_TURNS);
-      await saveUserSession(userId, session);
-
-      const memPay = pendingPayments.get(String(userId)) || session.pending_payment;
-      let payUrl = memPay?.authorization_url || null;
-      let textOut = reply;
-
-      if (payUrl || /checkout\.paystack\.com/i.test(textOut || '')) {
-        textOut = String(textOut || '')
-          .replace(/https?:\/\/checkout\.paystack\.com\/\S+/gi, '')
-          .replace(/[ \t]+\n/g, '\n')
-          .replace(/\n{3,}/g, '\n\n')
-          .trim();
-        if (!payUrl) {
-          const murl = String(reply).match(/https:\/\/checkout\.paystack\.com\/\S+/i);
-          if (murl) payUrl = murl[0].replace(/[)\].,]+$/, '');
-        }
-        if (memPay?.amount_ngn && !/₦|N\d/.test(textOut)) {
-          textOut = `Top up ₦${Number(memPay.amount_ngn).toLocaleString()}\n\nTap Pay below.\nWhen e successful, type: I don pay`;
-        } else if (payUrl && textOut.length < 8) {
-          textOut = `Your payment link ready.\n\nTap Pay below.\nWhen e successful, type: I don pay`;
-        } else if (payUrl && !/tap|pay|button/i.test(textOut)) {
-          textOut = `${textOut}\n\nTap Pay below when you ready.\nAfter payment type: I don pay`;
-        }
-      }
-
-      let sendOpts = {};
-      if (payUrl) {
-        sendOpts = Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', payUrl)]]);
-      } else if (session.last_options && session.last_options.length > 1) {
-        const cid = session.last_options[0].country_id || session.countryId;
-        sendOpts = optionButtons(cid, session.last_options.map((o) => ({
-          service_id: o.service_code,
-          service_name: o.name,
-          variant: o.variant,
-          price_ngn: o.price_ngn
-        })));
-      } else if (session.last_options && session.last_options.length === 1) {
-        const o = session.last_options[0];
-        const cid = o.country_id || session.countryId;
-        sendOpts = Markup.inlineKeyboard([
-          [Markup.button.callback(
-            `✅ Buy ${o.name} · ₦${Number(o.price_ngn).toLocaleString()}`,
-            `opt:${cid}:${o.service_code}:${o.price_ngn}`.slice(0, 64)
-          )],
-          [Markup.button.callback('⬅️ Cancel', 'opt:cancel')]
-        ]);
-      }
-      try {
-        await ctx.reply(textOut, { parse_mode: 'Markdown', ...sendOpts });
-      } catch (_) {
-        await ctx.reply(textOut, sendOpts);
-      }
-      return;
+function detectServiceOnly(text) {
+  const t = String(text || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const entries = Object.entries(SERVICE_MAP).sort((a, b) => b[0].length - a[0].length);
+  for (const [name, code] of entries) {
+    if (name.length < 2) continue;
+    if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(t)) {
+      return { serviceName: name, serviceCode: code };
     }
   }
+  return null;
+}
 
-  // Fallback: smart manual flow (works without Gemini)
-  const lower = text.toLowerCase().trim();
-  const sessionState = session.state || 'AWAITING_INPUT';
+function isYes(text) {
+  return /^(yes|y|yeah|yep|ok|okay|sure|go|process|buy|do am|i ready|ready|proceed|sharp|abeg|yes please)\b/i.test(
+    String(text || '').trim()
+  );
+}
 
-  // --- Greetings / help ---
-  if (/^(hi|hello|hey|yo|awfa|how far|how you dey|good morning|good evening|sup|wetin)\b/i.test(lower)) {
-    // Short human reply — don't dump the same menu every time
-    return ctx.reply(
-      'How far 👋\n\nWetin you need? Type country + app e.g. *USA WhatsApp* or *Nigeria Telegram*.\n\nOr /fund · /balance · /orders',
-      { parse_mode: 'Markdown' }
-    );
+function isNo(text) {
+  return /^(no|nah|nope|cancel|stop|never mind|later)\b/i.test(String(text || '').trim());
+}
+
+function looksLikeNeedNumber(text) {
+  return /\b(number|sms|otp|verify|verification|i need|get me|buy|virtual number)\b/i.test(
+    String(text || '')
+  );
+}
+
+async function miraShowPricesAndConfirm(ctx, session, userId, countryId, countryName, serviceQuery) {
+  countryName = asName(countryName) || String(countryName);
+  await ctx.reply(`Checking *${countryName}* ${serviceQuery || ''}…`, { parse_mode: 'Markdown' });
+  let list = await getSellableServices(countryId, serviceQuery);
+  if (!list.length) {
+    list = await getSellableServices(countryId, null);
+    if (serviceQuery) list = matchServices(list, serviceQuery);
   }
-  if (lower === 'menu' || lower === 'help' || lower === 'start') {
-    return ctx.reply(
-      'Type country + app freely, e.g. *Australia WhatsApp*.\n\nOr pick a shortcut:',
-      {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-          [
-            Markup.button.callback('🇺🇸 United States', 'cty:12'),
-            Markup.button.callback('🇬🇧 United Kingdom', 'cty:16')
-          ],
-          [
-            Markup.button.callback('🇨🇦 Canada', 'cty:36'),
-            Markup.button.callback('🇳🇬 Nigeria', 'cty:19')
-          ],
-          [Markup.button.callback('💳 Fund wallet', 'menu:fund')],
-          [Markup.button.callback('💰 Balance', 'menu:bal')]
-        ])
-      }
-    );
-  }
-
-  // --- Fund intent ---
-  if (/^(fund|top ?up|deposit|recharge)\b/i.test(lower) || /fund my wallet|top up/i.test(lower)) {
-    const amountMatch = lower.match(/(\d[\d,]{2,}|[1-9]\d{2,})/);
-    if (!amountMatch) {
-      session.state = 'AWAITING_FUND_AMOUNT';
-      await saveUserSession(userId, session);
-      return ctx.reply('How much you wan fund?\n\nMin ₦1,000 · Max ₦200,000\n\nExample: 5000');
-    }
-    let amount = parseInt(amountMatch[1].replace(/,/g, ''), 10);
-    if (amount < 1000) return ctx.reply('Minimum na ₦1,000.');
-    if (amount > 200000) return ctx.reply('Maximum na ₦200,000.');
-    const init = await paystackInitialize(amount, userId, null);
-    if (!init.success) return ctx.reply(init.message || 'Paystack no gree.');
-    const pending = {
-      reference: init.reference,
-      amount_ngn: init.amount_ngn,
-      authorization_url: init.authorization_url,
-      created_at: new Date().toISOString()
-    };
-    session.pending_payment = pending;
+  if (!list.length) {
     session.state = 'AWAITING_INPUT';
-    pendingPayments.set(String(userId), pending);
+    session.pendingService = serviceQuery || session.pendingService;
     await saveUserSession(userId, session);
-    return ctx.reply(
-      `Top up ₦${init.amount_ngn.toLocaleString()}\n\nTap Pay below.\nWhen e successful, type: I don pay`,
-      Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', init.authorization_url)]])
-    );
+    return ctx.reply(MIRA.noStock);
   }
 
-  // Awaiting fund amount only
-  if (sessionState === 'AWAITING_FUND_AMOUNT') {
-    const amount = parseInt(lower.replace(/[^\d]/g, ''), 10) || 0;
-    if (amount < 1000 || amount > 200000) {
-      return ctx.reply('Enter amount between ₦1,000 and ₦200,000. Example: 5000');
-    }
-    const init = await paystackInitialize(amount, userId, null);
-    if (!init.success) return ctx.reply(init.message || 'Paystack no gree.');
-    const pending = {
-      reference: init.reference,
-      amount_ngn: init.amount_ngn,
-      authorization_url: init.authorization_url,
-      created_at: new Date().toISOString()
-    };
-    session.pending_payment = pending;
-    session.state = 'AWAITING_INPUT';
-    pendingPayments.set(String(userId), pending);
-    await saveUserSession(userId, session);
-    return ctx.reply(
-      `Top up ₦${init.amount_ngn.toLocaleString()}\n\nTap Pay below.\nWhen e successful, type: I don pay`,
-      Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', init.authorization_url)]])
-    );
-  }
+  list = dedupeServices(list);
+  session.country = countryName;
+  session.countryId = countryId;
+  session.serviceQuery = serviceQuery;
+  session.pendingService = serviceQuery;
+  session.last_options = list.slice(0, 8).map((s) => ({
+    service_code: s.service_id,
+    name: s.service_name,
+    variant: s.variant || 'normal',
+    price_ngn: s.price_ngn,
+    stock: s.stock,
+    country_id: countryId
+  }));
+  session.state = 'AWAITING_CONFIRM';
+  await saveUserSession(userId, session);
 
-  // --- I don pay ---
-  if (/i don pay|i have paid|payment done|don pay|paid already/i.test(lower)) {
-    const mem = pendingPayments.get(String(userId));
-    const ref = session.pending_payment?.reference || mem?.reference;
-    if (!ref) {
-      return ctx.reply('I no see pending payment. Type /fund 2000 to start one.');
-    }
-    const verified = await paystackVerify(ref);
-    if (!verified.success) {
-      return ctx.reply(verified.message || 'Payment never show success yet. Wait small and try again.');
-    }
-    if (session.last_credited_reference === ref || creditedRefs.has(ref)) {
-      return ctx.reply(`This payment already credited.\nBalance: ₦${Number(session.balance || 0).toLocaleString()}`);
-    }
-    session.balance = (Number(session.balance) || 0) + (Number(verified.amount_ngn) || 0);
-    session.last_credited_reference = ref;
-    session.pending_payment = null;
-    pendingPayments.delete(String(userId));
-    creditedRefs.add(ref);
-    await saveUserSession(userId, session);
-    return ctx.reply(
-      `Payment confirmed ✅\n₦${Number(verified.amount_ngn).toLocaleString()} don enter.\nNew balance: ₦${Number(session.balance).toLocaleString()}\n\nYou fit buy number now. Type country + app e.g. USA WhatsApp`
-    );
-  }
-
-  // --- Need number / buy intent without details ---
-  if (/^(i need number|need number|buy number|i wan number|virtual number|otp|get number)\b/i.test(lower)
-      || lower === 'number') {
-    session.state = 'AWAITING_COUNTRY';
-    await saveUserSession(userId, session);
-    return ctx.reply(
-      'Select the country for your number:',
-      Markup.inlineKeyboard([
+  if (list.length === 1) {
+    const s = list[0];
+    const priceLine = `*${s.service_name}* · ₦${Number(s.price_ngn).toLocaleString()}`;
+    return ctx.reply(MIRA.confirm(countryName, serviceQuery || s.service_name, priceLine), {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
         [
-          Markup.button.callback('🇺🇸 United States', 'cty:12'),
-          Markup.button.callback('🇬🇧 United Kingdom', 'cty:16')
+          Markup.button.callback(
+            `✅ Yes · Buy ₦${Number(s.price_ngn).toLocaleString()}`,
+            `opt:${countryId}:${s.service_id}:${s.price_ngn}`.slice(0, 64)
+          )
         ],
-        [
-          Markup.button.callback('🇨🇦 Canada', 'cty:36'),
-          Markup.button.callback('🇳🇬 Nigeria', 'cty:19')
-        ],
-        [
-          Markup.button.callback('🇬🇭 Ghana', 'cty:38'),
-          Markup.button.callback('🇮🇳 India', 'cty:22')
-        ],
-        [Markup.button.callback('⬅️ Main menu', 'menu:home')]
+        [Markup.button.callback('❌ No', 'opt:cancel')]
       ])
-    );
-  }
-
-  // If we have country in session and user only sent app name
-  const _parsedEarly = await parseCountryService(text);
-  if (session.countryId && !_parsedEarly.countryId) {
-    const maybeApp = parseCountryService('nigeria ' + text); // reuse app matcher
-    // simpler: check SERVICE_MAP keys in text
-    let appHit = null;
-    for (const [name, code] of Object.entries(SERVICE_MAP)) {
-      if (name.length < 2) continue;
-      if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}\\b`, 'i').test(lower)) {
-        appHit = { name, code };
-        break;
-      }
-    }
-    if (appHit) {
-      return showServiceOptions(ctx, session, userId, session.countryId, session.country || 'selected', appHit.name);
-    }
-  }
-
-  // --- Country + app in one message ---
-  const parsed = await parseCountryService(text);
-  if (parsed.countryId && (parsed.serviceCode || parsed.serviceName)) {
-    return showServiceOptions(ctx, session, userId, parsed.countryId, parsed.countryName, parsed.serviceName || parsed.serviceCode);
-  }
-
-  if (parsed.countryId && !parsed.serviceCode) {
-    session.country = parsed.countryName;
-    session.countryId = parsed.countryId;
-    session.state = 'AWAITING_APP';
-    await saveUserSession(userId, session);
-    return ctx.reply(
-      `Country: *${parsed.countryName}*\n\nWhich app you need number for?`,
-      {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-          [
-            Markup.button.callback('WhatsApp', `app:${parsed.countryId}:whatsapp`),
-            Markup.button.callback('Telegram', `app:${parsed.countryId}:telegram`)
-          ],
-          [
-            Markup.button.callback('Google', `app:${parsed.countryId}:google`),
-            Markup.button.callback('Instagram', `app:${parsed.countryId}:instagram`)
-          ],
-          [
-            Markup.button.callback('Facebook', `app:${parsed.countryId}:facebook`),
-            Markup.button.callback('TikTok', `app:${parsed.countryId}:tiktok`)
-          ],
-          [Markup.button.callback('⬅️ Change country', 'menu:home')]
-        ])
-      }
-    );
-  }
-
-  // Last attempt: free-text country resolve + optional app
-  const lastTry = await resolveCountry(text.split(/\s+/)[0] || text);
-  if (lastTry) {
-    const appGuess = await parseCountryService(text);
-    if (appGuess.serviceName || appGuess.serviceCode) {
-      return showServiceOptions(
-        ctx,
-        session,
-        userId,
-        lastTry.id,
-        lastTry.name,
-        appGuess.serviceName || appGuess.serviceCode
-      );
-    }
-    session.country = lastTry.name;
-    session.countryId = lastTry.id;
-    session.state = 'AWAITING_APP';
-    await saveUserSession(userId, session);
-    return ctx.reply(
-      `Country: *${lastTry.name}*\n\nWhich app?`,
-      {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-          [
-            Markup.button.callback('WhatsApp', `app:${lastTry.id}:whatsapp`),
-            Markup.button.callback('Telegram', `app:${lastTry.id}:telegram`)
-          ],
-          [
-            Markup.button.callback('Google', `app:${lastTry.id}:google`),
-            Markup.button.callback('Instagram', `app:${lastTry.id}:instagram`)
-          ],
-          [
-            Markup.button.callback('Facebook', `app:${lastTry.id}:facebook`),
-            Markup.button.callback('TikTok', `app:${lastTry.id}:tiktok`)
-          ]
-        ])
-      }
-    );
+    });
   }
 
   return ctx.reply(
-    'I no catch that one clear.\n\nType like: *Australia WhatsApp* or *USA Telegram*',
+    `Alright, *${countryName}* ${serviceQuery || ''}.\nPick option:`,
+    {
+      parse_mode: 'Markdown',
+      ...optionButtons(countryId, list.slice(0, 8))
+    }
+  );
+}
+
+async function miraHandleSmartText(ctx, session, userId, text) {
+  const lower = String(text || '').trim().toLowerCase();
+  const state = session.state || 'AWAITING_INPUT';
+
+  // --- Confirm step ---
+  if (state === 'AWAITING_CONFIRM') {
+    if (isNo(lower)) {
+      session.state = 'AWAITING_INPUT';
+      session.pendingService = null;
+      await saveUserSession(userId, session);
+      return ctx.reply('Okay, cancelled. Wetin you need instead?');
+    }
+    if (isYes(lower) && session.last_options?.length) {
+      // Trigger same as tapping buy on first option
+      const s = session.last_options[0];
+      const countryId = session.countryId || s.country_id;
+      // Reuse opt handler logic by simulating — call buy path inline
+      const price = Number(s.price_ngn) || 0;
+      if (session.balance < price) {
+        return ctx.reply(MIRA.lowBal(price, session.balance), {
+          ...Markup.inlineKeyboard([[Markup.button.callback('💳 Fund wallet', 'menu:fund')]])
+        });
+      }
+      await ctx.reply('I dey grab the number… hold on.');
+      const bought = await grizzlyBuy(s.service_code, countryId);
+      if (!bought.success) {
+        return ctx.reply(
+          /502|503|gateway|unreachable|timeout/i.test(String(bought.message || ''))
+            ? 'Supplier temporarily unavailable. Abeg try again in a few minutes.'
+            : `E no work: ${bought.message || 'No number available.'}`
+        );
+      }
+      const deb = await safeDebit(userId, price, { orderId: bought.order_id });
+      session.balance = deb.balance;
+      Object.assign(session, deb.session);
+      const order = {
+        orderId: bought.order_id,
+        service: s.service_code,
+        serviceName: s.name,
+        phoneNumber: bought.number,
+        price: money(price),
+        status: 'Waiting for SMS',
+        date: new Date().toISOString(),
+        countryId,
+        charged: deb.ok,
+        refunded: false
+      };
+      session.orders = [...(session.orders || []), order].slice(-30);
+      session.state = 'AWAITING_INPUT';
+      session.last_options = [];
+      await saveUserSession(userId, session);
+      const phone = String(bought.number || '');
+      const cancelLabel = `⏳ Cancel (wait ${Math.round(MIN_CANCEL_MS / 60000)}m)`;
+      return ctx.reply(
+        `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n\nUse am for the app to request OTP.\nWhen you ready, tap Check.\n\n_Cancel opens after ~${Math.round(MIN_CANCEL_MS / 60000)} minutes._`,
+        {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([
+            [{ text: '📋 Copy number', copy_text: { text: phone } }],
+            [Markup.button.callback('Check SMS code', `chk:${bought.order_id}:${price}`)],
+            [Markup.button.callback(cancelLabel.slice(0, 64), `can:${bought.order_id}:${price}`)]
+          ])
+        }
+      );
+    }
+    // not yes/no — fall through to re-parse
+  }
+
+  // --- Waiting for country after service ---
+  if (state === 'AWAITING_COUNTRY') {
+    const c = await resolveCountry(text);
+    if (!c) {
+      return ctx.reply('I no catch that country. Type country name e.g. *USA*, *UK*, *Nigeria*.', {
+        parse_mode: 'Markdown'
+      });
+    }
+    const svc = session.pendingService || session.serviceQuery || '';
+    return miraShowPricesAndConfirm(ctx, session, userId, c.id, c.name, svc);
+  }
+
+  // --- Waiting for service ---
+  if (state === 'AWAITING_SERVICE') {
+    const svc = detectServiceOnly(text);
+    if (!svc) {
+      return ctx.reply(MIRA.askService);
+    }
+    session.pendingService = svc.serviceName;
+    session.serviceQuery = svc.serviceName;
+    session.state = 'AWAITING_COUNTRY';
+    await saveUserSession(userId, session);
+    return ctx.reply(MIRA.askCountry(svc.serviceName), { parse_mode: 'Markdown' });
+  }
+
+  // --- Full parse: country + service in one message ---
+  const parsed = await parseCountryService(text);
+  if (parsed.countryId && (parsed.serviceName || parsed.serviceCode)) {
+    return miraShowPricesAndConfirm(
+      ctx,
+      session,
+      userId,
+      parsed.countryId,
+      parsed.countryName,
+      parsed.serviceName || parsed.serviceCode
+    );
+  }
+  if (parsed.countryId && !parsed.serviceName) {
+    session.countryId = parsed.countryId;
+    session.country = parsed.countryName;
+    session.state = 'AWAITING_SERVICE';
+    await saveUserSession(userId, session);
+    return ctx.reply(
+      `Country: *${asName(parsed.countryName)}*\n\n${MIRA.askService}`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+  if (!parsed.countryId && (parsed.serviceName || parsed.serviceCode)) {
+    session.pendingService = parsed.serviceName || parsed.serviceCode;
+    session.serviceQuery = session.pendingService;
+    session.state = 'AWAITING_COUNTRY';
+    await saveUserSession(userId, session);
+    return ctx.reply(MIRA.askCountry(session.pendingService), { parse_mode: 'Markdown' });
+  }
+
+  // Country-only free resolve
+  const onlyCountry = await resolveCountry(text);
+  if (onlyCountry && String(text).trim().split(/\s+/).length <= 3) {
+    session.countryId = onlyCountry.id;
+    session.country = onlyCountry.name;
+    session.state = 'AWAITING_SERVICE';
+    await saveUserSession(userId, session);
+    return ctx.reply(
+      `Country: *${asName(onlyCountry.name)}*\n\n${MIRA.askService}`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  // "I need number" style
+  if (looksLikeNeedNumber(text)) {
+    session.state = 'AWAITING_SERVICE';
+    await saveUserSession(userId, session);
+    return ctx.reply(MIRA.askService);
+  }
+
+  // Greetings
+  if (/^(hi|hello|hey|yo|awfa|how far|how you dey|good morning|good evening|sup|wetin|mira)\b/i.test(lower)) {
+    return ctx.reply(MIRA.greet, { parse_mode: 'Markdown' });
+  }
+
+  if (lower === 'menu' || lower === 'help') {
+    return ctx.reply(
+      'Type country + app e.g. *Australia WhatsApp*\nOr say *I need number* make I guide you.\n\n/fund · /balance · /orders',
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  // Soft fallback — still Mira, not robotic
+  return ctx.reply(
+    `${MIRA.yarn}\n\nExample: *UK Telegram* or *Nigeria WhatsApp*`,
     { parse_mode: 'Markdown' }
   );
+}
+
+
+bot.on('text', async (ctx) => {
+  const textMsg = (ctx.message.text || '').trim();
+  if (textMsg.startsWith('/')) return;
+
+  const userId = ctx.from.id;
+  const session = await getUserSession(userId);
+  const lower = textMsg.toLowerCase();
+
+  // Keep country session if still browsing
+  if (session.countryId && session.state === 'AWAITING_APP') {
+    const svc = detectServiceOnly(textMsg) || (await parseCountryService(textMsg));
+    const q = svc.serviceName || svc.serviceCode || textMsg;
+    return miraShowPricesAndConfirm(ctx, session, userId, session.countryId, session.country, q);
+  }
+
+  // Gemini optional enhancement for pure chat — but Mira smart flow owns buy path
+  const buyIntent =
+    looksLikeNeedNumber(textMsg) ||
+    !!(await parseCountryService(textMsg)).countryId ||
+    !!(await parseCountryService(textMsg)).serviceName ||
+    ['AWAITING_SERVICE', 'AWAITING_COUNTRY', 'AWAITING_CONFIRM'].includes(session.state) ||
+    detectServiceOnly(textMsg);
+
+  if (GEMINI_API_KEY && !buyIntent && session.state === 'AWAITING_INPUT') {
+    try {
+      const result = await runGeminiAgent(textMsg, session, userId);
+      await saveUserSession(userId, session);
+      if (result?.text) {
+        const opts = session.last_options || [];
+        if (opts.length > 1 && session.countryId) {
+          return ctx.reply(result.text.slice(0, 4000), optionButtons(session.countryId, opts.map((o) => ({
+            service_id: o.service_code,
+            service_name: o.name,
+            price_ngn: o.price_ngn,
+            variant: o.variant
+          }))));
+        }
+        return ctx.reply(result.text.slice(0, 4000));
+      }
+    } catch (e) {
+      console.error('gemini text', e.message);
+    }
+  }
+
+  // Built-in Mira smart conversation (always on)
+  return miraHandleSmartText(ctx, session, userId, textMsg);
 });
+
 
 async function showServiceOptions(ctx, session, userId, countryId, countryName, serviceQuery) {
   countryName = asName(countryName) || `country ${countryId}`;
