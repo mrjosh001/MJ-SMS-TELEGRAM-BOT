@@ -57,9 +57,9 @@ const SERVICE_MAP = {
   facebook: 'fb', fb: 'fb',
   instagram: 'ig', ig: 'ig',
   twitter: 'tw', x: 'tw',
-  tiktok: 'lf',
+  tiktok: 'lf', douyin: 'lf',
   discord: 'ds',
-  snapchat: 'sn',
+  snapchat: 'fu', snap: 'fu',
   microsoft: 'mm',
   amazon: 'am',
   apple: 'wx',
@@ -69,8 +69,42 @@ const SERVICE_MAP = {
   netflix: 'nf',
   paypal: 'ts',
   bumble: 'mo',
-  tinder: 'oi'
+  tinder: 'oi',
+  linkedin: 'tn',
+  signal: 'aaw',
+  wechat: 'we',
+  imo: 'im'
 };
+
+// Human names for Grizzly service codes (aligned with MJ HUB website map)
+const SERVICE_NAMES = {
+  aaw: 'Signal', aax: 'Haraj', acz: 'Claude / AI', am: 'Amazon',
+  ds: 'Discord', fb: 'Facebook', fu: 'Snapchat', go: 'Google',
+  ig: 'Instagram', im: 'Imo', kc: 'X / Twitter (alt)', kt: 'KakaoTalk',
+  lf: 'TikTok', me: 'Line', mm: 'Microsoft', mo: 'Bumble',
+  nf: 'Netflix', oi: 'Tinder', ot: 'Any other', tg: 'Telegram',
+  tk: 'TikTok', tl: 'Truecaller', tn: 'LinkedIn', ts: 'PayPal',
+  tw: 'X / Twitter', uk: 'Airbnb', vi: 'Viber', vk: 'VK',
+  wa: 'WhatsApp', we: 'WeChat', wx: 'Apple', ya: 'Yandex'
+};
+
+function friendlyServiceName(code, rawName) {
+  const c = String(code || '').toLowerCase();
+  const raw = String(rawName || '').trim();
+  if (raw && raw.toLowerCase() !== c && !/^gr_/i.test(raw)) return raw.replace(/_/g, ' ');
+  if (SERVICE_NAMES[c]) return SERVICE_NAMES[c];
+  return c.toUpperCase();
+}
+
+function detectVariant(name, code) {
+  const s = `${name || ''} ${code || ''}`.toLowerCase();
+  if (/virtual|voip|temp number|temporary/.test(s)) return 'virtual';
+  if (/physical|real|normal|mobile|long.?term/.test(s)) return 'normal';
+  // Grizzly codes that commonly map to alternate/virtual lines for same app
+  if (/^wa_|^tg_|^go_|^ig_|^fb_/.test(s)) return 'alternate';
+  return 'normal';
+}
+
 
 if (!BOT_TOKEN) {
   console.error('BOT_TOKEN missing');
@@ -207,15 +241,20 @@ async function grizzlyPrices(countryId) {
       if (!code || typeof info !== 'object') continue;
       const cost = Number(info.cost ?? info.price ?? info.rate ?? 0);
       const count = Number(info.count ?? info.phones ?? info.qty ?? 0);
+      if (!(cost > 0)) continue;
+      const rawName = info.name || info.service || info.eng || code;
+      const display = friendlyServiceName(code, rawName);
+      const variant = detectVariant(display, code);
       list.push({
         service_id: String(code),
-        service_name: String(code),
+        service_name: display,
+        variant,
         stock: count,
         price_usd: cost,
         price_ngn: markupNgn(cost)
       });
     }
-    return list.filter((s) => s.price_usd > 0);
+    return list;
   } catch (e) {
     console.error('grizzlyPrices', e.message);
     return [];
@@ -294,57 +333,61 @@ const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GE
 const MAX_CONVERSATION_TURNS = 16;
 const MAX_TOOL_ROUNDTRIPS = 6;
 
-const GEMINI_SYSTEM_PROMPT = `You be Mira. You work for MJ SMS under MJ HUB (Server 1, GrizzlySMS). You be one real person wey dey help customers for Telegram. You no be AI, robot, assistant, or system.
+const GEMINI_SYSTEM_PROMPT = `You be Mira. You work for MJ SMS under MJ HUB (Server 1 powered by GrizzlySMS). You be real human support and sales for Telegram. You no be AI, robot, or system.
 
-HOW YOU TALK:
-- Sound like normal Nigerian for WhatsApp. Mix Pidgin with simple English natural, no force am.
-- Short messages. Like real chat. 1–3 short lines most times.
-- Fluent and smooth. No stiff English. No textbook tone.
-- Examples of good voice:
-  "How far, I dey. You need number for which app?"
-  "USA WhatsApp dey ₦2,500 now. You wan make I grab am?"
-  "E never land. Give am 30 seconds make I check again."
-  "Your balance low. How much you wan fund?"
-- Bad voice (never do this):
-  long essays, bullet lists, "I can help you with the following", "As an AI", heavy formal English, repeating welcome speech every message, stuffing hyphens or markdown walls.
+VOICE:
+Natural Nigerian WhatsApp chat. Pidgin + simple English. Short. Fluent. Warm. Street-smart. No essays, no bullet walls, no "As an AI", no re-intro every message. Continue the same conversation.
 
-CONVERSATION MEMORY:
-- You dey inside one ongoing chat. Read the history. Continue from where una stop.
-- If dem don greet, no greet again.
-- If dem say "yes", "ok", "go ahead", continue the last offer. No restart.
-- If dem already mention country or app, no ask that same thing again unless e unclear.
-- If dem change topic, follow them sharp.
-- No copy-paste the same sales paragraph. Each reply must fit the last message.
+WHAT MJ HUB IS (know this deep):
+MJ HUB na digital services marketplace with one ecosystem:
+1) MJ SMS — temporary real mobile numbers for SMS OTP verification
+2) MJ Logs — premium verified social accounts (website)
+3) MJ Boosters — social growth (Instagram, TikTok, YouTube, etc. on website)
+This Telegram bot handles MJ SMS Server 1 (GrizzlySMS) only.
 
-WETIN YOU FIT DO:
-1) Sell / buy virtual numbers for OTP (WhatsApp, Telegram, Google, Instagram, Facebook, TikTok, Snapchat, Discord, Microsoft, etc.)
-2) Check live price and stock
-3) Check if SMS code don land
-4) Cancel and refund if eligible
-5) Check balance and order history
-6) Fund wallet with Paystack (min ₦1,000, max ₦200,000)
+MJ SMS HOW E DEY WORK:
+- Customer pick country + app (WhatsApp, Telegram, Google, Instagram, Facebook, TikTok, Snapchat, Discord, Microsoft, Apple, etc.)
+- Dem pay from wallet in Naira (₦)
+- System give phone number
+- Customer use the number for the app to request OTP
+- SMS code land → dem ask you to check → you give the code
+- One number = one verification cycle. After code, dem free
+- If code never come and still eligible, cancel fit refund wallet
+- Numbers from Grizzly are real mobile routes for OTP (not random VOIP spam lines). Some countries still show more than one option for the same app (e.g. Normal vs Virtual / alternate routes). Prices and stock change live.
 
-HOW SALES FLOW:
-- First understand wetin dem need.
-- Call get_prices before you mention any price. Never invent price, number, code, stock, or balance.
-- Talk price simple: "Nigeria WhatsApp na ₦X."
-- Soft close one time: "I fit buy am for you now?"
-- If dem agree, call buy_number, then send the phone number clear and tell dem make dem request the OTP for the app.
-- When dem ask for code, call check_status.
-- If balance no reach, say the shortfall and ask how much dem wan fund. When amount clear, call create_payment.
-- For payment: no dump long checkout link for chat. Just confirm amount and say make dem tap the Pay button wey go show under the message. After dem pay, dem fit type "I don pay" then you call verify_payment.
+NORMAL VS VIRTUAL / MULTIPLE OPTIONS (VERY IMPORTANT):
+- For some countries (especially USA and others), one app fit get more than one service option: Normal, Virtual, or alternate routes with different price and stock.
+- ANY time get_prices or buy_number return more than one option, you MUST list all options clear and ask the user to pick before buying.
+- Format options simple, example:
+  "USA WhatsApp get 2 options:
+  1) Normal — ₦3,500 (stock 12)
+  2) Virtual — ₦2,200 (stock 40)
+  Which one you want?"
+- No pick for them. No buy until dem choose.
+- When dem choose, call buy_number with that service_code.
 
-PERSONALITY:
-- Warm, street-smart, patient, a bit playful but professional.
-- If dem vex or confuse, calm them: "No worry, make we sort am."
-- If stock finish or service fail, talk truth and offer another country/app.
-- You fit market small, but no force. No spam.
+SALES + SUPPORT FLOW:
+1) Understand need (country + app)
+2) Call get_prices before any price talk
+3) If multiple options → show all → wait for pick
+4) Soft close once dem choose
+5) buy_number → give phone number → tell dem request OTP on the app
+6) check_status when dem ask for code
+7) cancel_order if dem wan cancel and eligible
+8) If balance low → ask fund amount (min ₦1,000 max ₦200,000) → create_payment → dem tap Pay button → "I don pay" → verify_payment
 
-HARD RULES:
-- Never say you are AI / bot / model / language model.
-- Never invent data. Tools first for price, buy, code, balance, payment.
-- Keep Telegram replies short and human.
-- Tools available: list_countries, get_prices, buy_number, check_status, cancel_order, get_balance, get_my_orders, create_payment, verify_payment.
+FUNDING:
+No long Paystack URL dump. Confirm amount, say make dem tap Pay button under the message.
+
+TOOLS (never invent data):
+list_countries, get_prices, buy_number, check_status, cancel_order, get_balance, get_my_orders, create_payment, verify_payment.
+
+CONVERSATION RULES:
+- No repeat greeting
+- No ask the same question twice
+- If dem say yes/ok, continue last offer
+- Keep replies short and human
+- Market soft, no force
 `;
 
 const GEMINI_TOOLS = [{
@@ -368,12 +411,13 @@ const GEMINI_TOOLS = [{
     },
     {
       name: 'buy_number',
-      description: 'Buy a number and charge wallet. Only after user clearly confirmed country and app.',
+      description: 'Buy a number and charge wallet. Only after user clearly confirmed country, app, AND which option if multiple (normal vs virtual). Prefer service_code from get_prices.',
       parameters: {
         type: 'OBJECT',
         properties: {
           country: { type: 'STRING' },
-          service: { type: 'STRING', description: 'App name e.g. WhatsApp' }
+          service: { type: 'STRING', description: 'App name e.g. WhatsApp' },
+          service_code: { type: 'STRING', description: 'Exact Grizzly service code from get_prices options e.g. wa' }
         },
         required: ['country', 'service']
       }
@@ -546,13 +590,24 @@ async function executeGeminiFunction(fnName, args, telegramUserId, session) {
       }
       session.country = c.name;
       session.countryId = c.id;
+      const services = list.slice(0, 15).map((s) => ({
+        service_code: s.service_id,
+        name: s.service_name,
+        variant: s.variant || 'normal',
+        price_ngn: s.price_ngn,
+        stock: s.stock
+      }));
+      // Flag when user must choose between options (e.g. normal vs virtual)
+      const hasMultiple = services.length > 1;
+      const hasVariants = new Set(services.map((s) => s.variant)).size > 1;
       return {
         country: c.name,
-        services: list.slice(0, 15).map((s) => ({
-          service: s.service_id,
-          price_ngn: s.price_ngn,
-          stock: s.stock
-        }))
+        must_choose: hasMultiple,
+        has_normal_and_virtual: hasVariants,
+        services,
+        tip: hasMultiple
+          ? 'Show EVERY option with name, variant, price and stock. Ask user which one they want before buy_number. Prefer service_code when buying.'
+          : 'Only one option available for this filter.'
       };
     }
 
@@ -560,9 +615,29 @@ async function executeGeminiFunction(fnName, args, telegramUserId, session) {
       const c = resolveCountry(args.country);
       if (!c) return { error: `Unknown country "${args.country}".` };
       const list = await grizzlyPrices(c.id);
-      const matched = matchServices(list, args.service);
-      const svc = matched[0] || list.find((s) => String(s.service_id).toLowerCase() === String(args.service).toLowerCase());
-      if (!svc) return { error: `"${args.service}" isn't available in ${c.name} right now.` };
+      let svc = null;
+      // Prefer exact service_code if provided (user picked a specific option)
+      if (args.service_code) {
+        svc = list.find((s) => String(s.service_id).toLowerCase() === String(args.service_code).toLowerCase());
+      }
+      if (!svc) {
+        const matched = matchServices(list, args.service || args.service_code);
+        if (matched.length > 1 && !args.service_code) {
+          return {
+            error: 'multiple_options',
+            message: 'More than one option exists. Show options and ask user to pick before buying.',
+            options: matched.slice(0, 8).map((s) => ({
+              service_code: s.service_id,
+              name: s.service_name,
+              variant: s.variant,
+              price_ngn: s.price_ngn,
+              stock: s.stock
+            }))
+          };
+        }
+        svc = matched[0] || list.find((s) => String(s.service_id).toLowerCase() === String(args.service).toLowerCase());
+      }
+      if (!svc) return { error: `"${args.service || args.service_code}" isn't available in ${c.name} right now.` };
 
       if (svc.price_ngn > 0 && session.balance < svc.price_ngn) {
         return {
@@ -794,16 +869,34 @@ function parseCountryService(text) {
 }
 
 function matchServices(list, query) {
-  if (!query) return list.slice(0, 12);
-  const q = String(query).toLowerCase();
+  if (!query) return list.slice(0, 20);
+  const q = String(query).toLowerCase().trim();
   const code = SERVICE_MAP[q] || q;
-  const hit = list.filter(
-    (s) =>
-      s.service_id.toLowerCase() === code ||
-      s.service_id.toLowerCase().includes(q) ||
-      s.service_name.toLowerCase().includes(q)
-  );
-  return hit.length ? hit.slice(0, 12) : list.slice(0, 12);
+  const hit = list.filter((s) => {
+    const id = String(s.service_id || '').toLowerCase();
+    const name = String(s.service_name || '').toLowerCase();
+    return (
+      id === code ||
+      id === q ||
+      name === q ||
+      name.includes(q) ||
+      id.includes(code) ||
+      // WhatsApp family: wa, wa_*, etc.
+      (code === 'wa' && (id === 'wa' || id.startsWith('wa') || name.includes('whatsapp'))) ||
+      (code === 'tg' && (id === 'tg' || id.startsWith('tg') || name.includes('telegram'))) ||
+      (code === 'go' && (id === 'go' || name.includes('google') || name.includes('gmail'))) ||
+      (code === 'ig' && (id === 'ig' || name.includes('instagram'))) ||
+      (code === 'fb' && (id === 'fb' || name.includes('facebook')))
+    );
+  });
+  // Prefer stock > 0 first, then cheaper
+  hit.sort((a, b) => {
+    const sa = a.stock > 0 ? 0 : 1;
+    const sb = b.stock > 0 ? 0 : 1;
+    if (sa !== sb) return sa - sb;
+    return (a.price_ngn || 0) - (b.price_ngn || 0);
+  });
+  return hit.length ? hit.slice(0, 15) : list.slice(0, 15);
 }
 
 // ---------- Bot commands ----------
