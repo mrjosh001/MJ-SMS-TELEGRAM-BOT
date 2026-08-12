@@ -160,10 +160,11 @@ function friendlyServiceName(code, rawName) {
 
 function detectVariant(name, code) {
   const s = `${name || ''} ${code || ''}`.toLowerCase();
-  if (/virtual|voip|temp number|temporary/.test(s)) return 'virtual';
-  if (/physical|real|normal|mobile|long.?term/.test(s)) return 'normal';
-  // Grizzly codes that commonly map to alternate/virtual lines for same app
-  if (/^wa_|^tg_|^go_|^ig_|^fb_/.test(s)) return 'alternate';
+  // Only label virtual when supplier name/code clearly indicates it
+  if (/\bvirtual\b|\bvoip\b|temp number|temporary/.test(s)) return 'virtual';
+  if (/\bphysical\b|\breal sim\b|\bnormal\b|long.?term/.test(s)) return 'normal';
+  // Alternate route codes (wa_x style) — only when code has a suffix, not plain "wa"
+  if (/^(wa|tg|go|ig|fb)_.+/.test(s)) return 'alternate';
   return 'normal';
 }
 
@@ -592,23 +593,39 @@ async function getSellableServices(countryId, serviceFilter) {
   });
 
   const hubCount = out.filter((s) => s.source === 'hub').length;
+  const deduped = dedupeServices(out);
   console.log(
     '[prices] grizzly services',
     live.length,
+    '| after dedupe',
+    deduped.length,
     '| hub matched by service_id',
     hubCount,
     '| country',
     countryId,
     serviceFilter || '(all)'
   );
-  return out;
+  return deduped;
 }
 
 function optionButtons(countryId, services) {
-  // Telegram inline keyboard: 1 option per row for clarity (Normal vs Virtual)
-  const rows = services.slice(0, 12).map((s) => {
-    const label = `${s.variant === 'virtual' ? '👻 Virtual' : '📱 Normal'} · ${s.service_name} · ₦${Number(s.price_ngn).toLocaleString()}`;
-    // opt:countryId:serviceCode:price
+  // Only show Normal/Virtual labels when supplier actually returned distinct variants
+  const variants = new Set(services.map((s) => s.variant || 'normal'));
+  const showVariantLabel = services.length > 1 && variants.size > 1;
+  const rows = services.slice(0, 12).map((s, idx) => {
+    let label;
+    if (showVariantLabel) {
+      const tag =
+        s.variant === 'virtual' ? '👻 Virtual' :
+        s.variant === 'alternate' ? '🔀 Alternate' :
+        '📱 Normal';
+      label = `${tag} · ${s.service_name} · ₦${Number(s.price_ngn).toLocaleString()}`;
+    } else if (services.length > 1) {
+      // Multiple real service_ids but same variant class — show name + price only
+      label = `${s.service_name} · ₦${Number(s.price_ngn).toLocaleString()}`;
+    } else {
+      label = `✅ Buy · ₦${Number(s.price_ngn).toLocaleString()}`;
+    }
     const data = `opt:${countryId}:${s.service_id}:${s.price_ngn}`;
     return [Markup.button.callback(label.slice(0, 64), data.slice(0, 64))];
   });
@@ -1312,35 +1329,76 @@ async function parseCountryService(text) {
 
 
 function matchServices(list, query) {
-  if (!query) return list.slice(0, 20);
+  if (!query) return dedupeServices(list).slice(0, 20);
   const q = String(query).toLowerCase().trim();
-  const code = SERVICE_MAP[q] || q;
-  const hit = list.filter((s) => {
+  const code = (SERVICE_MAP[q] || q).toLowerCase();
+
+  // Primary exact service_id match first (wa, tg, go…)
+  const exact = list.filter((s) => String(s.service_id || '').toLowerCase() === code);
+
+  // Extra variants ONLY if supplier name/code clearly marks virtual/alternate
+  // Do NOT pull every service whose name merely contains "whatsapp"
+  const extras = list.filter((s) => {
     const id = String(s.service_id || '').toLowerCase();
     const name = String(s.service_name || '').toLowerCase();
-    return (
-      id === code ||
-      id === q ||
-      name === q ||
-      name.includes(q) ||
-      id.includes(code) ||
-      // WhatsApp family: wa, wa_*, etc.
-      (code === 'wa' && (id === 'wa' || name.includes('whatsapp'))) ||
-      (code === 'tg' && (id === 'tg' || name.includes('telegram'))) ||
-      (code === 'go' && (id === 'go' || name.includes('google') || name.includes('gmail'))) ||
-      (code === 'ig' && (id === 'ig' || name.includes('instagram'))) ||
-      (code === 'fb' && (id === 'fb' || name.includes('facebook')))
-    );
+    if (id === code) return false; // already in exact
+    // same family with explicit suffix: wa_xxx, tg_xxx
+    if (code.length >= 2 && new RegExp(`^${code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}_`).test(id)) {
+      return true;
+    }
+    // name must include app AND variant keyword
+    const appWord =
+      code === 'wa' ? 'whatsapp' :
+      code === 'tg' ? 'telegram' :
+      code === 'go' ? 'google' :
+      code === 'ig' ? 'instagram' :
+      code === 'fb' ? 'facebook' :
+      code === 'lf' ? 'tiktok' :
+      code === 'fu' ? 'snapchat' :
+      q;
+    if (!name.includes(appWord) && id !== q) return false;
+    return /virtual|voip|alternate|temp/.test(name) || /virtual|voip|alternate|temp/.test(id);
   });
-  // Prefer stock > 0 first, then cheaper
+
+  let hit = [...exact, ...extras];
+
+  // Fallback: loose name match only if nothing exact (single best row)
+  if (!hit.length) {
+    hit = list.filter((s) => {
+      const id = String(s.service_id || '').toLowerCase();
+      const name = String(s.service_name || '').toLowerCase();
+      return id === q || name === q || name.includes(q);
+    });
+  }
+
+  hit = dedupeServices(hit);
+
+  // Prefer stock > 0, then cheaper
   hit.sort((a, b) => {
     const sa = a.stock > 0 ? 0 : 1;
     const sb = b.stock > 0 ? 0 : 1;
     if (sa !== sb) return sa - sb;
     return (a.price_ngn || 0) - (b.price_ngn || 0);
   });
-  return hit.length ? hit.slice(0, 15) : list.slice(0, 15);
+
+  // If only the primary code exists, return just that (1 option)
+  // If supplier has real extras, return primary + extras
+  return hit.slice(0, 8);
 }
+
+/** Unique by service_id — never show the same supplier service twice */
+function dedupeServices(list) {
+  const seen = new Set();
+  const out = [];
+  for (const s of list || []) {
+    const id = String(s.service_id || '').toLowerCase();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(s);
+  }
+  return out;
+}
+
 
 // ---------- Bot commands ----------
 
@@ -1983,10 +2041,12 @@ async function showServiceOptions(ctx, session, userId, countryId, countryName, 
     return ctx.reply('No numbers available for that option right now. Try another country or app.');
   }
 
+  list = dedupeServices(list);
+
   session.country = countryName;
   session.countryId = countryId;
   session.serviceQuery = serviceQuery;
-  session.last_options = list.slice(0, 12).map((s) => ({
+  session.last_options = list.slice(0, 8).map((s) => ({
     service_code: s.service_id,
     name: s.service_name,
     variant: s.variant || 'normal',
@@ -1997,6 +2057,7 @@ async function showServiceOptions(ctx, session, userId, countryId, countryName, 
   session.state = 'AWAITING_INPUT';
   await saveUserSession(userId, session);
 
+  // Single supplier option → one buy button (no fake Normal/Virtual pair)
   if (list.length === 1) {
     const s = list[0];
     return ctx.reply(
@@ -2014,12 +2075,12 @@ async function showServiceOptions(ctx, session, userId, countryId, countryName, 
     );
   }
 
-  // Multiple options — Normal / Virtual style buttons
+  // Multiple real service_ids from supplier only
   return ctx.reply(
-    `*${countryName}* · ${serviceQuery || 'services'}\n\nSelect the number type:`,
+    `*${countryName}* · ${serviceQuery || 'services'}\n\nSelect an option:`,
     {
       parse_mode: 'Markdown',
-      ...optionButtons(countryId, list.slice(0, 12))
+      ...optionButtons(countryId, list.slice(0, 8))
     }
   );
 }
