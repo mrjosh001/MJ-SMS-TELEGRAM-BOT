@@ -287,69 +287,117 @@ async function grizzlyPrices(countryId) {
 
 // Pull selling prices from MJ HUB website catalog (number_services)
 async function fetchHubServices(countryId, serviceFilter) {
-  // Website catalog lives on a DIFFERENT Supabase than this bot
+  // Website catalog = different Supabase project
   if (!MJ_HUB_REST_URL || !MJ_HUB_SERVICE_KEY) {
-    console.error(
-      'fetchHubServices: set MJ_HUB_SUPABASE_URL + MJ_HUB_SERVICE_KEY (website project, not bot DB)'
-    );
+    console.error('fetchHubServices: MJ_HUB_SUPABASE_URL / MJ_HUB_SERVICE_KEY missing');
     return [];
   }
   try {
-    const baseSelect =
-      `${MJ_HUB_REST_URL}/number_services?select=id,service_id,service_name,country_id,country_name,price,available_quantity,is_available,supplier_price` +
-      `&price=gt.0&order=price.asc&limit=100`;
+    const select =
+      'id,service_id,service_name,country_id,country_name,price,available_quantity,is_available,supplier_price';
 
-    // 1) by country_id (Grizzly id, e.g. 12 = USA)
-    let url = `${baseSelect}&country_id=eq.${encodeURIComponent(countryId)}`;
-    let res = await axios.get(url, { ...axiosCfg, headers: mjHubHeaders });
-    let rows = Array.isArray(res.data) ? res.data : [];
-
-    // 2) if empty, try country_name (in case id type/format differs)
-    if (!rows.length) {
-      const nameGuess =
-        Object.entries(COUNTRY_MAP).find(([, id]) => String(id) === String(countryId))?.[0] || '';
-      const pretty =
-        nameGuess === 'usa' || nameGuess === 'us' || nameGuess === 'america' || nameGuess === 'united states'
-          ? 'USA'
-          : (nameGuess || '').toUpperCase();
-      if (pretty) {
-        url = `${baseSelect}&country_name=ilike.*${encodeURIComponent(pretty)}*`;
-        res = await axios.get(url, { ...axiosCfg, headers: mjHubHeaders });
-        rows = Array.isArray(res.data) ? res.data : [];
-        console.log('[hub] country_name fallback', pretty, 'rows', rows.length);
-      }
-    }
-
-    // Prefer available, but keep unavailable if that's all we have
-    const available = rows.filter((r) => r.is_available !== false && r.is_available !== 'false');
-    if (available.length) rows = available;
-
+    // Build optional service filter at the DB level (more reliable than JS-only)
+    let serviceQuery = '';
     if (serviceFilter) {
       const q = String(serviceFilter).toLowerCase().trim();
       const code = (SERVICE_MAP[q] || q).toLowerCase();
-      rows = rows.filter((r) => {
-        const id = String(r.service_id || '').toLowerCase();
-        const name = String(r.service_name || '').replace(/_/g, ' ').toLowerCase();
-        if (id === code || id === q) return true;
-        if (name === q || name === code) return true;
-        // Strict app matching — do NOT use startsWith('wa') (matches WAF etc.)
-        if (code === 'wa' || q === 'whatsapp') return id === 'wa' || name.includes('whatsapp');
-        if (code === 'tg' || q === 'telegram') return id === 'tg' || name.includes('telegram');
-        if (code === 'go' || q === 'google' || q === 'gmail') return id === 'go' || name.includes('google') || name.includes('gmail');
-        if (code === 'ig' || q === 'instagram') return id === 'ig' || name.includes('instagram');
-        if (code === 'fb' || q === 'facebook') return id === 'fb' || name.includes('facebook');
-        if (code === 'lf' || q === 'tiktok') return id === 'lf' || id === 'tk' || name.includes('tiktok');
-        if (code === 'fu' || q === 'snapchat') return id === 'fu' || id === 'sn' || name.includes('snapchat');
-        if (code === 'ds' || q === 'discord') return id === 'ds' || name.includes('discord');
-        return name.includes(q);
-      });
+      // Map common apps to name patterns + exact codes
+      const namePat =
+        code === 'wa' || q.includes('whatsapp')
+          ? 'whatsapp'
+          : code === 'tg' || q.includes('telegram')
+            ? 'telegram'
+            : code === 'go' || q.includes('google') || q.includes('gmail')
+              ? 'google'
+              : code === 'ig' || q.includes('instagram')
+                ? 'instagram'
+                : code === 'fb' || q.includes('facebook')
+                  ? 'facebook'
+                  : code === 'lf' || q.includes('tiktok')
+                    ? 'tiktok'
+                    : code === 'fu' || q.includes('snapchat')
+                      ? 'snapchat'
+                      : code === 'ds' || q.includes('discord')
+                        ? 'discord'
+                        : q.replace(/[^a-z0-9]/g, '');
+      // Exclude false friends like WAF when looking for WhatsApp
+      const exclude =
+        namePat === 'whatsapp' ? '&service_id=neq.waf&service_name=not.ilike.*waf*' : '';
+      serviceQuery =
+        `&or=(service_id.eq.${encodeURIComponent(code)},service_name.ilike.*${encodeURIComponent(namePat)}*)` +
+        exclude;
     }
 
-    return rows.map((r) => {
+    let url =
+      `${MJ_HUB_REST_URL}/number_services?select=${select}` +
+      `&country_id=eq.${encodeURIComponent(countryId)}` +
+      `&price=gt.0` +
+      serviceQuery +
+      `&order=price.asc&limit=50`;
+
+    let res = await axios.get(url, { ...axiosCfg, headers: mjHubHeaders });
+    let rows = Array.isArray(res.data) ? res.data : [];
+
+    // Fallback: country_name match (admin shows "USA" / "USA (2)")
+    if (!rows.length) {
+      const pretty =
+        String(countryId) === '12'
+          ? 'USA'
+          : String(countryId) === '16'
+            ? 'United Kingdom'
+            : String(countryId) === '19'
+              ? 'Nigeria'
+              : '';
+      if (pretty) {
+        url =
+          `${MJ_HUB_REST_URL}/number_services?select=${select}` +
+          `&country_name=ilike.*${encodeURIComponent(pretty)}*` +
+          `&price=gt.0` +
+          serviceQuery +
+          `&order=price.asc&limit=50`;
+        res = await axios.get(url, { ...axiosCfg, headers: mjHubHeaders });
+        rows = Array.isArray(res.data) ? res.data : [];
+        console.log('[hub] country_name', pretty, 'rows', rows.length);
+      }
+    }
+
+    // Last try for WhatsApp: no country filter, then keep USA-ish rows
+    if (!rows.length && serviceFilter && /whatsapp|wa/i.test(String(serviceFilter))) {
+      url =
+        `${MJ_HUB_REST_URL}/number_services?select=${select}` +
+        `&or=(service_id.eq.wa,service_name.ilike.*whatsapp*)` +
+        `&service_id=neq.waf` +
+        `&price=gt.0&order=price.asc&limit=30`;
+      res = await axios.get(url, { ...axiosCfg, headers: mjHubHeaders });
+      let all = Array.isArray(res.data) ? res.data : [];
+      rows = all.filter((r) => {
+        const cn = String(r.country_name || '').toUpperCase();
+        const cid = String(r.country_id);
+        return cid === String(countryId) || cn.includes('USA') || cn.includes('UNITED STATES');
+      });
+      console.log('[hub] global whatsapp then USA filter', all.length, '->', rows.length);
+    }
+
+    const available = rows.filter((r) => r.is_available !== false && r.is_available !== 'false');
+    if (available.length) rows = available;
+
+    // Dedupe by service_id + price
+    const seen = new Set();
+    const out = [];
+    for (const r of rows) {
       const name = friendlyServiceName(r.service_id, r.service_name);
-      // Use EXACT website selling price — do not re-markup
       const price = Math.ceil(Number(r.price) || 0);
-      return {
+      if (!(price > 0)) continue;
+      // Drop WAF / non-whatsapp when user asked WhatsApp
+      if (serviceFilter && /whatsapp|^wa$/i.test(String(serviceFilter))) {
+        const id = String(r.service_id || '').toLowerCase();
+        const nm = String(r.service_name || '').toLowerCase();
+        if (id === 'waf' || (id !== 'wa' && !nm.includes('whatsapp'))) continue;
+      }
+      const key = `${r.service_id}|${price}|${r.country_id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
         service_id: String(r.service_id),
         service_name: name,
         variant: detectVariant(name, r.service_id),
@@ -357,16 +405,23 @@ async function fetchHubServices(countryId, serviceFilter) {
         price_ngn: price,
         price_usd: Number(r.supplier_price) || 0,
         source: 'hub',
-        hub_id: r.id
-      };
-    }).filter((s) => s.price_ngn > 0);
+        hub_id: r.id,
+        country_name: r.country_name || null
+      });
+    }
+    console.log(
+      '[hub] final',
+      countryId,
+      serviceFilter,
+      out.map((s) => `${s.service_id}:${s.price_ngn}`).join(',')
+    );
+    return out;
   } catch (e) {
     console.error('fetchHubServices', e.response?.status, JSON.stringify(e.response?.data || e.message));
     return [];
   }
 }
 
-// Prefer MJ HUB catalog prices; fall back to live Grizzly + markup
 async function getSellableServices(countryId, serviceFilter) {
   const hub = await fetchHubServices(countryId, serviceFilter);
   if (hub.length) {
@@ -1073,19 +1128,25 @@ bot.command('hubtest', async (ctx) => {
     return ctx.reply(msg + '\nAdd env and redeploy.');
   }
   try {
-    const url =
-      `${MJ_HUB_REST_URL}/number_services?select=service_id,service_name,country_id,country_name,price&country_id=eq.12&price=gt.0&limit=10`;
-    const res = await axios.get(url, { ...axiosCfg, headers: mjHubHeaders });
-    const rows = Array.isArray(res.data) ? res.data : [];
-    msg += `USA (id 12) rows: ${rows.length}\n`;
-    msg += rows
-      .slice(0, 6)
-      .map((r) => `• ${r.service_name || r.service_id} | ₦${r.price} | ${r.country_name}`)
-      .join('\n') || '(none)';
-    // Also whatsapp filter
-    const wa = await getSellableServices(12, 'whatsapp');
-    msg += `\n\ngetSellableServices(USA,whatsapp): ${wa.length} opts\n`;
-    msg += wa.map((s) => `• ${s.service_name} ₦${s.price_ngn} [${s.source}]`).join('\n');
+    // Direct WhatsApp query on Hub
+    const waUrl =
+      `${MJ_HUB_REST_URL}/number_services?select=service_id,service_name,country_id,country_name,price,supplier_price` +
+      `&or=(service_id.eq.wa,service_name.ilike.*whatsapp*)&price=gt.0&order=price.asc&limit=15`;
+    const waRes = await axios.get(waUrl, { ...axiosCfg, headers: mjHubHeaders });
+    const waRows = Array.isArray(waRes.data) ? waRes.data : [];
+    msg += `Hub WhatsApp rows (any country): ${waRows.length}\n`;
+    msg +=
+      waRows
+        .slice(0, 10)
+        .map(
+          (r) =>
+            `• ${r.service_id} | ${r.service_name} | ₦${r.price} | cid=${r.country_id} | ${r.country_name}`
+        )
+        .join('\n') || '(none)';
+
+    const sell = await getSellableServices(12, 'whatsapp');
+    msg += `\n\nSellable USA WhatsApp: ${sell.length}\n`;
+    msg += sell.map((s) => `• ${s.service_id} ${s.service_name} ₦${s.price_ngn} [${s.source}]`).join('\n');
     await ctx.reply(msg.slice(0, 3500));
   } catch (e) {
     await ctx.reply(
