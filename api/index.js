@@ -1157,71 +1157,62 @@ const MAX_TOOL_ROUNDTRIPS = 6;
 
 const GEMINI_SYSTEM_PROMPT = `You be Mira, the official MJ SMS Assistant for MJ Hub (mjhub.store).
 
+Talk fluent Nigerian Pidgin mixed with clear English — natural, like real person wey dey help customer on Telegram. No force grammar. No robot vibe. No fake slang.
+
 Your main work:
-- Help users get real non-VOIP SMS numbers and OTP codes directly here on Telegram
-- Guide users step by step to buy number
-- Deliver the number and later deliver the code (only via tools — never invent)
-- Answer questions about MJ SMS and MJ Hub
-- Softly sell and grow the brand
-- Talk natural Nigerian Pidgin mixed with clear English (fluent and real, no force Pidgin)
+- Help users get real non-VOIP SMS numbers and OTP codes on this Telegram bot
+- Guide dem step by step to buy number
+- Deliver number and OTP ONLY from tools — never invent
+- Answer questions about MJ SMS and MJ Hub from the facts below only
+- Softly grow the brand without lies
+
+=== ZERO HALLUCINATION (strict) ===
+- NEVER invent: price, stock, phone number, OTP/SMS code, order id, balance, payment status, country availability
+- NEVER guess if a country or app "dey available" — use tools (get_prices / buy / status)
+- If you no sure → ask short clarifying question OR say you go check with tools
+- If tool fail or empty → tell customer straight: try another country/app or try again small time. No fabricate alternative
+- NEVER invent success stories, fake "plenty people just buy", or fake discounts
+- NEVER invent refund already done unless tool confirms
+- NEVER mention Grizzly, suppliers, API keys, Gemini, AI, or internal systems
+- NEVER claim you are AI/robot — you be Mira, MJ SMS assistant
+- Bot wallet and website (mjhub.store) wallet SEPARATE — never say dem join unless user already know
+- For MJ Logs / MJ Boosters: only point to mjhub.store — you no fit sell those for this bot
 
 Personality:
 - Calm, sharp, helpful, street-smart
-- Talk the way real Nigerians dey talk online
-- Be patient with new users
-- Be fast and clear when dem ready to buy
-- No dey sound like robot or script
-- Always helpful and solution-focused
+- Patient with new users; fast when dem ready to buy
+- Short replies when dem dey buy; warmer when dem just dey yarn
 
-About MJ Hub (know this deep so you fit answer customer questions alone):
-- All-in-one marketplace: MJ Logs (verified accounts), MJ SMS (real numbers for OTP), MJ Boosters (followers/likes/views)
-- One dashboard, one wallet (Naira or USD)
+About MJ Hub (facts only):
+- Marketplace: MJ Logs (accounts), MJ SMS (OTP numbers), MJ Boosters (SMM growth)
 - Website: https://mjhub.store
-- Support: same WhatsApp + Telegram as on the site; use /support for links
-- Referral: members earn 2% for life when people they invite fund their wallet
-- MJ Logs: premium Facebook, Instagram, X, Gmail, Spotify, dating accounts etc. — ordered on the website
-- MJ Boosters: SMM panel (followers, likes, views, comments) for IG, TikTok, YouTube, Telegram, X — ordered on the website
-- This Telegram bot is ONLY for MJ SMS (Server 1). For logs/boosters, point them to mjhub.store
+- Referral on website: 2% for life when people you invite fund wallet
+- This bot = MJ SMS only (Server 1)
 
-About MJ SMS (this bot = Server 1 numbers):
-- Real mobile numbers (not VOIP) — better success for WhatsApp and major apps
-- Works for WhatsApp, Telegram, Instagram, Google, Facebook, TikTok, Snapchat, Discord, Microsoft, Apple, Netflix, and plenty more
-- Over 200 countries available
-- Pay from wallet on this bot (/fund AMOUNT) or fund on mjhub.store (balances are separate: bot wallet vs website wallet)
-- OTP usually drops within about 1 minute after they request the code in the app
-- If code no drop after some time, user fit cancel/refund when supplier allows (usually wait ~3 minutes after buy)
-- Prices shown in Naira; stock changes live — always use tools, never invent
-- You can fund any amount between ₦1,000 and ₦200,000 per payment via Paystack
+About MJ SMS (this bot):
+- Real mobile numbers (not VOIP)
+- WhatsApp, Telegram, Instagram, Google, Facebook, TikTok, Snapchat, Discord, and more
+- Many countries — live stock from tools
+- Fund here: /fund AMOUNT or type fund + amount (2k, 5k…). Paystack. Min ~₦1,000 max ₦200,000 per payment
+- OTP usually within ~1 minute after dem request code for the app
+- Cancel/refund when allowed (often wait ~3 minutes after buy) — only after tool/status says so
+- Prices in Naira from tools only
 
-How you handle SMS request (step by step):
-1. If dem no mention app → ask which service (WhatsApp, Telegram, Instagram, Google…)
-2. If dem no mention country → ask which country
-3. Confirm: "Alright, [Country] [Service]. You ready make I process am?"
-4. Only when dem confirm OR dem already gave full request (e.g. "USA WhatsApp") → use tools get_prices then buy_number
-5. Never invent number or code. Only tool results.
-
-Important rules:
-1. Never invent price, stock, number, or OTP code
-2. Always use tools for prices, buy, status, cancel, balance, payment
-3. If get_prices returns options, show the price from tool and let dem pick / confirm before buy_number
-4. If balance low → guide /fund — do not promise free number
-5. If no stock → say try another country (do not invent Server 2 stock on this bot unless tool says so)
-6. If dem just dey yarn (hi, how far) → yarn natural, then soft ask wetin dem need
-7. Keep replies short when dem dey buy
-8. After successful number: tell dem use am for OTP; code go show when dem tap Check or when check_status returns it
-9. After code delivered: ask if dem need another number
-10. Never mention Grizzly, suppliers, API, or internal systems to the customer
-11. Never claim you are AI/robot
-12. Cancel: supplier blocks cancel for a few minutes after buy — tell dem the wait time from tool, no fake refund
+Buy flow:
+1. No app? → ask which app
+2. No country? → ask which country
+3. Full request like "USA WhatsApp" → get_prices, show real price, confirm, then buy_number
+4. After number: dem use am for OTP; code from check_status / Check button only
 
 Payment:
-- Wallet top-up with /fund AMOUNT (Paystack)
-- Minimum practical top-up around ₦1000
-- If no balance: "You never get enough balance. You fit /fund or fund on mjhub.store. How you wan do am?"
+- /fund 2k or fund 5000 → Paystack link
+- Low balance → guide /fund, no free number promise
 
-Reply style examples:
-- "I need number" → "Okay. Which service you need the number for? (WhatsApp, Telegram, Instagram, Google…)"
-- Dem say WhatsApp → "Which country you want?"
+When dem just greet (how far, awfa, hi):
+- Reply natural Pidgin short, then soft: wetin you need — number, fund, or balance?
+
+If you no understand:
+- No invent. Ask dem to type like: USA WhatsApp, Fund 5k, or Balance.
 - Dem say USA → "Alright, USA WhatsApp. You ready make I get the number for you now?"
 - No stock → "That one no dey available for now. You fit try another country?"
 - Code waiting → "Code never drop yet. Make I check… If e no show after some minutes, you fit cancel for refund when the timer allow."
@@ -1983,16 +1974,19 @@ registerBotMenu();
 bot.start(async (ctx) => {
   await getUserSession(ctx.from.id);
   await ctx.reply(
-    `How far 👋 I be *Mira* — MJ SMS assistant.\n\n` +
-      `I fit get real number for WhatsApp, Telegram, Instagram, Google and more.\n\n` +
-      `Just type like:\n` +
+    `How far 👋 Welcome to *MJ SMS*.\n` +
+      `I be *Mira* — I go help you get *real number* for verification sharp sharp.\n\n` +
+      `Numbers here na *real mobile* (no be VOIP) — dem dey work for WhatsApp, Telegram, Instagram, Google, TikTok and plenty more.\n\n` +
+      `*How e dey work*\n` +
+      `Just type country + app, e.g.\n` +
       `• *USA WhatsApp*\n` +
-      `• *Nigeria Telegram*\n` +
-      `• or say *I need number*\n\n` +
-      `/balance — wallet\n` +
-      `/fund 2000 — top up\n` +
-      `/orders — numbers you bought\n` +
-      `/support — help\n\n` +
+      `• *Canada Telegram*\n` +
+      `• *UK Instagram*\n\n` +
+      `*Quick commands*\n` +
+      `/balance — check your wallet\n` +
+      `/fund 2k — top up (even *5k*, *10k*…)\n` +
+      `/orders — numbers wey you don buy\n` +
+      `/support — talk to human\n\n` +
       `Wetin you need right now?`,
     { parse_mode: 'Markdown' }
   );
@@ -2547,31 +2541,35 @@ bot.action(/^can:([^:]+):(\d+)$/, async (ctx) => {
 // ---------- Mira smart flow (works without Gemini) ----------
 const MIRA = {
   greet:
-    'How far 👋 I be Mira.\n\nI go help you get real number for WhatsApp, Telegram, IG, Google and the rest.\n\nJust yarn e.g.\n• USA WhatsApp\n• UK Telegram\n• or “I need number”\n\nBalance · Fund (even *2k*) · Orders · Support — I dey.',
-  askService: 'Which app? WhatsApp, Telegram, Instagram, Google, Facebook, TikTok…',
+    'How far 👋 Welcome to *MJ SMS*.\nI be *Mira* — I go help you get *real number* for verification.\n\nType country + app:\n• *USA WhatsApp*\n• *Canada Telegram*\n• *UK Instagram*\n\n/balance · /fund 2k · /orders · /support\n\nWetin you need?',
+  askService: 'Which app you need the number for?\nWhatsApp, Telegram, Instagram, Google, Facebook, TikTok…',
   askCountry: (svc) =>
-    svc ? `Which country for ${svc}? e.g. USA, UK, Nigeria, Canada` : 'Which country you want?',
-  noStock: 'That one no dey available right now. Try another country?',
+    svc
+      ? `Which country for *${svc}*?\nExample: USA, UK, Nigeria, Canada`
+      : 'Which country you want the number from?',
+  noStock: 'That one no dey available right now o. You fit try another country?',
   lowBal: (need, bal) =>
-    `Balance no reach o.\nYou need ₦${Number(need).toLocaleString()} · you get ₦${Number(bal).toLocaleString()}.\n\nType /fund ${need} or just *fund ${Math.ceil(Number(need) / 1000)}k*.`,
-  yarn: 'I dey. Tell me country + app — like USA WhatsApp — or fund / balance.',
+    `Balance no reach o.\nYou need ₦${Number(need).toLocaleString()} · you get ₦${Number(bal).toLocaleString()}.\n\nType /fund ${need} or *fund ${Math.ceil(Number(need) / 1000)}k* make I open Paystack.`,
+  yarn:
+    'I dey here. Just tell me country + app — e.g. *USA WhatsApp* — or *fund* / *balance*.',
   about:
-    'MJ Hub na one place for:\n\n' +
-    '• MJ SMS — real numbers for OTP (wetin we dey do here)\n' +
-    '• MJ Logs — verified accounts on the website\n' +
-    '• MJ Boosters — followers/likes/views on the website\n\n' +
-    'Site: mjhub.store\nThis bot wallet separate from the website wallet.\nReferral on the site: 2% for life when your people fund.',
+    '*MJ Hub* na one place for three things:\n\n' +
+    '• *MJ SMS* — real numbers for OTP (wetin we dey do for this bot)\n' +
+    '• *MJ Logs* — verified accounts — order for *mjhub.store*\n' +
+    '• *MJ Boosters* — followers/likes/views — order for *mjhub.store*\n\n' +
+    'Site: mjhub.store\nThis bot wallet separate from website wallet.\nReferral for site: *2% for life* when people you invite fund.',
   howSms:
     'E simple:\n\n' +
-    '1. Tell me country + app\n' +
-    '2. I show price, you buy from wallet\n' +
-    '3. You use the number request OTP\n' +
-    '4. Code usually land within about 1 minute — tap Check\n' +
-    '5. If e no come, cancel after ~3 min for refund\n\n' +
-    'Numbers here na real mobile, no be VOIP.',
+    '1. Tell me country + app (e.g. USA WhatsApp)\n' +
+    '2. I show *live* price → you buy from wallet\n' +
+    '3. You use the number request OTP for the app\n' +
+    '4. Code usually land within about 1 minute — tap *Check*\n' +
+    '5. If e no come, cancel after ~3 min for refund when e allow\n\n' +
+    'Numbers here na *real mobile*, no be VOIP.',
   fundHelp:
-    'To fund:\n• /fund 2k  or  /fund 5000\n• or type fund then amount (2k, 5k, 10k…)\nPaystack go open — after pay, wallet update. You fit also type “I don pay”.\n\nBot wallet ≠ mjhub.store wallet.',
-  supportHelp: 'I fit handle number and OTP here. For human support type /support or use mjhub.store.',
+    'To fund this bot wallet:\n• */fund 2k* or */fund 5000*\n• or type *fund* then amount (*2k*, *5k*, *10k*…)\nPaystack go open — after pay, wallet update. You fit type *I don pay*.\n\nBot wallet ≠ mjhub.store wallet.',
+  supportHelp:
+    'I fit handle number and OTP here.\nFor human support type */support* or use mjhub.store.',
 };
 
 function detectServiceOnly(text) {
@@ -2606,10 +2604,33 @@ function looksLikeNeedNumber(text) {
 function looksLikeChitchat(text) {
   const t = String(text || '').toLowerCase().trim();
   return (
-    /^(hi|hello|hey|yo|awfa|how far|how you dey|how far na|wetin be your name|what is your name|who are you|good morning|good evening|good afternoon|sup|mira|thanks|thank you|ok|okay|alright|sharp)\b/i.test(
+    /^(hi|hello|hey|yo|awfa|how far|how you dey|how far na|how body|body|abeg|please|wetin be your name|what is your name|who are you|good morning|good evening|good afternoon|sup|mira|thanks|thank you|ok|okay|alright|sharp|na so|ehn|hmm|lol)\b/i.test(
       t
-    ) || /your name|who you be|you be who|wetin you (fit|can) do/.test(t)
+    ) ||
+    /your name|who you be|you be who|wetin you (fit|can) do|you dey|how market/.test(t)
   );
+}
+
+/** Short natural Pidgin replies for greetings — no fake prices or stock */
+function chitchatReply(text) {
+  const t = String(text || '').toLowerCase().trim();
+  if (/thank|thanks|appreciate/.test(t)) {
+    return 'You welcome 🙌 Anytime. You still need number, or you wan check balance?';
+  }
+  if (/name|who you|who are you|you be who/.test(t)) {
+    return 'I be *Mira* — MJ SMS assistant. I go help you get real number for OTP.\nJust type e.g. *USA WhatsApp*.';
+  }
+  if (/wetin you (fit|can) do|help me|commands?/.test(t)) {
+    return MIRA.greet;
+  }
+  if (/good morning/.test(t)) {
+    return 'Good morning ☀️ How you dey? You need number today, or you wan fund wallet?';
+  }
+  if (/good evening|good afternoon/.test(t)) {
+    return 'How far 👋 You need number, fund, or balance?';
+  }
+  // default hi / how far / awfa
+  return 'How far 👋 I dey.\nYou need *number*, *fund* wallet, or check *balance*?';
 }
 
 /** Resolve country only if message is mainly a country name (not random chat / amounts) */
@@ -2848,13 +2869,7 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
     if (wantsHelp) {
       return ctx.reply(MIRA.greet, { parse_mode: 'Markdown' });
     }
-    // chitchat falls through only if no active buy — else greet
-    if (!session.pendingService && state === 'AWAITING_INPUT') {
-      return ctx.reply(
-        'How far 👋 I dey. You need number, or you wan check balance / fund wallet?',
-        { parse_mode: 'Markdown' }
-      );
-    }
+    return ctx.reply(chitchatReply(textMsg), { parse_mode: 'Markdown' });
   }
 
   // Knowledge FAQ — also escapes stuck flow
@@ -3184,12 +3199,12 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
     return ctx.reply(MIRA.supportHelp);
   }
 
-  // Soft fallback — Pidgin, helpful, not stuck
+  // Soft fallback — no invented prices/stock
   return ctx.reply(
-    'I no too catch that one.\n\n' +
-      'Talk to me like:\n' +
+    'I no too catch that one o.\n\n' +
+      'Talk to me clear like:\n' +
       '• *USA WhatsApp* — buy number\n' +
-      '• *Fund* or */fund 5000* — top up\n' +
+      '• *Fund* or */fund 5k* — top up\n' +
       '• *Balance* — check wallet\n' +
       '• *How e dey work?* — explain SMS\n' +
       '• *Cancel* — clear and start fresh',
