@@ -1810,39 +1810,54 @@ async function parseCountryService(text) {
     }
   }
 
-  // ALIASES FIRST (usa, uk, ng…) — never let fuzzy live names steal "USA" → wrong country
-  try {
-    const live = await grizzlyCountries();
-    const ranked = [...live]
-      .map((c) => ({ id: c.id, name: c.name, n: String(c.name || '').toLowerCase().trim() }))
-      .filter((c) => c.n.length >= 2)
-      .sort((a, b) => b.n.length - a.n.length);
+  // Pretty labels for common ids (never show wrong country in "Checking…")
+  const PRETTY = {
+    12: 'USA',
+    187: 'USA (2)',
+    16: 'UK',
+    19: 'Nigeria',
+    36: 'Canada',
+    43: 'Germany',
+    38: 'Ghana',
+    8: 'Kenya',
+    31: 'South Africa',
+    22: 'India',
+    48: 'Netherlands',
+    78: 'France',
+    54: 'Mexico',
+    73: 'Brazil'
+  };
 
-    const aliasEntries = Object.entries(COUNTRY_MAP).sort((a, b) => b[0].length - a[0].length);
-    for (const [name, id] of aliasEntries) {
-      if (name.length < 2) continue;
-      // Require whole-word match; "us" only if exact word not inside "usa"
-      if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\b`, 'i').test(t)) {
-        countryId = id;
-        const liveHit = ranked.find((c) => Number(c.id) === Number(id));
-        countryName = liveHit ? liveHit.name : name.toUpperCase() === 'USA' ? 'USA' : name;
-        break;
-      }
+  // ALIASES FIRST — offline, never depend on Grizzly uptime
+  // (if Grizzly hangs, old code left countryId null → stuck session used USA)
+  const aliasEntries = Object.entries(COUNTRY_MAP).sort((a, b) => b[0].length - a[0].length);
+  for (const [name, id] of aliasEntries) {
+    if (name.length < 2) continue;
+    if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\b`, 'i').test(t)) {
+      countryId = id;
+      countryName = PRETTY[id] || name.replace(/\b\w/g, (c) => c.toUpperCase());
+      break;
     }
+  }
 
-    // Live names only if alias missed
-    if (countryId == null) {
+  // Live Grizzly names only if alias missed
+  if (countryId == null) {
+    try {
+      const live = await grizzlyCountries();
+      const ranked = [...live]
+        .map((c) => ({ id: c.id, name: c.name, n: String(c.name || '').toLowerCase().trim() }))
+        .filter((c) => c.n.length >= 3)
+        .sort((a, b) => b.n.length - a.n.length);
       for (const c of ranked) {
-        if (c.n.length < 3) continue; // skip 2-letter fuzzy
         const re = new RegExp(`\\b${c.n.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\b`, 'i');
         if (re.test(t)) {
           countryId = c.id;
-          countryName = c.name;
+          countryName = PRETTY[c.id] || c.name;
           break;
         }
       }
-    }
-  } catch (_) {}
+    } catch (_) {}
+  }
 
   return { countryId, countryName, serviceCode, serviceName };
 }
@@ -2637,7 +2652,24 @@ async function resolveCountryStrict(text) {
 }
 
 async function miraShowPricesAndConfirm(ctx, session, userId, countryId, countryName, serviceQuery) {
-  countryName = asName(countryName) || String(countryName);
+  // Never show sticky pool name — label from id when needed
+  const idNum = Number(countryId);
+  const prettyById = {
+    12: 'USA',
+    187: 'USA',
+    36: 'Canada',
+    16: 'UK',
+    19: 'Nigeria',
+    43: 'Germany',
+    38: 'Ghana',
+    8: 'Kenya'
+  };
+  countryName =
+    prettyById[idNum] ||
+    asName(countryName) ||
+    String(countryName || countryId);
+  // If caller passed "USA (2)" as the search country, still say USA (pools listed in buttons)
+  if (/usa\s*\(?\s*2\s*\)?/i.test(String(countryName))) countryName = 'USA';
   serviceQuery = asName(serviceQuery) || serviceQuery || '';
   await ctx.reply(`Checking ${countryName}${serviceQuery ? ' · ' + serviceQuery : ''}…`);
 
@@ -2995,16 +3027,37 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
   // Recover pending service / country from session (REAL services only)
   const pendingSvcRaw = session.pendingService || session.serviceQuery || null;
   const pendingSvc = isRealServiceName(pendingSvcRaw) ? pendingSvcRaw : null;
-  const pendingCountryId = session.countryId || null;
-  const pendingCountryName = session.country || null;
 
-  // --- One-shot: country + service together (always wins over stuck session country) ---
+  // Always parse THIS message — never trust sticky USA/Germany over what user just typed
   const parsed = await parseCountryService(textMsg);
+
+  // If user named a country different from session, wipe sticky country immediately
+  if (parsed.countryId != null) {
+    const sticky = session.countryId != null ? Number(session.countryId) : null;
+    const fresh = Number(parsed.countryId);
+    if (sticky !== fresh) {
+      session.countryId = parsed.countryId;
+      session.country = parsed.countryName;
+      // Don't keep confirm/app state tied to old country
+      if (['AWAITING_CONFIRM', 'AWAITING_APP', 'AWAITING_COUNTRY'].includes(session.state)) {
+        session.state = 'AWAITING_INPUT';
+        session.last_options = [];
+      }
+    }
+  }
+
+  const pendingCountryId =
+    parsed.countryId != null ? null : session.countryId || null; // ignore sticky if message has country
+  const pendingCountryName =
+    parsed.countryId != null ? null : session.country || null;
+
+  // --- One-shot: country + service together ---
   if (parsed.countryId && (parsed.serviceName || parsed.serviceCode)) {
-    // Clear stale Germany/etc. when user names a new country
     session.countryId = parsed.countryId;
     session.country = parsed.countryName;
     session.state = 'AWAITING_INPUT';
+    session.pendingService = null;
+    session.last_options = [];
     return miraShowPricesAndConfirm(
       ctx,
       session,
@@ -3016,7 +3069,10 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
   }
 
   // Country message while we already have a pending service → process
-  const countryGuess = await resolveCountryStrict(textMsg);
+  const countryGuess =
+    parsed.countryId != null
+      ? { id: parsed.countryId, name: parsed.countryName }
+      : await resolveCountryStrict(textMsg);
   if (countryGuess && pendingSvc) {
     session.countryId = countryGuess.id;
     session.country = countryGuess.name;
@@ -3030,7 +3086,7 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
     );
   }
 
-  // Service only while we already have a country (no country word in this message)
+  // Service only while we already have a country (and THIS message has no country word)
   const svcGuess =
     detectServiceOnly(textMsg) ||
     (parsed.serviceName && isRealServiceName(parsed.serviceName)
@@ -3235,9 +3291,34 @@ bot.on('text', async (ctx) => {
     return miraHandleSmartText(ctx, session, userId, textMsg);
   }
 
-  // Keep country session if still browsing
+  // Keep country session ONLY if user did not name a different country
   if (session.countryId && session.state === 'AWAITING_APP') {
-    const svc = detectServiceOnly(textMsg) || (await parseCountryService(textMsg));
+    const parsedNow = await parseCountryService(textMsg);
+    // User typed "Canada WhatsApp" while stuck on USA → honour Canada, wipe sticky USA
+    if (parsedNow.countryId && (parsedNow.serviceName || parsedNow.serviceCode)) {
+      session.countryId = parsedNow.countryId;
+      session.country = parsedNow.countryName;
+      session.state = 'AWAITING_INPUT';
+      return miraShowPricesAndConfirm(
+        ctx,
+        session,
+        userId,
+        parsedNow.countryId,
+        parsedNow.countryName,
+        parsedNow.serviceName || parsedNow.serviceCode
+      );
+    }
+    if (parsedNow.countryId && Number(parsedNow.countryId) !== Number(session.countryId)) {
+      session.countryId = parsedNow.countryId;
+      session.country = parsedNow.countryName;
+      session.state = 'AWAITING_SERVICE';
+      await saveUserSession(userId, session);
+      return ctx.reply(
+        `Which app for ${parsedNow.countryName}?\n(WhatsApp, Telegram, Instagram…)`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+    const svc = detectServiceOnly(textMsg) || parsedNow;
     const q = svc.serviceName || svc.serviceCode || textMsg;
     return miraShowPricesAndConfirm(ctx, session, userId, session.countryId, session.country, q);
   }
