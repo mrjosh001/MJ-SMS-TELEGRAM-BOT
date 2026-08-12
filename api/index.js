@@ -1057,6 +1057,89 @@ bot.command('fund', async (ctx) => {
 });
 
 // Buy callback: buy:countryId:serviceId:priceNgn
+
+bot.action('menu:home', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply(
+    'Select the country for your number:',
+    Markup.inlineKeyboard([
+      [
+        Markup.button.callback('🇺🇸 United States', 'cty:12'),
+        Markup.button.callback('🇬🇧 United Kingdom', 'cty:16')
+      ],
+      [
+        Markup.button.callback('🇨🇦 Canada', 'cty:36'),
+        Markup.button.callback('🇳🇬 Nigeria', 'cty:19')
+      ],
+      [
+        Markup.button.callback('🇬🇭 Ghana', 'cty:38'),
+        Markup.button.callback('🇰🇪 Kenya', 'cty:8')
+      ]
+    ])
+  );
+});
+
+bot.action('menu:fund', async (ctx) => {
+  await ctx.answerCbQuery();
+  const session = await getUserSession(ctx.from.id);
+  session.state = 'AWAITING_FUND_AMOUNT';
+  await saveUserSession(ctx.from.id, session);
+  await ctx.reply('How much you wan fund?\n\nMin ₦1,000 · Max ₦200,000\n\nExample: 5000');
+});
+
+bot.action('menu:bal', async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = await getUserSession(ctx.from.id);
+  await ctx.reply(`Balance: ₦${Number(s.balance || 0).toLocaleString()}`);
+});
+
+bot.action(/^cty:(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const countryId = ctx.match[1];
+  const nameFromId = Object.entries(COUNTRY_MAP).find(([, id]) => String(id) === String(countryId));
+  const countryName = nameFromId ? nameFromId[0] : `country ${countryId}`;
+  const session = await getUserSession(ctx.from.id);
+  session.countryId = Number(countryId);
+  session.country = countryName;
+  session.state = 'AWAITING_APP';
+  await saveUserSession(ctx.from.id, session);
+  await ctx.reply(
+    `Country: *${countryName}*\n\nWhich app?`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [
+          Markup.button.callback('WhatsApp', `app:${countryId}:whatsapp`),
+          Markup.button.callback('Telegram', `app:${countryId}:telegram`)
+        ],
+        [
+          Markup.button.callback('Google', `app:${countryId}:google`),
+          Markup.button.callback('Instagram', `app:${countryId}:instagram`)
+        ],
+        [
+          Markup.button.callback('Facebook', `app:${countryId}:facebook`),
+          Markup.button.callback('TikTok', `app:${countryId}:tiktok`)
+        ],
+        [
+          Markup.button.callback('Snapchat', `app:${countryId}:snapchat`),
+          Markup.button.callback('Discord', `app:${countryId}:discord`)
+        ],
+        [Markup.button.callback('⬅️ Back', 'menu:home')]
+      ])
+    }
+  );
+});
+
+bot.action(/^app:(\d+):([^:]+)$/, async (ctx) => {
+  await ctx.answerCbQuery('Loading…');
+  const countryId = ctx.match[1];
+  const app = ctx.match[2];
+  const session = await getUserSession(ctx.from.id);
+  const nameFromId = Object.entries(COUNTRY_MAP).find(([, id]) => String(id) === String(countryId));
+  const countryName = session.country || (nameFromId ? nameFromId[0] : countryId);
+  await showServiceOptions(ctx, session, ctx.from.id, countryId, countryName, app);
+});
+
 bot.action('opt:cancel', async (ctx) => {
   await ctx.answerCbQuery();
   const session = await getUserSession(ctx.from.id);
@@ -1267,41 +1350,256 @@ bot.on('text', async (ctx) => {
     }
   }
 
-  // Fallback: classic flow when Gemini is off, quota exceeded, or model failed
-  const parsed = parseCountryService(text);
-  if (!parsed.countryId) {
+  // Fallback: smart manual flow (works without Gemini)
+  const lower = text.toLowerCase().trim();
+  const sessionState = session.state || 'AWAITING_INPUT';
+
+  // --- Greetings / help ---
+  if (/^(hi|hello|hey|yo|awfa|how far|how you dey|good morning|good evening|sup|wetin|help)\b/i.test(lower)
+      || lower === 'menu' || lower === 'start') {
     return ctx.reply(
-      'Tell me country + app in one message.\nExamples: *USA WhatsApp*, *Nigeria Telegram*, *UK Google*',
-      { parse_mode: 'Markdown' }
+      'How far 👋 Welcome to MJ SMS (Server 1).\n\nI fit get number for WhatsApp, Telegram, Google, Instagram and more.\n\nPick country or type like: USA WhatsApp',
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback('🇺🇸 United States', 'cty:12'),
+          Markup.button.callback('🇬🇧 United Kingdom', 'cty:16')
+        ],
+        [
+          Markup.button.callback('🇨🇦 Canada', 'cty:36'),
+          Markup.button.callback('🇳🇬 Nigeria', 'cty:19')
+        ],
+        [
+          Markup.button.callback('🇬🇭 Ghana', 'cty:38'),
+          Markup.button.callback('🇰🇪 Kenya', 'cty:8')
+        ],
+        [Markup.button.callback('💳 Fund wallet', 'menu:fund')],
+        [Markup.button.callback('💰 Balance', 'menu:bal')]
+      ])
     );
   }
 
-  await ctx.reply(`Checking Grizzly for *${parsed.countryName}*…`, { parse_mode: 'Markdown' });
-  let list = await grizzlyPrices(parsed.countryId);
-  if (!list.length) {
-    return ctx.reply('No services returned for that country right now. Try another.');
+  // --- Fund intent ---
+  if (/^(fund|top ?up|deposit|recharge)\b/i.test(lower) || /fund my wallet|top up/i.test(lower)) {
+    const amountMatch = lower.match(/(\d[\d,]{2,}|[1-9]\d{2,})/);
+    if (!amountMatch) {
+      session.state = 'AWAITING_FUND_AMOUNT';
+      await saveUserSession(userId, session);
+      return ctx.reply('How much you wan fund?\n\nMin ₦1,000 · Max ₦200,000\n\nExample: 5000');
+    }
+    let amount = parseInt(amountMatch[1].replace(/,/g, ''), 10);
+    if (amount < 1000) return ctx.reply('Minimum na ₦1,000.');
+    if (amount > 200000) return ctx.reply('Maximum na ₦200,000.');
+    const init = await paystackInitialize(amount, userId, null);
+    if (!init.success) return ctx.reply(init.message || 'Paystack no gree.');
+    const pending = {
+      reference: init.reference,
+      amount_ngn: init.amount_ngn,
+      authorization_url: init.authorization_url,
+      created_at: new Date().toISOString()
+    };
+    session.pending_payment = pending;
+    session.state = 'AWAITING_INPUT';
+    pendingPayments.set(String(userId), pending);
+    await saveUserSession(userId, session);
+    return ctx.reply(
+      `Top up ₦${init.amount_ngn.toLocaleString()}\n\nTap Pay below.\nWhen e successful, type: I don pay`,
+      Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', init.authorization_url)]])
+    );
   }
-  if (parsed.serviceCode || parsed.serviceName) {
-    list = matchServices(list, parsed.serviceName || parsed.serviceCode);
+
+  // Awaiting fund amount only
+  if (sessionState === 'AWAITING_FUND_AMOUNT') {
+    const amount = parseInt(lower.replace(/[^\d]/g, ''), 10) || 0;
+    if (amount < 1000 || amount > 200000) {
+      return ctx.reply('Enter amount between ₦1,000 and ₦200,000. Example: 5000');
+    }
+    const init = await paystackInitialize(amount, userId, null);
+    if (!init.success) return ctx.reply(init.message || 'Paystack no gree.');
+    const pending = {
+      reference: init.reference,
+      amount_ngn: init.amount_ngn,
+      authorization_url: init.authorization_url,
+      created_at: new Date().toISOString()
+    };
+    session.pending_payment = pending;
+    session.state = 'AWAITING_INPUT';
+    pendingPayments.set(String(userId), pending);
+    await saveUserSession(userId, session);
+    return ctx.reply(
+      `Top up ₦${init.amount_ngn.toLocaleString()}\n\nTap Pay below.\nWhen e successful, type: I don pay`,
+      Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', init.authorization_url)]])
+    );
   }
 
-  session.country = parsed.countryName;
-  session.countryId = parsed.countryId;
-  session.serviceQuery = parsed.serviceName || parsed.serviceCode;
-  await saveUserSession(userId, session);
+  // --- I don pay ---
+  if (/i don pay|i have paid|payment done|don pay|paid already/i.test(lower)) {
+    const mem = pendingPayments.get(String(userId));
+    const ref = session.pending_payment?.reference || mem?.reference;
+    if (!ref) {
+      return ctx.reply('I no see pending payment. Type /fund 2000 to start one.');
+    }
+    const verified = await paystackVerify(ref);
+    if (!verified.success) {
+      return ctx.reply(verified.message || 'Payment never show success yet. Wait small and try again.');
+    }
+    if (session.last_credited_reference === ref || creditedRefs.has(ref)) {
+      return ctx.reply(`This payment already credited.\nBalance: ₦${Number(session.balance || 0).toLocaleString()}`);
+    }
+    session.balance = (Number(session.balance) || 0) + (Number(verified.amount_ngn) || 0);
+    session.last_credited_reference = ref;
+    session.pending_payment = null;
+    pendingPayments.delete(String(userId));
+    creditedRefs.add(ref);
+    await saveUserSession(userId, session);
+    return ctx.reply(
+      `Payment confirmed ✅\n₦${Number(verified.amount_ngn).toLocaleString()} don enter.\nNew balance: ₦${Number(session.balance).toLocaleString()}\n\nYou fit buy number now. Type country + app e.g. USA WhatsApp`
+    );
+  }
 
-  const buttons = list.slice(0, 10).map((s) => [
-    Markup.button.callback(
-      `${s.service_id} · ₦${s.price_ngn}${s.stock ? ` · ~${s.stock}` : ''}`,
-      `buy:${parsed.countryId}:${s.service_id}:${s.price_ngn}`
-    )
-  ]);
+  // --- Need number / buy intent without details ---
+  if (/^(i need number|need number|buy number|i wan number|virtual number|otp|get number)\b/i.test(lower)
+      || lower === 'number') {
+    session.state = 'AWAITING_COUNTRY';
+    await saveUserSession(userId, session);
+    return ctx.reply(
+      'Select the country for your number:',
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback('🇺🇸 United States', 'cty:12'),
+          Markup.button.callback('🇬🇧 United Kingdom', 'cty:16')
+        ],
+        [
+          Markup.button.callback('🇨🇦 Canada', 'cty:36'),
+          Markup.button.callback('🇳🇬 Nigeria', 'cty:19')
+        ],
+        [
+          Markup.button.callback('🇬🇭 Ghana', 'cty:38'),
+          Markup.button.callback('🇮🇳 India', 'cty:22')
+        ],
+        [Markup.button.callback('⬅️ Main menu', 'menu:home')]
+      ])
+    );
+  }
 
-  await ctx.reply(
-    `*Grizzly · Server 1*\nCountry: ${parsed.countryName} (${parsed.countryId})\nPick a service:`,
-    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
+  // If we have country in session and user only sent app name
+  if (session.countryId && !parseCountryService(text).countryId) {
+    const maybeApp = parseCountryService('nigeria ' + text); // reuse app matcher
+    // simpler: check SERVICE_MAP keys in text
+    let appHit = null;
+    for (const [name, code] of Object.entries(SERVICE_MAP)) {
+      if (name.length < 2) continue;
+      if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}\\b`, 'i').test(lower)) {
+        appHit = { name, code };
+        break;
+      }
+    }
+    if (appHit) {
+      return showServiceOptions(ctx, session, userId, session.countryId, session.country || 'selected', appHit.name);
+    }
+  }
+
+  // --- Country + app in one message ---
+  const parsed = parseCountryService(text);
+  if (parsed.countryId && (parsed.serviceCode || parsed.serviceName)) {
+    return showServiceOptions(ctx, session, userId, parsed.countryId, parsed.countryName, parsed.serviceName || parsed.serviceCode);
+  }
+
+  if (parsed.countryId && !parsed.serviceCode) {
+    session.country = parsed.countryName;
+    session.countryId = parsed.countryId;
+    session.state = 'AWAITING_APP';
+    await saveUserSession(userId, session);
+    return ctx.reply(
+      `Country: *${parsed.countryName}*\n\nWhich app you need number for?`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [
+            Markup.button.callback('WhatsApp', `app:${parsed.countryId}:whatsapp`),
+            Markup.button.callback('Telegram', `app:${parsed.countryId}:telegram`)
+          ],
+          [
+            Markup.button.callback('Google', `app:${parsed.countryId}:google`),
+            Markup.button.callback('Instagram', `app:${parsed.countryId}:instagram`)
+          ],
+          [
+            Markup.button.callback('Facebook', `app:${parsed.countryId}:facebook`),
+            Markup.button.callback('TikTok', `app:${parsed.countryId}:tiktok`)
+          ],
+          [Markup.button.callback('⬅️ Change country', 'menu:home')]
+        ])
+      }
+    );
+  }
+
+  return ctx.reply(
+    'How far — tell me country + app.\n\nExamples:\n• USA WhatsApp\n• Nigeria Telegram\n• UK Google\n\nOr tap below:',
+    Markup.inlineKeyboard([
+      [
+        Markup.button.callback('🇺🇸 United States', 'cty:12'),
+        Markup.button.callback('🇬🇧 United Kingdom', 'cty:16')
+      ],
+      [
+        Markup.button.callback('🇨🇦 Canada', 'cty:36'),
+        Markup.button.callback('🇳🇬 Nigeria', 'cty:19')
+      ],
+      [Markup.button.callback('💳 Fund wallet', 'menu:fund')]
+    ])
   );
 });
+
+async function showServiceOptions(ctx, session, userId, countryId, countryName, serviceQuery) {
+  await ctx.reply(`Checking *${countryName}* prices…`, { parse_mode: 'Markdown' });
+  let list = await getSellableServices(countryId, serviceQuery);
+  if (!list.length) {
+    list = await getSellableServices(countryId, null);
+    if (serviceQuery) list = matchServices(list, serviceQuery);
+  }
+  if (!list.length) {
+    return ctx.reply('No numbers available for that option right now. Try another country or app.');
+  }
+
+  session.country = countryName;
+  session.countryId = countryId;
+  session.serviceQuery = serviceQuery;
+  session.last_options = list.slice(0, 8).map((s) => ({
+    service_code: s.service_id,
+    name: s.service_name,
+    variant: s.variant || 'normal',
+    price_ngn: s.price_ngn,
+    stock: s.stock,
+    country_id: countryId
+  }));
+  session.state = 'AWAITING_INPUT';
+  await saveUserSession(userId, session);
+
+  const source = list[0]?.source === 'hub' ? 'MJ Hub price' : 'Live price';
+  if (list.length === 1) {
+    const s = list[0];
+    return ctx.reply(
+      `*${s.service_name}* · ${countryName}\n₦${Number(s.price_ngn).toLocaleString()} · ${source}\n\nTap to buy:`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback(
+            `✅ Buy · ₦${Number(s.price_ngn).toLocaleString()}`,
+            `opt:${countryId}:${s.service_id}:${s.price_ngn}`.slice(0, 64)
+          )],
+          [Markup.button.callback('⬅️ Cancel', 'opt:cancel')]
+        ])
+      }
+    );
+  }
+
+  // Multiple options — Normal / Virtual style buttons
+  return ctx.reply(
+    `*${countryName}* · ${serviceQuery || 'services'}\n${source}\n\nSelect the number type:`,
+    {
+      parse_mode: 'Markdown',
+      ...optionButtons(countryId, list.slice(0, 8))
+    }
+  );
+}
 
 bot.catch((err) => console.error('bot error', err));
 
