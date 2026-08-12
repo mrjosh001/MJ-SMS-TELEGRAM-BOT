@@ -70,7 +70,45 @@ const COUNTRY_MAP = {
   china: 3, cn: 3,
   vietnam: 10, vn: 10,
   thailand: 52, th: 52,
-  malaysia: 7, my: 7
+  malaysia: 7, my: 7,
+  australia: 175, au: 175,
+  japan: 182, jp: 182,
+  'south korea': 103, korea: 103, kr: 103,
+  uae: 95, dubai: 95, emirates: 95, 'united arab emirates': 95,
+  portugal: 117, pt: 117,
+  pakistan: 66, pk: 66,
+  bangladesh: 60, bd: 60,
+  morocco: 37, ma: 37,
+  argentina: 39, ar: 39,
+  colombia: 33, co: 33,
+  chile: 151, cl: 151,
+  peru: 65, pe: 65,
+  romania: 32, ro: 32,
+  sweden: 46, se: 46,
+  norway: 174, no: 174,
+  denmark: 172, dk: 172,
+  finland: 163, fi: 163,
+  ireland: 23, ie: 23,
+  'new zealand': 67, nz: 67,
+  singapore: 196, sg: 196,
+  'hong kong': 14, hk: 14,
+  taiwan: 55, tw: 55,
+  israel: 13, il: 13,
+  saudi: 53, 'saudi arabia': 53, sa: 53,
+  iraq: 40, iq: 40,
+  serbia: 29, rs: 29,
+  croatia: 35, hr: 35,
+  hungary: 100, hu: 100,
+  czech: 63, 'czech republic': 63, cz: 63,
+  austria: 50, at: 50,
+  switzerland: 173, ch: 173,
+  belgium: 82, be: 82,
+  cameroon: 41, cm: 41,
+  'ivory coast': 27, 'cote divoire': 27, ci: 27,
+  senegal: 61, sn: 61,
+  uganda: 75, ug: 75,
+  tanzania: 34, tz: 34,
+  ethiopia: 71, et: 71
 };
 
 // Common service short-codes (Grizzly / SMS-Activate style)
@@ -663,7 +701,7 @@ MJ HUB na digital services marketplace with one ecosystem:
 This Telegram bot handles MJ SMS number verification only.
 
 MJ SMS HOW E DEY WORK:
-- Customer pick country + app (WhatsApp, Telegram, Google, Instagram, Facebook, TikTok, Snapchat, Discord, Microsoft, Apple, etc.)
+- Customer type any country + app freely (e.g. Australia WhatsApp, Portugal Telegram, Japan Google). No fixed country list for them.
 - Dem pay from wallet in Naira (₦)
 - System give phone number
 - Customer use the number for the app to request OTP
@@ -720,7 +758,7 @@ const GEMINI_TOOLS = [{
       parameters: {
         type: 'OBJECT',
         properties: {
-          country: { type: 'STRING', description: 'Country name e.g. Nigeria, USA, UK, Ghana' },
+          country: { type: 'STRING', description: 'Any country name the customer typed (free search, full catalog)' },
           service: { type: 'STRING', description: 'Optional app filter e.g. WhatsApp, Telegram, Google' }
         },
         required: ['country']
@@ -879,32 +917,48 @@ async function paystackVerify(reference) {
 }
 
 async function resolveCountry(name) {
-  const key = String(name || '').toLowerCase().trim();
+  const raw = String(name || '').trim();
+  const key = raw.toLowerCase();
   if (!key) return null;
+
+  const live = await grizzlyCountries();
 
   // Numeric country id
   if (/^\d+$/.test(key)) {
     const id = Number(key);
-    const live = await grizzlyCountries();
     const hit = live.find((c) => c.id === id);
     return { id, name: hit ? hit.name : key };
   }
 
-  // Fast path: hardcoded aliases
-  if (key in COUNTRY_MAP) return { id: COUNTRY_MAP[key], name: key };
-  for (const [k, id] of Object.entries(COUNTRY_MAP)) {
-    if (key.includes(k) || k.includes(key)) return { id, name: k };
-  }
-
-  // Full Grizzly country list
-  const live = await grizzlyCountries();
+  // Exact match on live Grizzly country name
   let hit = live.find((c) => c.name.toLowerCase() === key);
   if (hit) return { id: hit.id, name: hit.name };
-  hit = live.find((c) => {
-    const n = c.name.toLowerCase();
-    return n.includes(key) || key.includes(n);
-  });
+
+  // Starts-with / contains on live names (prefer longer names)
+  const ranked = live
+    .map((c) => ({ ...c, n: c.name.toLowerCase() }))
+    .filter((c) => c.n.length >= 2)
+    .sort((a, b) => b.n.length - a.n.length);
+
+  hit = ranked.find((c) => c.n.startsWith(key) || key.startsWith(c.n));
   if (hit) return { id: hit.id, name: hit.name };
+
+  hit = ranked.find((c) => c.n.includes(key) || key.includes(c.n));
+  if (hit) return { id: hit.id, name: hit.name };
+
+  // Soft alias only if live search missed (ng → Nigeria, etc.)
+  if (key in COUNTRY_MAP) {
+    const id = COUNTRY_MAP[key];
+    const liveHit = live.find((c) => c.id === id);
+    return { id, name: liveHit ? liveHit.name : key };
+  }
+  for (const [k, id] of Object.entries(COUNTRY_MAP)) {
+    if (k.length < 3) continue;
+    if (key.includes(k) || k.includes(key)) {
+      const liveHit = live.find((c) => c.id === id);
+      return { id, name: liveHit ? liveHit.name : k };
+    }
+  }
   return null;
 }
 
@@ -919,10 +973,8 @@ async function executeGeminiFunction(fnName, args, telegramUserId, session) {
         .sort((a, b) => a.localeCompare(b));
       return {
         total: names.length,
-        countries: names.slice(0, 80),
-        tip: names.length > 80
-          ? 'Showing first 80. Customer can type any country name (e.g. Portugal, UAE, Japan).'
-          : 'Customer can type any country name from this list.'
+        countries: names.slice(0, 100),
+        tip: 'Full live catalog. Customer can type ANY country name freely — not limited to this preview.'
       };
     }
 
@@ -1202,39 +1254,62 @@ async function callGeminiWithTools(session, telegramUserId, userText) {
   };
 }
 
-function parseCountryService(text) {
-  const t = String(text || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+async function parseCountryService(text) {
+  const original = String(text || '').trim();
+  const t = original.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
   let countryId = null;
   let countryName = null;
   let serviceCode = null;
   let serviceName = null;
 
-  // Word-boundary matching, not substring .includes() — this function reads
-  // every free-text message a user sends (see bot.on('text', ...)), and
-  // short 2-letter codes like 'in', 'us', 'ng', 'ca' as raw substrings would
-  // false-match inside completely unrelated words ('finish', 'joining',
-  // 'buying', 'canada'... wait even 'canada' contains 'ca' — exactly this
-  // class of bug). \b ensures 'us' matches the standalone word "us", not
-  // the middle of "trust" or "custom". Longer names are checked first so
-  // e.g. "united states" wins over a shorter unrelated partial match.
-  const countryEntries = Object.entries(COUNTRY_MAP).sort((a, b) => b[0].length - a[0].length);
-  for (const [name, id] of countryEntries) {
-    if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(t)) {
-      countryId = id;
-      countryName = name;
-      break;
-    }
-  }
+  // Services first (so "WhatsApp" doesn't get eaten as a country fragment)
   const serviceEntries = Object.entries(SERVICE_MAP).sort((a, b) => b[0].length - a[0].length);
   for (const [name, code] of serviceEntries) {
-    if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(t)) {
+    if (name.length < 2) continue;
+    if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\b`).test(t)) {
       serviceCode = code;
       serviceName = name;
       break;
     }
   }
+
+  // Free-search country against full live Grizzly list
+  try {
+    const live = await grizzlyCountries();
+    const ranked = [...live]
+      .map((c) => ({ id: c.id, name: c.name, n: String(c.name || '').toLowerCase().trim() }))
+      .filter((c) => c.n.length >= 2)
+      .sort((a, b) => b.n.length - a.n.length);
+
+    // Prefer multi-word country names present in the message
+    for (const c of ranked) {
+      if (c.n.length < 3 && c.n.length !== 2) continue;
+      const re = new RegExp(`\\b${c.n.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\b`);
+      if (re.test(t)) {
+        countryId = c.id;
+        countryName = c.name;
+        break;
+      }
+    }
+
+    // If still nothing, try alias map only as helper (ng, uk, usa…)
+    if (countryId == null) {
+      const aliasEntries = Object.entries(COUNTRY_MAP).sort((a, b) => b[0].length - a[0].length);
+      for (const [name, id] of aliasEntries) {
+        if (name.length < 2) continue;
+        if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\b`).test(t)) {
+          countryId = id;
+          const liveHit = ranked.find((c) => c.id === id);
+          countryName = liveHit ? liveHit.name : name;
+          break;
+        }
+      }
+    }
+  } catch (_) {}
+
   return { countryId, countryName, serviceCode, serviceName };
 }
+
 
 function matchServices(list, query) {
   if (!query) return list.slice(0, 20);
@@ -1800,7 +1875,8 @@ bot.on('text', async (ctx) => {
   }
 
   // If we have country in session and user only sent app name
-  if (session.countryId && !parseCountryService(text).countryId) {
+  const _parsedEarly = await parseCountryService(text);
+  if (session.countryId && !_parsedEarly.countryId) {
     const maybeApp = parseCountryService('nigeria ' + text); // reuse app matcher
     // simpler: check SERVICE_MAP keys in text
     let appHit = null;
@@ -1817,7 +1893,7 @@ bot.on('text', async (ctx) => {
   }
 
   // --- Country + app in one message ---
-  const parsed = parseCountryService(text);
+  const parsed = await parseCountryService(text);
   if (parsed.countryId && (parsed.serviceCode || parsed.serviceName)) {
     return showServiceOptions(ctx, session, userId, parsed.countryId, parsed.countryName, parsed.serviceName || parsed.serviceCode);
   }
@@ -1850,19 +1926,49 @@ bot.on('text', async (ctx) => {
     );
   }
 
+  // Last attempt: free-text country resolve + optional app
+  const lastTry = await resolveCountry(text.split(/\s+/)[0] || text);
+  if (lastTry) {
+    const appGuess = await parseCountryService(text);
+    if (appGuess.serviceName || appGuess.serviceCode) {
+      return showServiceOptions(
+        ctx,
+        session,
+        userId,
+        lastTry.id,
+        lastTry.name,
+        appGuess.serviceName || appGuess.serviceCode
+      );
+    }
+    session.country = lastTry.name;
+    session.countryId = lastTry.id;
+    session.state = 'AWAITING_APP';
+    await saveUserSession(userId, session);
+    return ctx.reply(
+      `Country: *${lastTry.name}*\n\nWhich app?`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [
+            Markup.button.callback('WhatsApp', `app:${lastTry.id}:whatsapp`),
+            Markup.button.callback('Telegram', `app:${lastTry.id}:telegram`)
+          ],
+          [
+            Markup.button.callback('Google', `app:${lastTry.id}:google`),
+            Markup.button.callback('Instagram', `app:${lastTry.id}:instagram`)
+          ],
+          [
+            Markup.button.callback('Facebook', `app:${lastTry.id}:facebook`),
+            Markup.button.callback('TikTok', `app:${lastTry.id}:tiktok`)
+          ]
+        ])
+      }
+    );
+  }
+
   return ctx.reply(
-    'How far — tell me country + app.\n\nExamples:\n• USA WhatsApp\n• Nigeria Telegram\n• UK Google\n\nOr tap below:',
-    Markup.inlineKeyboard([
-      [
-        Markup.button.callback('🇺🇸 United States', 'cty:12'),
-        Markup.button.callback('🇬🇧 United Kingdom', 'cty:16')
-      ],
-      [
-        Markup.button.callback('🇨🇦 Canada', 'cty:36'),
-        Markup.button.callback('🇳🇬 Nigeria', 'cty:19')
-      ],
-      [Markup.button.callback('💳 Fund wallet', 'menu:fund')]
-    ])
+    'I no catch that one clear.\n\nType like: *Australia WhatsApp* or *USA Telegram*',
+    { parse_mode: 'Markdown' }
   );
 });
 
