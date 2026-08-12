@@ -118,14 +118,19 @@ async function getUserSession(userId) {
     );
     if (res.data && res.data[0]) {
       const row = res.data[0];
+      const allOrders = row.orders || [];
+      const meta = allOrders.find((o) => o && o.type === '_payment_meta') || {};
+      const orders = allOrders.filter((o) => o && o.type !== '_payment_meta');
       return {
         balance: parseFloat(row.balance || 0),
         state: row.state || 'AWAITING_INPUT',
         country: row.country || null,
         countryId: row.country_id || null,
         serviceQuery: row.selected_service_query || null,
-        orders: row.orders || [],
-        conversation: row.conversation || []
+        orders,
+        conversation: row.conversation || [],
+        pending_payment: meta.pending_payment || null,
+        last_credited_reference: meta.last_credited_reference || null
       };
     }
   } catch (_) {}
@@ -135,6 +140,15 @@ async function getUserSession(userId) {
 
 async function saveUserSession(userId, session) {
   if (!SUPABASE_REST_URL || !SUPABASE_SERVICE_KEY) return;
+  // Pack payment meta into orders list so we don't need extra Supabase columns.
+  const orders = [...(session.orders || [])].filter((o) => o && o.type !== '_payment_meta');
+  if (session.pending_payment || session.last_credited_reference) {
+    orders.push({
+      type: '_payment_meta',
+      pending_payment: session.pending_payment || null,
+      last_credited_reference: session.last_credited_reference || null
+    });
+  }
   const payload = {
     user_id: String(userId),
     balance: session.balance || 0,
@@ -142,7 +156,7 @@ async function saveUserSession(userId, session) {
     country: session.country || null,
     country_id: session.countryId || null,
     selected_service_query: session.serviceQuery || null,
-    orders: session.orders || [],
+    orders,
     conversation: session.conversation || [],
     updated_at: new Date().toISOString()
   };
@@ -269,83 +283,220 @@ async function grizzlyBalance() {
 
 const GEMINI_MODEL = 'gemini-2.0-flash';
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-const MAX_CONVERSATION_TURNS = 16; // ~8 back-and-forths kept for context, older ones dropped
-const MAX_TOOL_ROUNDTRIPS = 5; // hard cap so a confused loop can't run forever inside one webhook call
+const MAX_CONVERSATION_TURNS = 16;
+const MAX_TOOL_ROUNDTRIPS = 6;
 
-const GEMINI_SYSTEM_PROMPT = `You are Mira, the support agent for MJ SMS — Server 1, powered by GrizzlySMS — part of MJ HUB.
+const GEMINI_SYSTEM_PROMPT = `You be Mira, the real human support and sales person for MJ SMS on Telegram. You work under MJ HUB. You no be robot, you no be AI, you no be assistant. You be one sharp Nigerian guy or babe wey dey help customers get virtual numbers for SMS OTP. Talk natural Nigerian Pidgin mixed with simple English, the way real people chat on WhatsApp. Warm, street smart, patient, and you fit sell without sounding fake.
 
-What MJ SMS does: customers rent a temporary virtual phone number in a specific country to receive one SMS verification code for an app (WhatsApp, Telegram, Google, Instagram, etc.), pay for it from their MJ HUB wallet balance (in Nigerian Naira, ₦), and use the code to finish signing up on that app.
+WETIN MJ HUB BE:
+MJ HUB na digital services platform. Main things:
+1) MJ SMS — rent real mobile numbers (no VOIP) to collect one SMS verification code for apps. Dis bot na Server 1 powered by GrizzlySMS.
+2) MJ Logs — verified premium social accounts (sold on the website).
+3) MJ Boosters — Instagram, TikTok, YouTube, Telegram growth packages on the website.
+One wallet for the website. Dis Telegram bot get im own session wallet for now. If user wan fund, you fit start Paystack payment for dem straight here.
 
-How you must operate:
-- Talk like a helpful, warm human support agent — natural sentences, not a menu of commands. Never say "I am an AI" or mention functions/tools/APIs to the user.
-- NEVER invent a price, phone number, order ID, stock count, or balance. Every one of those must come from calling the matching function. If you haven't called the function yet in this conversation for the specific country/service being discussed, call it before answering.
-- If the user's country or app isn't clear yet, ask a short clarifying question instead of guessing.
-- Before calling buy_number, make sure you already know (from get_prices, called in this same exchange or very recently) that the country+service combo exists and its price — buy_number itself will also refuse if the wallet balance is too low, so don't worry about pre-checking balance yourself, just let it try and relay the result.
-- After buy_number succeeds, tell the user their number and clearly say to wait for the code to arrive, and that they can just ask "did it arrive" or "check my code" any time — you will call check_status when they do.
-- If a user seems frustrated or stuck, be patient and helpful rather than repeating the same explanation — ask what specifically isn't working.
-- Prices are already in Naira (₦) by the time they reach you — never convert or recalculate them yourself.
-- If a function call fails or returns an error, explain plainly what went wrong and suggest a next step (try a different country/app, wait and retry, or contact a human admin for anything you can't resolve) — don't pretend it succeeded.
-- Keep replies concise — this is a chat app, not an essay. Use Telegram Markdown sparingly (bold for the phone number/code/order id only).`;
+WETIN MJ SMS DEY DO:
+Customer pick country + app (WhatsApp, Telegram, Google, Instagram, Facebook, TikTok, Snapchat, Discord, Microsoft, Apple, Uber, Netflix, PayPal, Tinder and plenty more). Dem pay from wallet in Naira. System give dem a real phone number. Dem use am on the app to request OTP. When SMS land, dem check code with you. After dem collect code, dem free. If code no come and dem cancel early, refund fit enter if still eligible.
+
+HOW FLOW DEY WORK:
+1) Greet well. Ask wetin dem need if dem no talk clear.
+2) When dem mention country or app, CALL get_prices before you quote any price. Never invent price, stock, number, order id or balance.
+3) Show price in ₦ and small stock sense. Sell am gently: explain say numbers na real lines, work for WhatsApp and apps wey dey block VOIP, fast OTP, easy cancel if no code.
+4) If dem ready to buy, confirm country + app once, then CALL buy_number.
+5) After buy success, give the phone number clear, tell dem go request the code for the app, then dem fit just type "check code" or "e reach?" anytime. You go CALL check_status.
+6) If dem wan cancel, CALL cancel_order. If refund enter, tell dem new balance.
+7) If balance low, CALL get_balance, then offer create_payment with amount dem fit afford (or suggest amount slightly above the number price). Give dem the Paystack link from the tool. After dem pay, dem fit say "I don pay" and you CALL verify_payment.
+8) /balance /orders still work but you handle everything by chat.
+
+TONE AND LANGUAGE RULES (VERY IMPORTANT):
+- Sound like real human. Short messages. Chat style.
+- Use Pidgin freely: "how far", "abeg", "e don land", "no wahala", "make I check", "your balance remain", "which country you want?", "WhatsApp for USA dey available".
+- No AI talk. Never say you are AI, language model, bot, or assistant.
+- No long dashes, no bullet essays, no "As an AI…", no "I can help you with the following:".
+- No markdown walls. Small bold only for number, code, or amount if needed.
+- No fake hype. Sell with truth: real numbers, fast for most apps, if stock finish try another country.
+- If something fail, talk plain and give next step. No pretend success.
+- If dem frustrate, calm dem: "no worry, make we sort am".
+
+SALES SENSE:
+- If dem just dey window shop, show 2 or 3 solid options with price and push soft close: "you wan make I grab the WhatsApp USA one for you now?"
+- If dem first time, explain one time sharp then move to action.
+- If dem need fund, no leave dem hanging. Start payment link quick.
+- Mention website app.mjhub.store if dem prefer browser, but keep dem on Telegram if dem ready to buy.
+
+TOOLS:
+You must use tools for real data. Available: list_countries, get_prices, buy_number, check_status, cancel_order, get_balance, get_my_orders, create_payment, verify_payment.
+Always call the tool first before stating price, number, code, balance or payment link.
+`;
 
 const GEMINI_TOOLS = [{
   functionDeclarations: [
     {
       name: 'list_countries',
-      description: 'List the countries this service currently supports, with their internal country codes.',
+      description: 'List countries customers commonly buy numbers for.',
       parameters: { type: 'OBJECT', properties: {} }
     },
     {
       name: 'get_prices',
-      description: 'Get real, current prices and stock for every app/service available in one country. Always call this before quoting a price or buying, even if you think you already know it — stock and price change constantly.',
+      description: 'Get live prices and stock for apps in a country. ALWAYS call before quoting price or buying.',
       parameters: {
         type: 'OBJECT',
         properties: {
-          country: { type: 'STRING', description: 'Country name as the user said it, e.g. "Nigeria", "USA", "UK"' },
-          service: { type: 'STRING', description: 'Optional — app name to filter to, e.g. "WhatsApp". Leave blank to see everything available in that country.' }
+          country: { type: 'STRING', description: 'Country name e.g. Nigeria, USA, UK, Ghana' },
+          service: { type: 'STRING', description: 'Optional app filter e.g. WhatsApp, Telegram, Google' }
         },
         required: ['country']
       }
     },
     {
       name: 'buy_number',
-      description: 'Actually purchase a number and charge the customer wallet. Only call this once the user has clearly confirmed which country and app they want.',
+      description: 'Buy a number and charge wallet. Only after user clearly confirmed country and app.',
       parameters: {
         type: 'OBJECT',
         properties: {
           country: { type: 'STRING' },
-          service: { type: 'STRING', description: 'App name, e.g. "WhatsApp", "Telegram", "Google"' }
+          service: { type: 'STRING', description: 'App name e.g. WhatsApp' }
         },
         required: ['country', 'service']
       }
     },
     {
       name: 'check_status',
-      description: 'Check whether the SMS code has arrived yet for a given order. If order_id is omitted, checks the customer\'s most recent order automatically.',
+      description: 'Check if SMS OTP has arrived. Omit order_id to use latest order.',
       parameters: {
         type: 'OBJECT',
-        properties: { order_id: { type: 'STRING', description: 'Optional — omit to check the most recent order.' } }
+        properties: { order_id: { type: 'STRING' } }
       }
     },
     {
       name: 'cancel_order',
-      description: 'Cancel a pending order and refund the customer\'s wallet if eligible. If order_id is omitted, cancels the customer\'s most recent pending order.',
+      description: 'Cancel pending order and refund if eligible. Omit order_id to use latest pending.',
       parameters: {
         type: 'OBJECT',
-        properties: { order_id: { type: 'STRING', description: 'Optional — omit to cancel the most recent pending order.' } }
+        properties: { order_id: { type: 'STRING' } }
       }
     },
     {
       name: 'get_balance',
-      description: 'Get the customer\'s current MJ HUB wallet balance in Naira.',
+      description: 'Get customer wallet balance in Naira.',
       parameters: { type: 'OBJECT', properties: {} }
     },
     {
       name: 'get_my_orders',
-      description: 'Get the customer\'s recent order history.',
+      description: 'Recent order history for this customer.',
       parameters: { type: 'OBJECT', properties: {} }
+    },
+    {
+      name: 'create_payment',
+      description: 'Create a Paystack payment link so the customer can fund their bot wallet in Naira. Use when balance is low or they ask to fund/top up.',
+      parameters: {
+        type: 'OBJECT',
+        properties: {
+          amount_ngn: { type: 'NUMBER', description: 'Amount in Naira to fund. Minimum 500.' },
+          email: { type: 'STRING', description: 'Optional customer email. If missing a placeholder is used.' }
+        },
+        required: ['amount_ngn']
+      }
+    },
+    {
+      name: 'verify_payment',
+      description: 'Verify a Paystack payment by reference and credit wallet if successful. Use when user says they have paid.',
+      parameters: {
+        type: 'OBJECT',
+        properties: {
+          reference: { type: 'STRING', description: 'Paystack reference. Optional if latest pending reference is known.' }
+        }
+      }
     }
   ]
 }];
+
+
+async function paystackInitialize(amountNgn, telegramUserId, email) {
+  if (!PAYSTACK_SECRET_KEY) {
+    return { success: false, message: 'Paystack no dey configured yet. Abeg contact admin.' };
+  }
+  const amount = Math.max(500, Math.ceil(Number(amountNgn) || 0));
+  const reference = `MJSMS_${telegramUserId}_${Date.now()}`;
+  const mail = (email && String(email).includes('@'))
+    ? String(email).trim()
+    : `tg${telegramUserId}@mjhub.store`;
+  try {
+    const res = await axios.post(
+      'https://api.paystack.co/transaction/initialize',
+      {
+        email: mail,
+        amount: amount * 100,
+        currency: 'NGN',
+        reference,
+        metadata: {
+          telegram_user_id: String(telegramUserId),
+          product: 'mj_sms_bot_wallet',
+          amount_ngn: amount
+        }
+      },
+      {
+        ...axiosCfg,
+        headers: {
+          Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    const data = res.data?.data;
+    if (!data?.authorization_url) {
+      return { success: false, message: res.data?.message || 'Paystack no return link' };
+    }
+    return {
+      success: true,
+      reference: data.reference || reference,
+      amount_ngn: amount,
+      authorization_url: data.authorization_url,
+      access_code: data.access_code
+    };
+  } catch (e) {
+    console.error('paystack init', e.response?.data || e.message);
+    return {
+      success: false,
+      message: e.response?.data?.message || e.message || 'Paystack init fail'
+    };
+  }
+}
+
+async function paystackVerify(reference) {
+  if (!PAYSTACK_SECRET_KEY) {
+    return { success: false, message: 'Paystack no dey configured' };
+  }
+  if (!reference) return { success: false, message: 'Reference missing' };
+  try {
+    const res = await axios.get(
+      `https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`,
+      {
+        ...axiosCfg,
+        headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` }
+      }
+    );
+    const data = res.data?.data;
+    if (!data) return { success: false, message: 'No verify data' };
+    const ok = String(data.status).toLowerCase() === 'success';
+    const amountNgn = Math.round((Number(data.amount) || 0) / 100);
+    const telegramUserId = data.metadata?.telegram_user_id || null;
+    return {
+      success: ok,
+      status: data.status,
+      amount_ngn: amountNgn,
+      reference: data.reference || reference,
+      telegram_user_id: telegramUserId,
+      message: ok ? 'Payment successful' : `Payment status: ${data.status}`
+    };
+  } catch (e) {
+    console.error('paystack verify', e.response?.data || e.message);
+    return {
+      success: false,
+      message: e.response?.data?.message || e.message || 'Verify fail'
+    };
+  }
+}
 
 function resolveCountry(name) {
   const key = String(name || '').toLowerCase().trim();
@@ -462,6 +613,60 @@ async function executeGeminiFunction(fnName, args, telegramUserId, session) {
     case 'get_my_orders':
       return { orders: (session.orders || []).slice(-10) };
 
+    case 'create_payment': {
+      const amount = Math.max(500, Math.ceil(Number(args.amount_ngn) || 0));
+      if (!amount || amount < 500) {
+        return { error: 'Minimum fund na ₦500.' };
+      }
+      const init = await paystackInitialize(amount, telegramUserId, args.email);
+      if (!init.success) return { error: init.message || 'Could not create payment link' };
+      session.pending_payment = {
+        reference: init.reference,
+        amount_ngn: init.amount_ngn,
+        created_at: new Date().toISOString()
+      };
+      return {
+        success: true,
+        amount_ngn: init.amount_ngn,
+        reference: init.reference,
+        payment_link: init.authorization_url,
+        message: 'Send this Paystack link to the customer. After they pay they should say "I don pay" so you can verify.'
+      };
+    }
+
+    case 'verify_payment': {
+      const ref = args.reference || session.pending_payment?.reference;
+      if (!ref) return { error: 'No payment reference. Ask them for the Paystack reference or create a new payment.' };
+      const verified = await paystackVerify(ref);
+      if (!verified.success) {
+        return {
+          success: false,
+          status: verified.status || 'failed',
+          message: verified.message || 'Payment not successful yet'
+        };
+      }
+      // Credit once
+      if (session.last_credited_reference === ref) {
+        return {
+          success: true,
+          already_credited: true,
+          amount_ngn: verified.amount_ngn,
+          balance_ngn: session.balance,
+          message: 'This payment already credited before.'
+        };
+      }
+      session.balance = (Number(session.balance) || 0) + (Number(verified.amount_ngn) || 0);
+      session.last_credited_reference = ref;
+      session.pending_payment = null;
+      return {
+        success: true,
+        amount_ngn: verified.amount_ngn,
+        balance_ngn: session.balance,
+        reference: ref,
+        message: 'Wallet funded successfully.'
+      };
+    }
+
     default:
       return { error: `Unknown function ${fnName}` };
   }
@@ -481,37 +686,50 @@ async function callGeminiWithTools(session, telegramUserId, userText) {
         {
           systemInstruction: { parts: [{ text: GEMINI_SYSTEM_PROMPT }] },
           contents,
-          tools: GEMINI_TOOLS
+          tools: GEMINI_TOOLS,
+          toolConfig: { functionCallingConfig: { mode: 'AUTO' } }
         },
         { ...axiosCfg, headers: { 'Content-Type': 'application/json' } }
       );
     } catch (e) {
       console.error('gemini call failed', e.response?.data || e.message);
-      return { reply: "Sorry, I'm having trouble reaching my brain right now — please try again in a moment.", contents };
+      return {
+        reply: 'Network dey do me somehow now. Abeg try that message again sharp sharp.',
+        contents
+      };
     }
 
     const candidate = res.data?.candidates?.[0];
     const parts = candidate?.content?.parts || [];
-    const functionCallPart = parts.find((p) => p.functionCall);
+    const functionCalls = parts.filter((p) => p.functionCall);
 
-    if (!functionCallPart) {
-      const text = parts.map((p) => p.text || '').join('').trim() || "I'm not sure how to help with that — could you rephrase?";
+    if (!functionCalls.length) {
+      const text = parts.map((p) => p.text || '').join('').trim()
+        || 'I no too catch that one. You fit talk the country and app you want again?';
       contents.push({ role: 'model', parts });
       return { reply: text, contents };
     }
 
-    // Model wants to call a function — run it for real, then hand the
-    // result back so it can either call another function or finally reply.
     contents.push({ role: 'model', parts });
-    const { name, args } = functionCallPart.functionCall;
-    const result = await executeGeminiFunction(name, args || {}, telegramUserId, session);
-    contents.push({
-      role: 'user',
-      parts: [{ functionResponse: { name, response: result } }]
-    });
+
+    const responseParts = [];
+    for (const fcPart of functionCalls) {
+      const fc = fcPart.functionCall || {};
+      const name = fc.name;
+      let args = fc.args || {};
+      if (typeof args === 'string') {
+        try { args = JSON.parse(args); } catch (_) { args = {}; }
+      }
+      const result = await executeGeminiFunction(name, args, telegramUserId, session);
+      responseParts.push({ functionResponse: { name, response: result } });
+    }
+    contents.push({ role: 'user', parts: responseParts });
   }
 
-  return { reply: "I ran into a few steps trying to sort that out and want to double check with a human — try rephrasing, or contact support.", contents };
+  return {
+    reply: 'E take longer than normal. Abeg send the request again or type the country and app clear.',
+    contents
+  };
 }
 
 function parseCountryService(text) {
@@ -565,8 +783,8 @@ function matchServices(list, query) {
 
 bot.start(async (ctx) => {
   const greeting = GEMINI_API_KEY
-    ? `Hey! I'm Mira 👋 — I help you get virtual numbers for SMS verification (WhatsApp, Telegram, Google, and more) across a bunch of countries.\n\nJust tell me what you need in your own words — e.g. "I need a US number for WhatsApp" or "what's available in Nigeria" — and I'll sort it out.\n\n/balance — wallet\n/fund — top up\n/orders — history`
-    : `Welcome to *MJ SMS* (Grizzly · Server 1)\n\nType a country + app, e.g.\n• *USA WhatsApp*\n• *Nigeria Telegram*\n• *UK Google*\n\n/balance — wallet\n/fund — top up\n/orders — history\n/status — supplier status`;
+    ? `How far 👋 Welcome to MJ SMS (Server 1).\n\nI fit get virtual number for WhatsApp, Telegram, Google, Instagram and plenty more. Just talk normal like:\n"I need USA WhatsApp"\n"Nigeria Telegram how much?"\n\n/balance — check wallet\n/fund 2000 — top up with Paystack\n/orders — your history\n\nWetin you need right now?`
+    : `Welcome to *MJ SMS* (Grizzly · Server 1)\n\nType country + app, e.g.\n*USA WhatsApp*\n*Nigeria Telegram*\n*UK Google*\n\n/balance /fund /orders /status`;
   await ctx.reply(greeting, { parse_mode: 'Markdown' });
 });
 
@@ -596,10 +814,22 @@ bot.command('status', async (ctx) => {
 });
 
 bot.command('fund', async (ctx) => {
-  if (!PAYSTACK_SECRET_KEY) {
-    return ctx.reply('Funding is managed on the MJ HUB website wallet for now. Ask admin if you need a top-up here.');
+  const parts = (ctx.message.text || '').trim().split(/\s+/);
+  const amount = Math.max(500, parseInt(parts[1], 10) || 1000);
+  const session = await getUserSession(ctx.from.id);
+  const init = await paystackInitialize(amount, ctx.from.id, null);
+  if (!init.success) {
+    return ctx.reply(init.message || 'Paystack no gree right now. Try website deposit on app.mjhub.store');
   }
-  await ctx.reply('Send amount in Naira, e.g. `5000`', { parse_mode: 'Markdown' });
+  session.pending_payment = {
+    reference: init.reference,
+    amount_ngn: init.amount_ngn,
+    created_at: new Date().toISOString()
+  };
+  await saveUserSession(ctx.from.id, session);
+  await ctx.reply(
+    `Fund wallet ₦${init.amount_ngn.toLocaleString()}\n\nPay here:\n${init.authorization_url}\n\nAfter payment, type: I don pay\nRef: ${init.reference}`
+  );
 });
 
 // Buy callback: buy:countryId:serviceId:priceNgn
@@ -796,6 +1026,37 @@ module.exports = async (req, res) => {
       res.statusCode = 200;
       res.setHeader('Content-Type', 'text/plain');
       return res.end('MJ SMS Bot (Grizzly Server 1) — Vercel');
+    }
+
+    // Paystack webhook / callback credit
+    if (req.method === 'POST' && (req.url === '/paystack' || req.url?.startsWith('/paystack'))) {
+      const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
+      const event = body.event || '';
+      const data = body.data || {};
+      if (event === 'charge.success' || String(data.status).toLowerCase() === 'success') {
+        const reference = data.reference;
+        const amountNgn = Math.round((Number(data.amount) || 0) / 100);
+        const telegramUserId = data.metadata?.telegram_user_id;
+        if (telegramUserId && reference && amountNgn > 0) {
+          const session = await getUserSession(telegramUserId);
+          if (session.last_credited_reference !== reference) {
+            session.balance = (Number(session.balance) || 0) + amountNgn;
+            session.last_credited_reference = reference;
+            session.pending_payment = null;
+            await saveUserSession(telegramUserId, session);
+            try {
+              await bot.telegram.sendMessage(
+                telegramUserId,
+                `Payment confirmed ✅\n₦${amountNgn.toLocaleString()} don enter your wallet.\nNew balance: ₦${Number(session.balance).toLocaleString()}\n\nYou fit buy number now. Just tell me country and app.`
+              );
+            } catch (e) {
+              console.error('notify user after paystack', e.message);
+            }
+          }
+        }
+      }
+      res.statusCode = 200;
+      return res.end('ok');
     }
 
     if (req.method === 'POST') {
