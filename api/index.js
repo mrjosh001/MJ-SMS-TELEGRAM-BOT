@@ -2387,18 +2387,154 @@ async function miraShowPricesAndConfirm(ctx, session, userId, countryId, country
   );
 }
 
+/** Only real apps count as a service — never junk like "cheaper ones" */
+function isRealServiceName(name) {
+  if (!name) return false;
+  const s = String(name).toLowerCase().trim();
+  if (s.length < 2 || s.length > 24) return false;
+  if (/cheaper|option|number|price|available|stock|please|help|fund|wallet|balance|country|service/.test(s)) {
+    return false;
+  }
+  if (SERVICE_MAP[s]) return true;
+  if (Object.keys(SERVICE_MAP).some((k) => k.length > 2 && (s.includes(k) || k.includes(s)))) return true;
+  if (SERVICE_NAMES[s]) return true;
+  return false;
+}
+
+function clearBuyState(session, userId) {
+  session.state = 'AWAITING_INPUT';
+  session.pendingService = null;
+  session.serviceQuery = null;
+  session.country = null;
+  session.countryId = null;
+  session.last_options = [];
+  clearIntent(userId);
+}
+
 async function miraHandleSmartText(ctx, session, userId, textMsg) {
   const lower = String(textMsg || '').trim().toLowerCase();
   let state = session.state || 'AWAITING_INPUT';
 
-  // Merge: memory intent + supabase session + reply-to message
+  // Scrub junk pending service left from old bugs ("cheaper ones", etc.)
+  if (session.pendingService && !isRealServiceName(session.pendingService)) {
+    session.pendingService = null;
+    session.serviceQuery = null;
+    if (state === 'AWAITING_COUNTRY') state = 'AWAITING_INPUT';
+    session.state = state;
+  }
+  if (session.serviceQuery && !isRealServiceName(session.serviceQuery)) {
+    session.serviceQuery = null;
+  }
+
+  // ========== ESCAPE INTENTS (always win over stuck buy flow) ==========
+  // User wants to leave the "which country?" loop — clear state and help them.
+  const wantsFund =
+    /\b(fund|top\s*up|topup|deposit|recharge|add\s*money|load\s*wallet|pay\s*in)\b/i.test(lower);
+  const wantsBalance =
+    /\b(balance|my\s*wallet|how\s*much\s*(i\s*get|dey|left)|wallet\s*balance|wetin\s*(remain|left)|what.?s?\s*my\s*balance)\b/i.test(
+      lower
+    );
+  const wantsCancelFlow =
+    /^(cancel|stop|never mind|forget|reset|start over|abeg forget|no more)$/i.test(lower.trim());
+  const wantsHelp =
+    /^(help|menu|start)$/i.test(lower.trim()) ||
+    /\b(wetin you fit do|what can you do|commands?)\b/i.test(lower);
+
+  if (wantsCancelFlow) {
+    clearBuyState(session, userId);
+    await saveUserSession(userId, session);
+    return ctx.reply('Alright, e clear. Wetin you need now? Number, fund, or balance?');
+  }
+
+  if (wantsBalance) {
+    clearBuyState(session, userId);
+    await saveUserSession(userId, session);
+    return ctx.reply(`Your balance na *₦${money(session.balance).toLocaleString()}* 💰`, {
+      parse_mode: 'Markdown'
+    });
+  }
+
+  if (wantsFund) {
+    clearBuyState(session, userId);
+    const amtMatch =
+      lower.match(/(?:fund|top\s*up|topup|deposit|recharge)\s*[₦n]?\s*([\d,]+)/i) ||
+      lower.match(/\b([\d,]{3,})\b/);
+    if (amtMatch) {
+      const amount = parseInt(String(amtMatch[1]).replace(/[^\d]/g, ''), 10) || 0;
+      if (amount >= 1000 && amount <= 200000) {
+        const init = await paystackInitialize(amount, userId, null);
+        if (!init.success) {
+          await saveUserSession(userId, session);
+          return ctx.reply(init.message || 'Paystack no gree right now. Try /fund later.');
+        }
+        const pending = {
+          reference: init.reference,
+          amount_ngn: init.amount_ngn,
+          authorization_url: init.authorization_url,
+          created_at: new Date().toISOString()
+        };
+        session.pending_payment = pending;
+        pendingPayments.set(String(userId), pending);
+        await saveUserSession(userId, session);
+        return ctx.reply(
+          `Top up *₦${init.amount_ngn.toLocaleString()}*\n\nTap *Pay* below.\nWhen e successful, type: *I don pay*`,
+          {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', init.authorization_url)]])
+          }
+        );
+      }
+    }
+    session.state = 'AWAITING_FUND_AMOUNT';
+    await saveUserSession(userId, session);
+    return ctx.reply(
+      'How much you wan fund?\n\nMin ₦1,000 · Max ₦200,000\n\nExample: *5000*',
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  if (wantsHelp || looksLikeChitchat(textMsg)) {
+    // Don't trap greetings inside a stuck buy flow
+    if (state === 'AWAITING_COUNTRY' || state === 'AWAITING_SERVICE' || state === 'AWAITING_CONFIRM') {
+      clearBuyState(session, userId);
+      await saveUserSession(userId, session);
+    }
+    if (wantsHelp) {
+      return ctx.reply(MIRA.greet, { parse_mode: 'Markdown' });
+    }
+    // chitchat falls through only if no active buy — else greet
+    if (!session.pendingService && state === 'AWAITING_INPUT') {
+      return ctx.reply(
+        'How far 👋 I dey. You need number, or you wan check balance / fund wallet?',
+        { parse_mode: 'Markdown' }
+      );
+    }
+  }
+
+  // Knowledge FAQ — also escapes stuck flow
+  if (
+    /\b(what\s*is\s*mj\s*(hub|sms)|about\s*mj|wetin\s*be\s*mj|mj\s*hub\s*na\s*wetin|tell\s*me\s*about)\b/i.test(
+      lower
+    )
+  ) {
+    clearBuyState(session, userId);
+    await saveUserSession(userId, session);
+    return ctx.reply(MIRA.about, { parse_mode: 'Markdown' });
+  }
+  if (/\b(how\s*(does|do|e\s*dey)\s*work|how\s*to\s*(buy|get|use)|how\s*sms\s*work)\b/i.test(lower)) {
+    clearBuyState(session, userId);
+    await saveUserSession(userId, session);
+    return ctx.reply(MIRA.howSms, { parse_mode: 'Markdown' });
+  }
+
+  // Merge: memory intent + supabase session + reply-to message (only REAL services)
   const mem = getIntent(userId) || {};
   const replyCtx = contextFromReply(ctx);
-  if (replyCtx.service && !session.pendingService) {
+  if (replyCtx.service && isRealServiceName(replyCtx.service) && !session.pendingService) {
     session.pendingService = replyCtx.service;
     session.serviceQuery = replyCtx.service;
   }
-  if (mem.service && !session.pendingService) {
+  if (mem.service && isRealServiceName(mem.service) && !session.pendingService) {
     session.pendingService = mem.service;
     session.serviceQuery = mem.service;
   }
@@ -2406,7 +2542,7 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
     session.countryId = mem.countryId;
     session.country = mem.countryName || session.country;
   }
-  if (mem.service && !state.startsWith('AWAITING')) {
+  if (session.pendingService && isRealServiceName(session.pendingService) && !state.startsWith('AWAITING')) {
     state = 'AWAITING_COUNTRY';
     session.state = 'AWAITING_COUNTRY';
   }
@@ -2474,16 +2610,27 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
     }
   }
 
-  // --- Waiting for country (service already known) ---
+  // --- Waiting for country (service already known — REAL apps only) ---
   {
-    const svcPending = session.pendingService || session.serviceQuery || mem.service || replyCtx.service;
+    const rawPending =
+      session.pendingService || session.serviceQuery || mem.service || replyCtx.service || null;
+    const svcPending = isRealServiceName(rawPending) ? rawPending : null;
+    if (!svcPending && (session.pendingService || session.serviceQuery)) {
+      // Drop junk and don't trap the user
+      session.pendingService = null;
+      session.serviceQuery = null;
+      if (state === 'AWAITING_COUNTRY') {
+        state = 'AWAITING_INPUT';
+        session.state = 'AWAITING_INPUT';
+      }
+    }
     const c = await resolveCountryStrict(textMsg);
     if (c && svcPending) {
       return miraShowPricesAndConfirm(ctx, session, userId, c.id, c.name, svcPending);
     }
-    if ((state === 'AWAITING_COUNTRY' || svcPending) && !c && !detectServiceOnly(textMsg)) {
+    if (state === 'AWAITING_COUNTRY' && svcPending && !c && !detectServiceOnly(textMsg)) {
       return ctx.reply(
-        `Which country for ${svcPending || 'the number'}?\n\n_Reply with country name_`,
+        `Which country for *${svcPending}*?\n\n_Reply with country name e.g. USA, UK, Nigeria_`,
         { parse_mode: 'Markdown' }
       );
     }
@@ -2507,8 +2654,9 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
     }
   }
 
-  // Recover pending service / country from session
-  const pendingSvc = session.pendingService || session.serviceQuery || null;
+  // Recover pending service / country from session (REAL services only)
+  const pendingSvcRaw = session.pendingService || session.serviceQuery || null;
+  const pendingSvc = isRealServiceName(pendingSvcRaw) ? pendingSvcRaw : null;
   const pendingCountryId = session.countryId || null;
   const pendingCountryName = session.country || null;
 
@@ -2525,7 +2673,7 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
     );
   }
 
-  // Country message while we already have a pending service → process (fixes lost state)
+  // Country message while we already have a pending service → process
   const countryGuess = await resolveCountryStrict(textMsg);
   if (countryGuess && pendingSvc) {
     return miraShowPricesAndConfirm(
@@ -2539,9 +2687,11 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
   }
 
   // Service message while we already have a country → process
-  const svcGuess = detectServiceOnly(textMsg) || (
-    parsed.serviceName ? { serviceName: parsed.serviceName, serviceCode: parsed.serviceCode } : null
-  );
+  const svcGuess =
+    detectServiceOnly(textMsg) ||
+    (parsed.serviceName && isRealServiceName(parsed.serviceName)
+      ? { serviceName: parsed.serviceName, serviceCode: parsed.serviceCode }
+      : null);
   if (svcGuess && pendingCountryId) {
     return miraShowPricesAndConfirm(
       ctx,
@@ -2554,7 +2704,7 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
   }
 
   // Service only → ask country (keep service in session)
-  if (svcGuess || parsed.serviceName || parsed.serviceCode) {
+  if (svcGuess || (parsed.serviceName && isRealServiceName(parsed.serviceName)) || parsed.serviceCode) {
     const svc = svcGuess || {
       serviceName: parsed.serviceName,
       serviceCode: parsed.serviceCode
@@ -2573,8 +2723,9 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
 
   // Country only (no pending service) → ask service
   if (countryGuess) {
-    // If reply/memory already has service, process now
-    const svcNow = session.pendingService || session.serviceQuery || replyCtx.service || mem.service;
+    const svcNowRaw =
+      session.pendingService || session.serviceQuery || replyCtx.service || mem.service || null;
+    const svcNow = isRealServiceName(svcNowRaw) ? svcNowRaw : null;
     if (svcNow) {
       return miraShowPricesAndConfirm(ctx, session, userId, countryGuess.id, countryGuess.name, svcNow);
     }
@@ -2584,100 +2735,22 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
     setIntent(userId, { countryId: countryGuess.id, countryName: countryGuess.name });
     await saveUserSession(userId, session);
     return ctx.reply(
-      `Which app for ${asName(countryGuess.name)}?\n\n_Reply to this message with the app_`,
+      `Which app for *${asName(countryGuess.name)}*?\n\nWhatsApp, Telegram, Instagram, Google…`,
       { parse_mode: 'Markdown' }
     );
   }
 
-  // --- Natural "fund / top up" intent (no / command needed) ---
-  if (
-    /\b(fund|top\s*up|topup|deposit|recharge|add\s*money|load\s*wallet|pay\s*in)\b/i.test(lower) &&
-    !detectServiceOnly(textMsg)
-  ) {
-    // e.g. "fund 5000" or "top up 2000"
-    const amtMatch = lower.match(/(?:fund|top\s*up|topup|deposit|recharge)\s*[₦n]?\s*([\d,]+)/i)
-      || lower.match(/([\d,]+)\s*(?:naira|ngn|₦)?/);
-    if (amtMatch) {
-      const amount = parseInt(String(amtMatch[1]).replace(/[^\d]/g, ''), 10) || 0;
-      if (amount >= 1000 && amount <= 200000) {
-        const init = await paystackInitialize(amount, userId, null);
-        if (!init.success) {
-          return ctx.reply(init.message || 'Paystack no gree right now. Try /fund later.');
-        }
-        const pending = {
-          reference: init.reference,
-          amount_ngn: init.amount_ngn,
-          authorization_url: init.authorization_url,
-          created_at: new Date().toISOString()
-        };
-        session.pending_payment = pending;
-        session.state = 'AWAITING_INPUT';
-        pendingPayments.set(String(userId), pending);
-        await saveUserSession(userId, session);
-        return ctx.reply(
-          `Top up ₦${init.amount_ngn.toLocaleString()}\n\nTap Pay below.\nWhen e successful, type: I don pay`,
-          Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', init.authorization_url)]])
-        );
-      }
-    }
-    session.state = 'AWAITING_FUND_AMOUNT';
+  if (looksLikeNeedNumber(textMsg)) {
+    clearBuyState(session, userId);
+    session.state = 'AWAITING_SERVICE';
     await saveUserSession(userId, session);
-    return ctx.reply(MIRA.fundHelp + '\n\nHow much you wan fund? (e.g. 5000)');
+    return ctx.reply(MIRA.askService);
   }
 
-  // --- Balance check in natural language ---
-  if (/\b(balance|my\s*wallet|how\s*much\s*(i\s*get|dey|left)|wallet\s*balance)\b/i.test(lower)) {
-    return ctx.reply(`Balance: *₦${money(session.balance).toLocaleString()}*`, { parse_mode: 'Markdown' });
-  }
-
-  // --- Knowledge / FAQ (Gemini-style answers without Gemini) ---
-  if (
-    /\b(what\s*is\s*mj\s*(hub|sms)|about\s*mj|wetin\s*be\s*mj|mj\s*hub\s*na\s*wetin|tell\s*me\s*about)\b/i.test(
-      lower
-    ) ||
-    /^(about|info|information)$/i.test(lower)
-  ) {
-    return ctx.reply(MIRA.about, { parse_mode: 'Markdown' });
-  }
-  if (
-    /\b(how\s*(does|do|e\s*dey)\s*work|how\s*to\s*(buy|get|use)|how\s*sms\s*work|how\s*i\s*(go|fit)\s*(buy|get))\b/i.test(
-      lower
-    )
-  ) {
-    return ctx.reply(MIRA.howSms, { parse_mode: 'Markdown' });
-  }
-  if (/\b(referral|refer\s*&?\s*earn|2%|commission|invite)\b/i.test(lower)) {
-    return ctx.reply(
-      'On *mjhub.store* every member get unique referral link.\n\n' +
-        'When someone you invite *funds their wallet*, you earn *2% of that deposit — for life*.\n\n' +
-        'Credit enters your NGN wallet automatic. This bot wallet is separate — referrals are on the website.',
-      { parse_mode: 'Markdown' }
-    );
-  }
-  if (/\b(voip|real\s*number|physical|virtual\s*number|is\s*it\s*real)\b/i.test(lower)) {
-    return ctx.reply(
-      'Numbers for this bot are *real mobile lines* (non-VOIP). Dem work better for WhatsApp, Telegram, Google and major apps than pure virtual/VOIP numbers.\n\nTell me country + app make I check price.',
-      { parse_mode: 'Markdown' }
-    );
-  }
-  if (/\b(cancel|refund|code\s*no\s*(come|drop|show)|otp\s*no)\b/i.test(lower)) {
-    return ctx.reply(
-      'If OTP no drop:\n\n1. Tap *Check SMS code* on the order message\n2. Wait ~3 minutes after buy (supplier blocks early cancel)\n3. Then tap *Cancel* — wallet refund automatic when supplier confirms\n\nOr send your order id and I go guide you. Type /orders to see recent numbers.'
-    );
-  }
-  if (/\b(price|how\s*much|cost|rate)\b/i.test(lower) && !detectServiceOnly(textMsg) && !(await resolveCountryStrict(textMsg))) {
-    return ctx.reply(
-      'Price depend on country + app and stock.\n\nTell me e.g. *USA WhatsApp* or *UK Telegram* — I go check live price for you.',
-      { parse_mode: 'Markdown' }
-    );
-  }
-  if (/\b(support|help\s*me|human|customer\s*care|agent)\b/i.test(lower) && !looksLikeNeedNumber(textMsg)) {
-    return ctx.reply(MIRA.supportHelp);
-  }
-  if (/\b(orders?|history|my\s*numbers?|numbers?\s*i\s*buy)\b/i.test(lower)) {
+  if (/\b(orders?|history|my\s*numbers?)\b/i.test(lower)) {
     const list = (session.orders || []).filter((o) => o && o.orderId && o.type !== '_meta');
     if (!list.length) {
-      return ctx.reply('No orders yet.\n\nType country + app e.g. *USA WhatsApp* to buy.', {
+      return ctx.reply('You never buy any number yet.\n\nType e.g. *USA WhatsApp* make I get one for you.', {
         parse_mode: 'Markdown'
       });
     }
@@ -2693,29 +2766,33 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
     return ctx.reply(`*Your recent orders*\n\n${lines}`, { parse_mode: 'Markdown' });
   }
 
-  if (looksLikeNeedNumber(textMsg)) {
-    session.state = 'AWAITING_SERVICE';
-    session.pendingService = null;
-    await saveUserSession(userId, session);
-    return ctx.reply(MIRA.askService);
+  if (/\b(referral|2%|commission|invite)\b/i.test(lower)) {
+    return ctx.reply(
+      'For referral: go *mjhub.store*, sign up, copy your link.\nWhen your people fund, you earn *2% for life* on the website wallet.',
+      { parse_mode: 'Markdown' }
+    );
   }
 
-  if (looksLikeChitchat(textMsg)) {
-    return ctx.reply(MIRA.greet, { parse_mode: 'Markdown' });
+  if (/\b(voip|real\s*number|is\s*it\s*real)\b/i.test(lower)) {
+    return ctx.reply(
+      'Numbers here na *real mobile* (non-VOIP). Dem dey work well for WhatsApp and major apps.\n\nTell me country + app e.g. *USA WhatsApp*.',
+      { parse_mode: 'Markdown' }
+    );
   }
 
-  if (lower === 'menu' || lower === 'help' || lower === 'start') {
-    return ctx.reply(MIRA.greet, { parse_mode: 'Markdown' });
+  if (/\b(support|human|customer\s*care)\b/i.test(lower)) {
+    return ctx.reply(MIRA.supportHelp);
   }
 
-  // Soft fallback — still helpful, not robotic
+  // Soft fallback — Pidgin, helpful, not stuck
   return ctx.reply(
-    'I no too catch that one sharp.\n\n' +
-      'You fit:\n' +
-      '• Type *USA WhatsApp* (country + app)\n' +
-      '• Say *I need number*\n' +
-      '• /fund 2000 · /balance · /orders · /support\n' +
-      '• Ask *wetin be MJ Hub?* or *how e dey work?*',
+    'I no too catch that one.\n\n' +
+      'Talk to me like:\n' +
+      '• *USA WhatsApp* — buy number\n' +
+      '• *Fund* or */fund 5000* — top up\n' +
+      '• *Balance* — check wallet\n' +
+      '• *How e dey work?* — explain SMS\n' +
+      '• *Cancel* — clear and start fresh',
     { parse_mode: 'Markdown' }
   );
 }
