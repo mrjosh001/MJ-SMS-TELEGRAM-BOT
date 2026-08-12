@@ -107,7 +107,8 @@ async function getUserSession(userId) {
     country: null,
     countryId: null,
     serviceQuery: null,
-    orders: []
+    orders: [],
+    conversation: []
   };
   if (!SUPABASE_REST_URL || !SUPABASE_SERVICE_KEY) return empty;
   try {
@@ -123,7 +124,8 @@ async function getUserSession(userId) {
         country: row.country || null,
         countryId: row.country_id || null,
         serviceQuery: row.selected_service_query || null,
-        orders: row.orders || []
+        orders: row.orders || [],
+        conversation: row.conversation || []
       };
     }
   } catch (_) {}
@@ -141,6 +143,7 @@ async function saveUserSession(userId, session) {
     country_id: session.countryId || null,
     selected_service_query: session.serviceQuery || null,
     orders: session.orders || [],
+    conversation: session.conversation || [],
     updated_at: new Date().toISOString()
   };
   try {
@@ -255,6 +258,262 @@ async function grizzlyBalance() {
   }
 }
 
+// ===========================================================================
+// GEMINI — conversational layer over the real MJ SMS (Server 1/GrizzlySMS)
+// actions above. This does NOT replace grizzlyPrices/grizzlyBuy/etc. — it
+// gives Gemini "function calling" access to call those exact same functions,
+// so what it tells the user is always backed by a real price/order/status,
+// never invented. If GEMINI_API_KEY isn't set, the bot falls back to the
+// old rigid parseCountryService flow below instead of breaking.
+// ===========================================================================
+
+const GEMINI_MODEL = 'gemini-2.0-flash';
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+const MAX_CONVERSATION_TURNS = 16; // ~8 back-and-forths kept for context, older ones dropped
+const MAX_TOOL_ROUNDTRIPS = 5; // hard cap so a confused loop can't run forever inside one webhook call
+
+const GEMINI_SYSTEM_PROMPT = `You are Mira, the support agent for MJ SMS — Server 1, powered by GrizzlySMS — part of MJ HUB.
+
+What MJ SMS does: customers rent a temporary virtual phone number in a specific country to receive one SMS verification code for an app (WhatsApp, Telegram, Google, Instagram, etc.), pay for it from their MJ HUB wallet balance (in Nigerian Naira, ₦), and use the code to finish signing up on that app.
+
+How you must operate:
+- Talk like a helpful, warm human support agent — natural sentences, not a menu of commands. Never say "I am an AI" or mention functions/tools/APIs to the user.
+- NEVER invent a price, phone number, order ID, stock count, or balance. Every one of those must come from calling the matching function. If you haven't called the function yet in this conversation for the specific country/service being discussed, call it before answering.
+- If the user's country or app isn't clear yet, ask a short clarifying question instead of guessing.
+- Before calling buy_number, make sure you already know (from get_prices, called in this same exchange or very recently) that the country+service combo exists and its price — buy_number itself will also refuse if the wallet balance is too low, so don't worry about pre-checking balance yourself, just let it try and relay the result.
+- After buy_number succeeds, tell the user their number and clearly say to wait for the code to arrive, and that they can just ask "did it arrive" or "check my code" any time — you will call check_status when they do.
+- If a user seems frustrated or stuck, be patient and helpful rather than repeating the same explanation — ask what specifically isn't working.
+- Prices are already in Naira (₦) by the time they reach you — never convert or recalculate them yourself.
+- If a function call fails or returns an error, explain plainly what went wrong and suggest a next step (try a different country/app, wait and retry, or contact a human admin for anything you can't resolve) — don't pretend it succeeded.
+- Keep replies concise — this is a chat app, not an essay. Use Telegram Markdown sparingly (bold for the phone number/code/order id only).`;
+
+const GEMINI_TOOLS = [{
+  functionDeclarations: [
+    {
+      name: 'list_countries',
+      description: 'List the countries this service currently supports, with their internal country codes.',
+      parameters: { type: 'OBJECT', properties: {} }
+    },
+    {
+      name: 'get_prices',
+      description: 'Get real, current prices and stock for every app/service available in one country. Always call this before quoting a price or buying, even if you think you already know it — stock and price change constantly.',
+      parameters: {
+        type: 'OBJECT',
+        properties: {
+          country: { type: 'STRING', description: 'Country name as the user said it, e.g. "Nigeria", "USA", "UK"' },
+          service: { type: 'STRING', description: 'Optional — app name to filter to, e.g. "WhatsApp". Leave blank to see everything available in that country.' }
+        },
+        required: ['country']
+      }
+    },
+    {
+      name: 'buy_number',
+      description: 'Actually purchase a number and charge the customer wallet. Only call this once the user has clearly confirmed which country and app they want.',
+      parameters: {
+        type: 'OBJECT',
+        properties: {
+          country: { type: 'STRING' },
+          service: { type: 'STRING', description: 'App name, e.g. "WhatsApp", "Telegram", "Google"' }
+        },
+        required: ['country', 'service']
+      }
+    },
+    {
+      name: 'check_status',
+      description: 'Check whether the SMS code has arrived yet for a given order. If order_id is omitted, checks the customer\'s most recent order automatically.',
+      parameters: {
+        type: 'OBJECT',
+        properties: { order_id: { type: 'STRING', description: 'Optional — omit to check the most recent order.' } }
+      }
+    },
+    {
+      name: 'cancel_order',
+      description: 'Cancel a pending order and refund the customer\'s wallet if eligible. If order_id is omitted, cancels the customer\'s most recent pending order.',
+      parameters: {
+        type: 'OBJECT',
+        properties: { order_id: { type: 'STRING', description: 'Optional — omit to cancel the most recent pending order.' } }
+      }
+    },
+    {
+      name: 'get_balance',
+      description: 'Get the customer\'s current MJ HUB wallet balance in Naira.',
+      parameters: { type: 'OBJECT', properties: {} }
+    },
+    {
+      name: 'get_my_orders',
+      description: 'Get the customer\'s recent order history.',
+      parameters: { type: 'OBJECT', properties: {} }
+    }
+  ]
+}];
+
+function resolveCountry(name) {
+  const key = String(name || '').toLowerCase().trim();
+  if (key in COUNTRY_MAP) return { id: COUNTRY_MAP[key], name: key };
+  // try a loose contains-match as a fallback for phrasing Gemini might use
+  // that isn't an exact key (e.g. "United States of America")
+  for (const [k, id] of Object.entries(COUNTRY_MAP)) {
+    if (key.includes(k) || k.includes(key)) return { id, name: k };
+  }
+  return null;
+}
+
+async function executeGeminiFunction(fnName, args, telegramUserId, session) {
+  switch (fnName) {
+    case 'list_countries': {
+      const names = [...new Set(Object.keys(COUNTRY_MAP).filter((k) => k.length > 2))];
+      return { countries: names };
+    }
+
+    case 'get_prices': {
+      const c = resolveCountry(args.country);
+      if (!c) return { error: `Unknown country "${args.country}". Ask the user to clarify or try list_countries.` };
+      let list = await grizzlyPrices(c.id);
+      if (!list.length) return { error: `No services currently available for ${c.name}.` };
+      if (args.service) {
+        const filtered = matchServices(list, args.service);
+        if (filtered.length) list = filtered;
+      }
+      session.country = c.name;
+      session.countryId = c.id;
+      return {
+        country: c.name,
+        services: list.slice(0, 15).map((s) => ({
+          service: s.service_id,
+          price_ngn: s.price_ngn,
+          stock: s.stock
+        }))
+      };
+    }
+
+    case 'buy_number': {
+      const c = resolveCountry(args.country);
+      if (!c) return { error: `Unknown country "${args.country}".` };
+      const list = await grizzlyPrices(c.id);
+      const matched = matchServices(list, args.service);
+      const svc = matched[0] || list.find((s) => String(s.service_id).toLowerCase() === String(args.service).toLowerCase());
+      if (!svc) return { error: `"${args.service}" isn't available in ${c.name} right now.` };
+
+      if (svc.price_ngn > 0 && session.balance < svc.price_ngn) {
+        return {
+          error: 'insufficient_balance',
+          balance_ngn: session.balance,
+          price_ngn: svc.price_ngn,
+          message: `Customer's balance (₦${session.balance}) is below the price (₦${svc.price_ngn}). Tell them to top up their MJ HUB wallet and try again.`
+        };
+      }
+
+      const bought = await grizzlyBuy(svc.service_id, c.id);
+      if (!bought.success) return { error: bought.message || 'Purchase failed at the supplier.' };
+
+      if (svc.price_ngn > 0) session.balance = Math.max(0, session.balance - svc.price_ngn);
+      const order = {
+        orderId: bought.order_id,
+        provider: 'grizzly',
+        serviceName: svc.service_id,
+        phoneNumber: bought.number,
+        price: svc.price_ngn,
+        status: 'Waiting SMS',
+        date: new Date().toISOString()
+      };
+      session.orders = [...(session.orders || []), order].slice(-30);
+
+      return {
+        success: true,
+        order_id: bought.order_id,
+        phone_number: bought.number,
+        price_ngn: svc.price_ngn,
+        new_balance_ngn: session.balance
+      };
+    }
+
+    case 'check_status': {
+      const orderId = args.order_id || (session.orders || []).slice(-1)[0]?.orderId;
+      if (!orderId) return { error: 'No recent order found for this customer.' };
+      const st = await grizzlyStatus(orderId);
+      if (st.success && st.code) {
+        session.orders = (session.orders || []).map((o) =>
+          String(o.orderId) === String(orderId) ? { ...o, status: `Code: ${st.code}` } : o
+        );
+        return { order_id: orderId, code: st.code };
+      }
+      return { order_id: orderId, waiting: !!st.waiting, message: st.message || 'Still waiting for the SMS to arrive.' };
+    }
+
+    case 'cancel_order': {
+      const orderId = args.order_id || (session.orders || []).slice(-1)[0]?.orderId;
+      if (!orderId) return { error: 'No recent order found for this customer.' };
+      const order = (session.orders || []).find((o) => String(o.orderId) === String(orderId));
+      await grizzlyCancel(orderId);
+      let refunded = 0;
+      if (order && order.price > 0 && !/cancelled/i.test(order.status || '')) {
+        refunded = order.price;
+        session.balance += refunded;
+      }
+      session.orders = (session.orders || []).map((o) =>
+        String(o.orderId) === String(orderId) ? { ...o, status: 'Cancelled' } : o
+      );
+      return { order_id: orderId, refunded_ngn: refunded, new_balance_ngn: session.balance };
+    }
+
+    case 'get_balance':
+      return { balance_ngn: session.balance };
+
+    case 'get_my_orders':
+      return { orders: (session.orders || []).slice(-10) };
+
+    default:
+      return { error: `Unknown function ${fnName}` };
+  }
+}
+
+async function callGeminiWithTools(session, telegramUserId, userText) {
+  const contents = [
+    ...(session.conversation || []),
+    { role: 'user', parts: [{ text: userText }] }
+  ];
+
+  for (let round = 0; round < MAX_TOOL_ROUNDTRIPS; round++) {
+    let res;
+    try {
+      res = await axios.post(
+        GEMINI_URL,
+        {
+          systemInstruction: { parts: [{ text: GEMINI_SYSTEM_PROMPT }] },
+          contents,
+          tools: GEMINI_TOOLS
+        },
+        { ...axiosCfg, headers: { 'Content-Type': 'application/json' } }
+      );
+    } catch (e) {
+      console.error('gemini call failed', e.response?.data || e.message);
+      return { reply: "Sorry, I'm having trouble reaching my brain right now — please try again in a moment.", contents };
+    }
+
+    const candidate = res.data?.candidates?.[0];
+    const parts = candidate?.content?.parts || [];
+    const functionCallPart = parts.find((p) => p.functionCall);
+
+    if (!functionCallPart) {
+      const text = parts.map((p) => p.text || '').join('').trim() || "I'm not sure how to help with that — could you rephrase?";
+      contents.push({ role: 'model', parts });
+      return { reply: text, contents };
+    }
+
+    // Model wants to call a function — run it for real, then hand the
+    // result back so it can either call another function or finally reply.
+    contents.push({ role: 'model', parts });
+    const { name, args } = functionCallPart.functionCall;
+    const result = await executeGeminiFunction(name, args || {}, telegramUserId, session);
+    contents.push({
+      role: 'user',
+      parts: [{ functionResponse: { name, response: result } }]
+    });
+  }
+
+  return { reply: "I ran into a few steps trying to sort that out and want to double check with a human — try rephrasing, or contact support.", contents };
+}
+
 function parseCountryService(text) {
   const t = String(text || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
   let countryId = null;
@@ -302,64 +561,23 @@ function matchServices(list, query) {
   return hit.length ? hit.slice(0, 12) : list.slice(0, 12);
 }
 
-// ---------- Gemini AI assistant ----------
-// Used as the fallback when a message doesn't parse as "country + service" —
-// instead of only ever showing the same static hint, it lets the bot answer
-// real questions about MJ HUB / MJ SMS in a natural, conversational way.
-// GEMINI_API_KEY was declared before but never actually called anywhere in
-// this file — this is that wiring. If the key is missing, the call fails,
-// or Gemini is having a bad day, this always falls back to a real, useful
-// static reply (never a raw error, never silence) so the bot keeps working
-// even when the AI layer doesn't.
-
-const GEMINI_SYSTEM_PROMPT = `You are the assistant inside "MJ SMS", a Telegram bot that is part of MJ HUB — a Nigerian website selling temporary/virtual phone numbers for SMS verification (WhatsApp, Telegram, Google, and more), plus other digital services.
-
-How you talk: warm, friendly Nigerian Pidgin naturally mixed with English — like a helpful guy at a shop, not a corporate support bot. Keep replies short (2-4 sentences max), never robotic, never overly formal.
-
-What you know: MJ SMS lets people type a country + app (e.g. "USA WhatsApp", "Nigeria Telegram") to see available numbers and buy one. Commands: /balance (wallet), /fund (top up — done on the MJ HUB website), /orders (order history), /status (is the server up).
-
-Your job here specifically: the user just sent a message that did NOT match the "country + app" format the bot needs to sell them a number. Either:
-1. If they're asking a real question (about the website, how it works, pricing, refunds, anything) — answer it helpfully and briefly, in-character.
-2. If it's unclear what they want, or they just made a typo — gently nudge them toward the right format, with an example like "USA WhatsApp".
-
-Never make up specific prices, balances, or order details — you don't have access to their account data here. For anything account-specific, point them to the right command (/balance, /orders, etc).`;
-
-async function askGemini(userMessage) {
-  if (!GEMINI_API_KEY) return null;
-  try {
-    const res = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        system_instruction: { parts: [{ text: GEMINI_SYSTEM_PROMPT }] },
-        contents: [{ role: 'user', parts: [{ text: userMessage }] }],
-        generationConfig: { maxOutputTokens: 200, temperature: 0.8 }
-      },
-      { timeout: 12000, headers: { 'Content-Type': 'application/json' } }
-    );
-    const reply = res.data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    return reply ? reply.trim() : null;
-  } catch (e) {
-    console.error('askGemini', e.response?.data || e.message);
-    return null;
-  }
-}
-
+// ---------- Bot commands ----------
 
 bot.start(async (ctx) => {
-  await ctx.reply(
-    `Welcome to *MJ SMS* (Server 1) 🎉\n\nJust type country + app, my guy:\n• *USA WhatsApp*\n• *Nigeria Telegram*\n• *UK Google*\n\nAnd I go show you wetin dey available.\n\n/balance — check your wallet\n/fund — top up\n/orders — your order history\n/status — see if server dey up`,
-    { parse_mode: 'Markdown' }
-  );
+  const greeting = GEMINI_API_KEY
+    ? `Hey! I'm Mira 👋 — I help you get virtual numbers for SMS verification (WhatsApp, Telegram, Google, and more) across a bunch of countries.\n\nJust tell me what you need in your own words — e.g. "I need a US number for WhatsApp" or "what's available in Nigeria" — and I'll sort it out.\n\n/balance — wallet\n/fund — top up\n/orders — history`
+    : `Welcome to *MJ SMS* (Grizzly · Server 1)\n\nType a country + app, e.g.\n• *USA WhatsApp*\n• *Nigeria Telegram*\n• *UK Google*\n\n/balance — wallet\n/fund — top up\n/orders — history\n/status — supplier status`;
+  await ctx.reply(greeting, { parse_mode: 'Markdown' });
 });
 
 bot.command(['balance', 'bal'], async (ctx) => {
   const s = await getUserSession(ctx.from.id);
-  await ctx.reply(`Boss your current balance na *₦${(s.balance || 0).toLocaleString()}* ✨`, { parse_mode: 'Markdown' });
+  await ctx.reply(`Balance: *₦${(s.balance || 0).toLocaleString()}*`, { parse_mode: 'Markdown' });
 });
 
 bot.command('orders', async (ctx) => {
   const s = await getUserSession(ctx.from.id);
-  if (!s.orders || !s.orders.length) return ctx.reply('You never order anything before o.');
+  if (!s.orders || !s.orders.length) return ctx.reply('No orders yet.');
   const lines = s.orders
     .slice(-10)
     .reverse()
@@ -369,19 +587,19 @@ bot.command('orders', async (ctx) => {
 });
 
 bot.command('status', async (ctx) => {
-  if (!GRIZZLY_KEY) return ctx.reply('Server key never set for backend o — abeg tell admin.');
+  if (!GRIZZLY_KEY) return ctx.reply('GRIZZLYSMS_API_KEY not set on server.');
   const bal = await grizzlyBalance();
-  if (bal == null) return ctx.reply('Server 1 dey OFFLINE right now. Try again small time.');
-  await ctx.reply(`*Server 1:* dey ONLINE ✅\nWe get enough stock to serve you.`, {
+  if (bal == null) return ctx.reply('Grizzly: OFFLINE');
+  await ctx.reply(`*Grizzly (Server 1):* ONLINE\nSupplier balance: \`${bal}\``, {
     parse_mode: 'Markdown'
   });
 });
 
 bot.command('fund', async (ctx) => {
   if (!PAYSTACK_SECRET_KEY) {
-    return ctx.reply('E get one way to fund here for now — abeg go MJ HUB website and top up your wallet there, boss.');
+    return ctx.reply('Funding is managed on the MJ HUB website wallet for now. Ask admin if you need a top-up here.');
   }
-  await ctx.reply('Send the amount for Naira, e.g. `5000`', { parse_mode: 'Markdown' });
+  await ctx.reply('Send amount in Naira, e.g. `5000`', { parse_mode: 'Markdown' });
 });
 
 // Buy callback: buy:countryId:serviceId:priceNgn
@@ -394,13 +612,13 @@ bot.action(/^buy:(\d+):([^:]+):(\d+)$/, async (ctx) => {
   const session = await getUserSession(userId);
 
   if (price > 0 && session.balance < price) {
-    return ctx.reply('E be like say your balance no reach o. Use /fund or top up on MJ HUB first.');
+    return ctx.reply('Insufficient balance. Use /fund or top up on MJ HUB.');
   }
 
-  await ctx.reply('Dey buy your number… hold on small.');
+  await ctx.reply('Buying number…');
   const bought = await grizzlyBuy(serviceId, countryId);
   if (!bought.success) {
-    return ctx.reply(`E no work o: ${bought.message || 'no number available'}. Try again.`);
+    return ctx.reply(`Failed: ${bought.message || 'No number'}`);
   }
 
   if (price > 0) {
@@ -419,7 +637,7 @@ bot.action(/^buy:(\d+):([^:]+):(\d+)$/, async (ctx) => {
   await saveUserSession(userId, session);
 
   await ctx.reply(
-    `Your number don ready! 🎉\n📞 \`${bought.number}\`\n🆔 \`${bought.order_id}\`\n\nTap "Check SMS code" below when the message land (or check am every 10 seconds or so).`,
+    `Number ready\n📞 \`${bought.number}\`\n🆔 \`${bought.order_id}\`\n\nTap below when the SMS arrives (or every ~10s).`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
@@ -441,9 +659,9 @@ bot.action(/^chk:([^:]+):(\d+)$/, async (ctx) => {
       String(o.orderId) === String(orderId) ? { ...o, status: `Code: ${st.code}` } : o
     );
     await saveUserSession(ctx.from.id, session);
-    return ctx.reply(`Code don land! *${st.code}* 🎉`, { parse_mode: 'Markdown' });
+    return ctx.reply(`Code: *${st.code}*`, { parse_mode: 'Markdown' });
   }
-  return ctx.reply(st.waiting ? 'Message never land yet… tap Check again small time.' : `Status: ${st.message || 'still dey wait'}`);
+  return ctx.reply(st.waiting ? 'Still waiting for SMS… tap Check again.' : `Status: ${st.message || 'waiting'}`);
 });
 
 bot.action(/^can:([^:]+):(\d+)$/, async (ctx) => {
@@ -459,40 +677,58 @@ bot.action(/^can:([^:]+):(\d+)$/, async (ctx) => {
     );
     await saveUserSession(ctx.from.id, session);
   }
-  await ctx.reply(price > 0 ? `Cancelled ✅ ₦${price} don enter your wallet back.` : 'Cancelled ✅');
+  await ctx.reply(price > 0 ? `Cancelled. ₦${price} refunded.` : 'Cancelled.');
 });
 
 bot.on('text', async (ctx) => {
   const text = (ctx.message.text || '').trim();
   if (text.startsWith('/')) return;
 
+  const userId = ctx.from.id;
+  const session = await getUserSession(userId);
+
+  if (GEMINI_API_KEY) {
+    try {
+      await ctx.sendChatAction('typing');
+    } catch (_) {}
+    const { reply, contents } = await callGeminiWithTools(session, userId, text);
+    // Cap history so the prompt sent to Gemini (and the row stored in
+    // Supabase) doesn't grow unbounded across a long-running conversation.
+    session.conversation = contents.slice(-MAX_CONVERSATION_TURNS);
+    await saveUserSession(userId, session);
+    try {
+      await ctx.reply(reply, { parse_mode: 'Markdown' });
+    } catch (_) {
+      // Markdown parse errors (e.g. stray * or _ in the reply) shouldn't
+      // eat the whole reply — retry once as plain text.
+      await ctx.reply(reply);
+    }
+    return;
+  }
+
+  // Fallback used only if GEMINI_API_KEY isn't configured — the original
+  // rigid substring/keyword flow, kept working rather than removed.
   const parsed = parseCountryService(text);
   if (!parsed.countryId) {
-    await ctx.sendChatAction('typing').catch(() => {});
-    const aiReply = await askGemini(text);
-    if (aiReply) return ctx.reply(aiReply);
-
-    // Gemini not configured or the call failed — still a real, complete answer.
     return ctx.reply(
-      'Wagwan My Boss… 👋\n\nAbeg tell me country + service for one message, my guy.\nLike this: *USA WhatsApp*, *Nigeria Telegram*, *UK Google*',
+      'Tell me country + app in one message.\nExamples: *USA WhatsApp*, *Nigeria Telegram*, *UK Google*',
       { parse_mode: 'Markdown' }
     );
   }
 
-  await ctx.reply(`Dey check Server 1 for *${parsed.countryName}*… hold on.`, { parse_mode: 'Markdown' });
+  await ctx.reply(`Checking Grizzly for *${parsed.countryName}*…`, { parse_mode: 'Markdown' });
   let list = await grizzlyPrices(parsed.countryId);
   if (!list.length) {
-    return ctx.reply('E no get service for that country right now o. Try another one.');
+    return ctx.reply('No services returned for that country right now. Try another.');
   }
   if (parsed.serviceCode || parsed.serviceName) {
     list = matchServices(list, parsed.serviceName || parsed.serviceCode);
   }
 
-  const session = await getUserSession(ctx.from.id);
   session.country = parsed.countryName;
   session.countryId = parsed.countryId;
   session.serviceQuery = parsed.serviceName || parsed.serviceCode;
-  await saveUserSession(ctx.from.id, session);
+  await saveUserSession(userId, session);
 
   const buttons = list.slice(0, 10).map((s) => [
     Markup.button.callback(
@@ -502,7 +738,7 @@ bot.on('text', async (ctx) => {
   ]);
 
   await ctx.reply(
-    `*Server 1*\nCountry: ${parsed.countryName} (${parsed.countryId})\nPick the service wey you want:`,
+    `*Grizzly · Server 1*\nCountry: ${parsed.countryName} (${parsed.countryId})\nPick a service:`,
     { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
   );
 });
@@ -559,7 +795,7 @@ module.exports = async (req, res) => {
     if (req.method === 'GET') {
       res.statusCode = 200;
       res.setHeader('Content-Type', 'text/plain');
-      return res.end('MJ SMS Bot (Server 1) — Vercel');
+      return res.end('MJ SMS Bot (Grizzly Server 1) — Vercel');
     }
 
     if (req.method === 'POST') {
