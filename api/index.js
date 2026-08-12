@@ -60,7 +60,7 @@ const COUNTRY_MAP = {
   'south africa': 31, sa: 31,
   india: 22, in: 22,
   canada: 36, ca: 36,
-  germany: 43, de: 43,
+  germany: 43, de: 43, deutschland: 43,
   france: 78, fr: 78,
   netherlands: 48, nl: 48,
   indonesia: 6, id: 6,
@@ -1790,6 +1790,12 @@ async function parseCountryService(text) {
   let serviceCode = null;
   let serviceName = null;
 
+  // Regions are not countries — leave countryId null so handler can ask for a specific country
+  if (/\b(europe|eu|european union|africa|asia|latin america|middle east|scandinavia)\b/.test(t) &&
+      !/\b(south africa|central african)\b/.test(t)) {
+    // still detect service if present
+  }
+
   // Services first
   const serviceEntries = Object.entries(SERVICE_MAP).sort((a, b) => b[0].length - a[0].length);
   for (const [name, code] of serviceEntries) {
@@ -3021,58 +3027,32 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
     }
   }
 
-  // --- Waiting for service (country already known) ---
-  if (state === 'AWAITING_SERVICE' || session.countryId) {
-    const svc = detectServiceOnly(textMsg);
-    if (svc && session.countryId) {
-      return miraShowPricesAndConfirm(
-        ctx,
-        session,
-        userId,
-        session.countryId,
-        session.country || session.countryId,
-        svc.serviceName
-      );
-    }
-    if (state === 'AWAITING_SERVICE' && !svc) {
-      return ctx.reply(MIRA.askService);
-    }
-  }
-
-  // Recover pending service / country from session (REAL services only)
-  const pendingSvcRaw = session.pendingService || session.serviceQuery || null;
-  const pendingSvc = isRealServiceName(pendingSvcRaw) ? pendingSvcRaw : null;
-
-  // Always parse THIS message — never trust sticky USA/Germany over what user just typed
+  // ========== PARSE THIS MESSAGE FIRST (root fix for sticky country) ==========
+  // Never reuse session.countryId when the user named a NEW country in this text.
   const parsed = await parseCountryService(textMsg);
 
-  // If user named a country different from session, wipe sticky country immediately
-  if (parsed.countryId != null) {
-    const sticky = session.countryId != null ? Number(session.countryId) : null;
-    const fresh = Number(parsed.countryId);
-    if (sticky !== fresh) {
-      session.countryId = parsed.countryId;
-      session.country = parsed.countryName;
-      // Don't keep confirm/app state tied to old country
-      if (['AWAITING_CONFIRM', 'AWAITING_APP', 'AWAITING_COUNTRY'].includes(session.state)) {
-        session.state = 'AWAITING_INPUT';
-        session.last_options = [];
-      }
-    }
+  // Region words (not a single Grizzly country)
+  if (/\b(europe|eu|european|africa|asia|latin\s*america)\b/i.test(textMsg) && parsed.countryId == null) {
+    return ctx.reply(
+      'That is a *region*, not one country.\n\n' +
+        'Try a specific country, e.g.\n' +
+        '• *Germany WhatsApp*\n' +
+        '• *Netherlands TikTok*\n' +
+        '• *France Telegram*\n' +
+        '• *UK Instagram*',
+      { parse_mode: 'Markdown' }
+    );
   }
 
-  const pendingCountryId =
-    parsed.countryId != null ? null : session.countryId || null; // ignore sticky if message has country
-  const pendingCountryName =
-    parsed.countryId != null ? null : session.country || null;
-
-  // --- One-shot: country + service together ---
+  // One-shot: country + app in the SAME message — always wins over sticky session
   if (parsed.countryId && (parsed.serviceName || parsed.serviceCode)) {
     session.countryId = parsed.countryId;
     session.country = parsed.countryName;
     session.state = 'AWAITING_INPUT';
     session.pendingService = null;
+    session.serviceQuery = null;
     session.last_options = [];
+    clearIntent(userId);
     return miraShowPricesAndConfirm(
       ctx,
       session,
@@ -3083,38 +3063,71 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
     );
   }
 
-  // Country message while we already have a pending service → process
-  const countryGuess =
-    parsed.countryId != null
-      ? { id: parsed.countryId, name: parsed.countryName }
-      : await resolveCountryStrict(textMsg);
-  if (countryGuess && pendingSvc) {
-    session.countryId = countryGuess.id;
-    session.country = countryGuess.name;
-    return miraShowPricesAndConfirm(
-      ctx,
-      session,
-      userId,
-      countryGuess.id,
-      countryGuess.name,
-      pendingSvc
+  // Country only in this message → set country, ask for app (or use pending service)
+  if (parsed.countryId && !(parsed.serviceName || parsed.serviceCode)) {
+    const pendingSvcEarly = isRealServiceName(session.pendingService || session.serviceQuery)
+      ? (session.pendingService || session.serviceQuery)
+      : null;
+    session.countryId = parsed.countryId;
+    session.country = parsed.countryName;
+    session.last_options = [];
+    if (pendingSvcEarly) {
+      session.state = 'AWAITING_INPUT';
+      return miraShowPricesAndConfirm(
+        ctx,
+        session,
+        userId,
+        parsed.countryId,
+        parsed.countryName,
+        pendingSvcEarly
+      );
+    }
+    session.state = 'AWAITING_SERVICE';
+    session.pendingService = null;
+    await saveUserSession(userId, session);
+    return ctx.reply(
+      `Which app for *${asName(parsed.countryName)}*?\n\nWhatsApp, Telegram, Instagram, TikTok, Google…`,
+      { parse_mode: 'Markdown' }
     );
   }
 
-  // Service only while we already have a country (and THIS message has no country word)
+  // Recover pending service from session (REAL apps only)
+  const pendingSvcRaw = session.pendingService || session.serviceQuery || null;
+  const pendingSvc = isRealServiceName(pendingSvcRaw) ? pendingSvcRaw : null;
+
+  // Service-only message → use sticky country ONLY if this message has NO country word
   const svcGuess =
     detectServiceOnly(textMsg) ||
     (parsed.serviceName && isRealServiceName(parsed.serviceName)
       ? { serviceName: parsed.serviceName, serviceCode: parsed.serviceCode }
       : null);
-  if (svcGuess && pendingCountryId && !parsed.countryId) {
+
+  if (svcGuess && session.countryId && !parsed.countryId) {
     return miraShowPricesAndConfirm(
       ctx,
       session,
       userId,
-      pendingCountryId,
-      pendingCountryName || pendingCountryId,
+      session.countryId,
+      session.country || session.countryId,
       svcGuess.serviceName || svcGuess.serviceCode
+    );
+  }
+
+  if (state === 'AWAITING_SERVICE' && !svcGuess && !parsed.countryId) {
+    return ctx.reply(MIRA.askService);
+  }
+
+  // Country message while we already have a pending service
+  if (parsed.countryId && pendingSvc) {
+    session.countryId = parsed.countryId;
+    session.country = parsed.countryName;
+    return miraShowPricesAndConfirm(
+      ctx,
+      session,
+      userId,
+      parsed.countryId,
+      parsed.countryName,
+      pendingSvc
     );
   }
 
@@ -3136,24 +3149,7 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
     );
   }
 
-  // Country only (no pending service) → ask service
-  if (countryGuess) {
-    const svcNowRaw =
-      session.pendingService || session.serviceQuery || replyCtx.service || mem.service || null;
-    const svcNow = isRealServiceName(svcNowRaw) ? svcNowRaw : null;
-    if (svcNow) {
-      return miraShowPricesAndConfirm(ctx, session, userId, countryGuess.id, countryGuess.name, svcNow);
-    }
-    session.countryId = countryGuess.id;
-    session.country = countryGuess.name;
-    session.state = 'AWAITING_SERVICE';
-    setIntent(userId, { countryId: countryGuess.id, countryName: countryGuess.name });
-    await saveUserSession(userId, session);
-    return ctx.reply(
-      `Which app for *${asName(countryGuess.name)}*?\n\nWhatsApp, Telegram, Instagram, Google…`,
-      { parse_mode: 'Markdown' }
-    );
-  }
+  // country-only handled in PARSE THIS MESSAGE FIRST block above
 
   if (looksLikeNeedNumber(textMsg)) {
     clearBuyState(session, userId);
@@ -3306,14 +3302,16 @@ bot.on('text', async (ctx) => {
     return miraHandleSmartText(ctx, session, userId, textMsg);
   }
 
-  // Keep country session ONLY if user did not name a different country
-  if (session.countryId && session.state === 'AWAITING_APP') {
+  // ALWAYS parse country+service from THIS message before any sticky session
+  {
     const parsedNow = await parseCountryService(textMsg);
-    // User typed "Canada WhatsApp" while stuck on USA → honour Canada, wipe sticky USA
     if (parsedNow.countryId && (parsedNow.serviceName || parsedNow.serviceCode)) {
       session.countryId = parsedNow.countryId;
       session.country = parsedNow.countryName;
       session.state = 'AWAITING_INPUT';
+      session.pendingService = null;
+      session.last_options = [];
+      clearIntent(userId);
       return miraShowPricesAndConfirm(
         ctx,
         session,
@@ -3323,19 +3321,31 @@ bot.on('text', async (ctx) => {
         parsedNow.serviceName || parsedNow.serviceCode
       );
     }
-    if (parsedNow.countryId && Number(parsedNow.countryId) !== Number(session.countryId)) {
+    if (parsedNow.countryId && Number(parsedNow.countryId) !== Number(session.countryId || -1)) {
       session.countryId = parsedNow.countryId;
       session.country = parsedNow.countryName;
       session.state = 'AWAITING_SERVICE';
+      session.pendingService = null;
       await saveUserSession(userId, session);
       return ctx.reply(
-        `Which app for ${parsedNow.countryName}?\n(WhatsApp, Telegram, Instagram…)`,
+        `Which app for *${parsedNow.countryName}*?\n(WhatsApp, Telegram, Instagram, TikTok…)`,
         { parse_mode: 'Markdown' }
       );
     }
-    const svc = detectServiceOnly(textMsg) || parsedNow;
-    const q = svc.serviceName || svc.serviceCode || textMsg;
-    return miraShowPricesAndConfirm(ctx, session, userId, session.countryId, session.country, q);
+  }
+
+  // Sticky country ONLY when user sent service-only (no country in message)
+  if (session.countryId && session.state === 'AWAITING_APP') {
+    const parsedNow = await parseCountryService(textMsg);
+    if (parsedNow.countryId) {
+      // handled above
+    } else {
+      const svc = detectServiceOnly(textMsg) || parsedNow;
+      const q = svc.serviceName || svc.serviceCode || textMsg;
+      if (q && isRealServiceName(q)) {
+        return miraShowPricesAndConfirm(ctx, session, userId, session.countryId, session.country, q);
+      }
+    }
   }
 
   // Gemini optional enhancement for pure chat — Mira owns buy + fund path
