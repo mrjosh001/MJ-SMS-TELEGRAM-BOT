@@ -295,15 +295,31 @@ async function fetchHubServices(countryId, serviceFilter) {
     return [];
   }
   try {
-    // Exact MJ HUB website selling prices from number_services
-    let url =
+    const baseSelect =
       `${MJ_HUB_REST_URL}/number_services?select=id,service_id,service_name,country_id,country_name,price,available_quantity,is_available,supplier_price` +
-      `&country_id=eq.${encodeURIComponent(countryId)}` +
-      `&price=gt.0` +
-      `&order=price.asc` +
-      `&limit=100`;
-    const res = await axios.get(url, { ...axiosCfg, headers: mjHubHeaders });
+      `&price=gt.0&order=price.asc&limit=100`;
+
+    // 1) by country_id (Grizzly id, e.g. 12 = USA)
+    let url = `${baseSelect}&country_id=eq.${encodeURIComponent(countryId)}`;
+    let res = await axios.get(url, { ...axiosCfg, headers: mjHubHeaders });
     let rows = Array.isArray(res.data) ? res.data : [];
+
+    // 2) if empty, try country_name (in case id type/format differs)
+    if (!rows.length) {
+      const nameGuess =
+        Object.entries(COUNTRY_MAP).find(([, id]) => String(id) === String(countryId))?.[0] || '';
+      const pretty =
+        nameGuess === 'usa' || nameGuess === 'us' || nameGuess === 'america' || nameGuess === 'united states'
+          ? 'USA'
+          : (nameGuess || '').toUpperCase();
+      if (pretty) {
+        url = `${baseSelect}&country_name=ilike.*${encodeURIComponent(pretty)}*`;
+        res = await axios.get(url, { ...axiosCfg, headers: mjHubHeaders });
+        rows = Array.isArray(res.data) ? res.data : [];
+        console.log('[hub] country_name fallback', pretty, 'rows', rows.length);
+      }
+    }
+
     // Prefer available, but keep unavailable if that's all we have
     const available = rows.filter((r) => r.is_available !== false && r.is_available !== 'false');
     if (available.length) rows = available;
@@ -1044,6 +1060,40 @@ bot.start(async (ctx) => {
     ? `How far 👋 Welcome to MJ SMS (Server 1).\n\nI fit get virtual number for WhatsApp, Telegram, Google, Instagram and plenty more. Just talk normal like:\n"I need USA WhatsApp"\n"Nigeria Telegram how much?"\n\n/balance — check wallet\n/fund 2000 — top up with Paystack\n/orders — your history\n\nWetin you need right now?`
     : `Welcome to *MJ SMS* (Grizzly · Server 1)\n\nType country + app, e.g.\n*USA WhatsApp*\n*Nigeria Telegram*\n*UK Google*\n\n/balance /fund /orders /status`;
   await ctx.reply(greeting, { parse_mode: 'Markdown' });
+});
+
+bot.command('hubtest', async (ctx) => {
+  if (String(ctx.from.id) !== String(ADMIN_TELEGRAM_ID)) {
+    return ctx.reply('Admin only.');
+  }
+  const hasUrl = Boolean(MJ_HUB_REST_URL);
+  const hasKey = Boolean(MJ_HUB_SERVICE_KEY);
+  let msg = `MJ_HUB_REST_URL: ${hasUrl ? 'set' : 'MISSING'}\nMJ_HUB_SERVICE_KEY: ${hasKey ? 'set' : 'MISSING'}\n`;
+  if (!hasUrl || !hasKey) {
+    return ctx.reply(msg + '\nAdd env and redeploy.');
+  }
+  try {
+    const url =
+      `${MJ_HUB_REST_URL}/number_services?select=service_id,service_name,country_id,country_name,price&country_id=eq.12&price=gt.0&limit=10`;
+    const res = await axios.get(url, { ...axiosCfg, headers: mjHubHeaders });
+    const rows = Array.isArray(res.data) ? res.data : [];
+    msg += `USA (id 12) rows: ${rows.length}\n`;
+    msg += rows
+      .slice(0, 6)
+      .map((r) => `• ${r.service_name || r.service_id} | ₦${r.price} | ${r.country_name}`)
+      .join('\n') || '(none)';
+    // Also whatsapp filter
+    const wa = await getSellableServices(12, 'whatsapp');
+    msg += `\n\ngetSellableServices(USA,whatsapp): ${wa.length} opts\n`;
+    msg += wa.map((s) => `• ${s.service_name} ₦${s.price_ngn} [${s.source}]`).join('\n');
+    await ctx.reply(msg.slice(0, 3500));
+  } catch (e) {
+    await ctx.reply(
+      msg +
+        `\nERROR ${e.response?.status || ''}\n` +
+        JSON.stringify(e.response?.data || e.message).slice(0, 500)
+    );
+  }
 });
 
 bot.command(['balance', 'bal'], async (ctx) => {
