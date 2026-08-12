@@ -2112,7 +2112,7 @@ bot.action(/^opt:(\d+):([^:]+):(\d+)$/, async (ctx) => {
   const phone = String(bought.number || '');
   const cancelLabel = `⏳ Cancel (wait ${Math.round(MIN_CANCEL_MS / 60000)}m)`;
   await ctx.reply(
-    `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n₦${price.toLocaleString()} debited · Balance: ₦${balNow.toLocaleString()}\n\nUse am for the app to request OTP.\nWhen you ready, tap Check.\n\n_Cancel opens after ~${Math.round(MIN_CANCEL_MS / 60000)} minutes._`,
+    `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n₦${price.toLocaleString()} debited · Balance: ₦${balNow.toLocaleString()}\n\nUse am for the app to request OTP.\nI go auto-check the code — or tap Check anytime.\n\n_Cancel opens after ~${Math.round(MIN_CANCEL_MS / 60000)} minutes._`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
@@ -2122,6 +2122,19 @@ bot.action(/^opt:(\d+):([^:]+):(\d+)$/, async (ctx) => {
       ])
     }
   );
+  // Auto-poll SMS status → push code to user when ready
+  try {
+    const baseUrl =
+      process.env.BOT_PUBLIC_URL ||
+      (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : '');
+    if (baseUrl) {
+      startStatusPolling(baseUrl, userId, bought.order_id, price, 0).catch((e) =>
+        console.error('startStatusPolling', e.message)
+      );
+    }
+  } catch (e) {
+    console.error('schedule poll', e.message);
+  }
 });
 
 bot.action(/^buy:(\d+):([^:]+):(\d+)$/, async (ctx) => {
@@ -2183,7 +2196,7 @@ bot.action(/^buy:(\d+):([^:]+):(\d+)$/, async (ctx) => {
   const phone = String(bought.number || '');
   const cancelLabel = `⏳ Cancel (wait ${Math.round(MIN_CANCEL_MS / 60000)}m)`;
   await ctx.reply(
-    `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n₦${priceN.toLocaleString()} debited · Balance: ₦${balNow.toLocaleString()}\n\nTap Check when the SMS arrives.\n\n_Cancel opens after ~${Math.round(MIN_CANCEL_MS / 60000)} minutes._`,
+    `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n₦${priceN.toLocaleString()} debited · Balance: ₦${balNow.toLocaleString()}\n\nI go auto-check the code — or tap Check.\n\n_Cancel opens after ~${Math.round(MIN_CANCEL_MS / 60000)} minutes._`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
@@ -2193,6 +2206,18 @@ bot.action(/^buy:(\d+):([^:]+):(\d+)$/, async (ctx) => {
       ])
     }
   );
+  try {
+    const baseUrl =
+      process.env.BOT_PUBLIC_URL ||
+      (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : '');
+    if (baseUrl) {
+      startStatusPolling(baseUrl, userId, bought.order_id, priceN, 0).catch((e) =>
+        console.error('startStatusPolling', e.message)
+      );
+    }
+  } catch (e) {
+    console.error('schedule poll', e.message);
+  }
 });
 
 bot.action(/^chk:([^:]+):(\d+)$/, async (ctx) => {
@@ -2504,11 +2529,12 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
   }
 
   // ========== ESCAPE INTENTS (always win over stuck buy flow) ==========
-  // User wants to leave the "which country?" loop — clear state and help them.
   const wantsFund =
     /\b(fund|top\s*up|topup|deposit|recharge|add\s*money|load\s*wallet|pay\s*in)\b/i.test(lower);
+  // Balance ONLY if not a fund request ("fund my wallet" must not match balance)
   const wantsBalance =
-    /\b(balance|my\s*wallet|how\s*much\s*(i\s*get|dey|left)|wallet\s*balance|wetin\s*(remain|left)|what.?s?\s*my\s*balance)\b/i.test(
+    !wantsFund &&
+    /\b(balance|check\s*wallet|how\s*much\s*(i\s*get|dey|left)|wallet\s*balance|wetin\s*(remain|left)|what.?s?\s*my\s*balance|my\s*balance)\b/i.test(
       lower
     );
   const wantsCancelFlow =
@@ -2523,48 +2549,48 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
     return ctx.reply('Alright, e clear. Wetin you need now? Number, fund, or balance?');
   }
 
+  // FUND first — never confuse with balance
+  if (wantsFund) {
+    clearBuyState(session, userId);
+    const amount = parseNairaAmount(textMsg);
+    if (amount >= 1000 && amount <= 200000) {
+      const init = await paystackInitialize(amount, userId, null);
+      if (!init.success) {
+        await saveUserSession(userId, session);
+        return ctx.reply(init.message || 'Paystack no gree right now. Try /fund later.');
+      }
+      const pending = {
+        reference: init.reference,
+        amount_ngn: init.amount_ngn,
+        authorization_url: init.authorization_url,
+        created_at: new Date().toISOString()
+      };
+      session.pending_payment = pending;
+      session.state = 'AWAITING_INPUT';
+      pendingPayments.set(String(userId), pending);
+      await saveUserSession(userId, session);
+      return ctx.reply(
+        `Top up *₦${init.amount_ngn.toLocaleString()}*\n\nTap *Pay* below.\nWhen e successful, type: *I don pay*`,
+        {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', init.authorization_url)]])
+        }
+      );
+    }
+    session.state = 'AWAITING_FUND_AMOUNT';
+    await saveUserSession(userId, session);
+    return ctx.reply(
+      'How much you wan fund?\n\nMin ₦1,000 · Max ₦200,000\n\nExample: *2k* · *5k* · *5000*',
+      { parse_mode: 'Markdown' }
+    );
+  }
+
   if (wantsBalance) {
     clearBuyState(session, userId);
     await saveUserSession(userId, session);
     return ctx.reply(`Your balance na *₦${money(session.balance).toLocaleString()}* 💰`, {
       parse_mode: 'Markdown'
     });
-  }
-
-  if (wantsFund) {
-    clearBuyState(session, userId);
-    const amount = parseNairaAmount(textMsg);
-    if (amount >= 1000 && amount <= 200000) {
-      {
-        const init = await paystackInitialize(amount, userId, null);
-        if (!init.success) {
-          await saveUserSession(userId, session);
-          return ctx.reply(init.message || 'Paystack no gree right now. Try /fund later.');
-        }
-        const pending = {
-          reference: init.reference,
-          amount_ngn: init.amount_ngn,
-          authorization_url: init.authorization_url,
-          created_at: new Date().toISOString()
-        };
-        session.pending_payment = pending;
-        pendingPayments.set(String(userId), pending);
-        await saveUserSession(userId, session);
-        return ctx.reply(
-          `Top up *₦${init.amount_ngn.toLocaleString()}*\n\nTap *Pay* below.\nWhen e successful, type: *I don pay*`,
-          {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', init.authorization_url)]])
-          }
-        );
-      }
-    }
-    session.state = 'AWAITING_FUND_AMOUNT';
-    await saveUserSession(userId, session);
-    return ctx.reply(
-      'How much you wan fund?\n\nMin ₦1,000 · Max ₦200,000\n\nExample: *2k* or *5000*',
-      { parse_mode: 'Markdown' }
-    );
   }
 
   if (wantsHelp || looksLikeChitchat(textMsg)) {
@@ -2682,8 +2708,20 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
       const balNow = money((await getUserSession(userId)).balance);
       const phone = String(bought.number || '');
       const cancelLabel = `⏳ Cancel (wait ${Math.round(MIN_CANCEL_MS / 60000)}m)`;
+      try {
+        const baseUrl =
+          process.env.BOT_PUBLIC_URL ||
+          (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : '');
+        if (baseUrl) {
+          startStatusPolling(baseUrl, userId, bought.order_id, price, 0).catch((e) =>
+            console.error('startStatusPolling', e.message)
+          );
+        }
+      } catch (e) {
+        console.error('schedule poll', e.message);
+      }
       return ctx.reply(
-        `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n₦${price.toLocaleString()} debited · Balance: ₦${balNow.toLocaleString()}\n\nUse am for OTP. Tap Check when you expect code.`,
+        `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n₦${price.toLocaleString()} debited · Balance: ₦${balNow.toLocaleString()}\n\nUse am for OTP. I go auto-check — or tap Check.`,
         {
           parse_mode: 'Markdown',
           ...Markup.inlineKeyboard([
@@ -2921,40 +2959,59 @@ bot.on('text', async (ctx) => {
     );
   }
 
-  // --- FUND WALLET: user typed amount after "Fund wallet" button ---
-  // This was the glitch: amount was treated as a country/service search.
-  if (session.state === 'AWAITING_FUND_AMOUNT') {
-    const amount = parseNairaAmount(textMsg);
-    if (amount < 1000) {
-      return ctx.reply('Minimum na ₦1,000. You fit type *2k*, *5k* or *5000*.', {
-        parse_mode: 'Markdown'
-      });
-    }
-    if (amount > 200000) {
-      return ctx.reply('Maximum na ₦200,000 for one payment. Example: *50k*', {
-        parse_mode: 'Markdown'
-      });
-    }
-    const init = await paystackInitialize(amount, userId, null);
-    if (!init.success) {
+  // --- FUND WALLET amount (after /fund, Fund button, or "fund my wallet") ---
+  // Also accept bare amounts like 2k / 5000 if user clearly just got asked to fund
+  const isFundAmountState = session.state === 'AWAITING_FUND_AMOUNT';
+  const looksLikeOnlyAmount =
+    /^(?:₦|ngn|naira)?\s*\d+(?:[.,]\d+)?\s*k?\s*$/i.test(textMsg.trim()) ||
+    /^\d+(?:[.,]\d+)?\s*(?:k|thousand)\s*$/i.test(textMsg.trim());
+
+  if (isFundAmountState || (looksLikeOnlyAmount && session.pending_payment == null && parseNairaAmount(textMsg) >= 1000)) {
+    // If bare amount without state, only treat as fund if previous bot message was about funding
+    // — we rely on AWAITING_FUND_AMOUNT primarily; bare amount alone is OK when state set
+    if (isFundAmountState || session.state === 'AWAITING_FUND_AMOUNT') {
+      const amount = parseNairaAmount(textMsg);
+      if (amount < 1000) {
+        return ctx.reply('Minimum na ₦1,000. Type *2k*, *5k* or *5000*.', {
+          parse_mode: 'Markdown'
+        });
+      }
+      if (amount > 200000) {
+        return ctx.reply('Maximum na ₦200,000 for one payment. Example: *50k*', {
+          parse_mode: 'Markdown'
+        });
+      }
+      const init = await paystackInitialize(amount, userId, null);
+      if (!init.success) {
+        session.state = 'AWAITING_INPUT';
+        await saveUserSession(userId, session);
+        return ctx.reply(init.message || 'Paystack no gree right now. Try /fund again later.');
+      }
+      const pending = {
+        reference: init.reference,
+        amount_ngn: init.amount_ngn,
+        authorization_url: init.authorization_url,
+        created_at: new Date().toISOString()
+      };
+      session.pending_payment = pending;
       session.state = 'AWAITING_INPUT';
+      pendingPayments.set(String(userId), pending);
       await saveUserSession(userId, session);
-      return ctx.reply(init.message || 'Paystack no gree right now. Try /fund again later.');
+      return ctx.reply(
+        `Top up *₦${init.amount_ngn.toLocaleString()}*\n\nTap *Pay* below.\nWhen e successful, type: *I don pay*`,
+        {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', init.authorization_url)]])
+        }
+      );
     }
-    const pending = {
-      reference: init.reference,
-      amount_ngn: init.amount_ngn,
-      authorization_url: init.authorization_url,
-      created_at: new Date().toISOString()
-    };
-    session.pending_payment = pending;
-    session.state = 'AWAITING_INPUT';
-    pendingPayments.set(String(userId), pending);
-    await saveUserSession(userId, session);
-    return ctx.reply(
-      `Top up ₦${init.amount_ngn.toLocaleString()}\n\nTap Pay below.\nWhen e successful, type: I don pay`,
-      Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', init.authorization_url)]])
-    );
+  }
+
+  // Fund intent BEFORE Gemini — Gemini was asking for amount without setting state
+  const fundIntent =
+    /\b(fund|top\s*up|topup|deposit|recharge|add\s*money|load\s*wallet|pay\s*in)\b/i.test(lower);
+  if (fundIntent) {
+    return miraHandleSmartText(ctx, session, userId, textMsg);
   }
 
   // Keep country session if still browsing
@@ -2964,12 +3021,16 @@ bot.on('text', async (ctx) => {
     return miraShowPricesAndConfirm(ctx, session, userId, session.countryId, session.country, q);
   }
 
-  // Gemini optional enhancement for pure chat — but Mira smart flow owns buy path
+  // Gemini optional enhancement for pure chat — Mira owns buy + fund path
   const buyIntent =
     looksLikeNeedNumber(textMsg) ||
+    fundIntent ||
+    session.state === 'AWAITING_FUND_AMOUNT' ||
     !!(await parseCountryService(textMsg)).countryId ||
     !!(await parseCountryService(textMsg)).serviceName ||
-    ['AWAITING_SERVICE', 'AWAITING_COUNTRY', 'AWAITING_CONFIRM'].includes(session.state) ||
+    ['AWAITING_SERVICE', 'AWAITING_COUNTRY', 'AWAITING_CONFIRM', 'AWAITING_FUND_AMOUNT'].includes(
+      session.state
+    ) ||
     detectServiceOnly(textMsg);
 
   if (GEMINI_API_KEY && !buyIntent && session.state === 'AWAITING_INPUT') {
@@ -3086,6 +3147,194 @@ async function showServiceOptions(ctx, session, userId, countryId, countryName, 
 
 bot.catch((err) => console.error('bot error', err));
 
+// ---------- SMS status: webhook + auto-poll ----------
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Find which Telegram user owns this activation id */
+async function findUserIdByOrderId(orderId) {
+  if (!orderId || !SUPABASE_REST_URL || !SUPABASE_SERVICE_KEY) return null;
+  const oid = String(orderId).trim();
+  try {
+    // orders is jsonb array — filter rows updated recently and scan
+    const res = await axios.get(
+      `${SUPABASE_REST_URL}/user_sessions?select=user_id,orders&orders=not.is.null&order=updated_at.desc&limit=80`,
+      { ...axiosCfg, headers: sbHeaders }
+    );
+    const rows = Array.isArray(res.data) ? res.data : [];
+    for (const row of rows) {
+      const orders = row.orders || [];
+      if (orders.some((o) => o && String(o.orderId) === oid)) {
+        return String(row.user_id);
+      }
+    }
+  } catch (e) {
+    console.error('findUserIdByOrderId', e.message);
+  }
+  return null;
+}
+
+/** Persist code on order + DM the customer */
+async function deliverCodeToUser(telegramUserId, orderId, code, fullText) {
+  const session = await getUserSession(telegramUserId);
+  let found = false;
+  session.orders = (session.orders || []).map((o) => {
+    if (String(o.orderId) === String(orderId)) {
+      found = true;
+      return { ...o, status: `Code: ${code}`, sms_text: fullText || null, code_at: new Date().toISOString() };
+    }
+    return o;
+  });
+  if (!found) {
+    session.orders = [
+      ...(session.orders || []),
+      {
+        orderId: String(orderId),
+        status: `Code: ${code}`,
+        sms_text: fullText || null,
+        code_at: new Date().toISOString()
+      }
+    ].slice(-30);
+  }
+  await saveUserSession(telegramUserId, session);
+  const msg =
+    `Your code don drop ✅\n\n` +
+    `*${code}*\n` +
+    (fullText && fullText !== code ? `\n_${String(fullText).slice(0, 200)}_\n` : '') +
+    `\nOrder: \`${orderId}\`\nCopy sharp. You need another number?`;
+  try {
+    await bot.telegram.sendMessage(telegramUserId, msg, { parse_mode: 'Markdown' });
+  } catch (e) {
+    console.error('deliverCodeToUser send', e.message);
+  }
+  return true;
+}
+
+/**
+ * Handle inbound SMS status (webhook body or polled result).
+ * Accepts SMS-Activate style:
+ *   { activationId, code, text, service, country, receivedAt }
+ * or our internal: { order_id, code, text, telegram_user_id }
+ */
+async function handleSmsStatusPayload(body) {
+  const orderId =
+    body.activationId ||
+    body.activation_id ||
+    body.id ||
+    body.order_id ||
+    body.orderId ||
+    null;
+  const code = body.code || body.sms_code || body.otp || null;
+  const text = body.text || body.sms || body.message || null;
+  let userId =
+    body.telegram_user_id ||
+    body.telegramUserId ||
+    body.user_id ||
+    null;
+
+  if (!orderId) return { ok: false, error: 'missing order/activation id' };
+
+  // Extract code from text if needed
+  let finalCode = code ? String(code).trim() : '';
+  if (!finalCode && text) {
+    const m = String(text).match(/\b(\d{4,8})\b/);
+    if (m) finalCode = m[1];
+  }
+  if (!finalCode) return { ok: false, error: 'no code yet', waiting: true, orderId };
+
+  if (!userId) userId = await findUserIdByOrderId(orderId);
+  if (!userId) {
+    console.error('[status] no user for order', orderId);
+    return { ok: false, error: 'user not found for order', orderId, code: finalCode };
+  }
+
+  // Skip if already delivered
+  const session = await getUserSession(userId);
+  const existing = (session.orders || []).find((o) => String(o.orderId) === String(orderId));
+  if (existing && /Code:\s*\d/i.test(String(existing.status || ''))) {
+    return { ok: true, already: true, orderId, code: finalCode };
+  }
+
+  await deliverCodeToUser(userId, orderId, finalCode, text);
+  return { ok: true, orderId, code: finalCode, userId };
+}
+
+/** After buy: poll Grizzly a few times and push code when ready (serverless-friendly chain) */
+async function startStatusPolling(baseUrl, telegramUserId, orderId, price, attempt = 0) {
+  const maxAttempts = Number(process.env.STATUS_POLL_ATTEMPTS) || 18; // ~18 * 8s ≈ 2.5 min
+  const delayMs = Number(process.env.STATUS_POLL_MS) || 8000;
+  const secret = process.env.WEBHOOK_SECRET || process.env.INTERNAL_POLL_SECRET || '';
+
+  try {
+    const st = await grizzlyStatus(orderId);
+    if (st.success && st.code) {
+      await handleSmsStatusPayload({
+        order_id: orderId,
+        code: st.code,
+        telegram_user_id: String(telegramUserId)
+      });
+      return { done: true, code: st.code };
+    }
+  } catch (e) {
+    console.error('[poll] status', e.message);
+  }
+
+  if (attempt + 1 >= maxAttempts) {
+    console.log('[poll] give up', orderId, 'user', telegramUserId);
+    try {
+      await bot.telegram.sendMessage(
+        telegramUserId,
+        `Code never drop yet for order \`${orderId}\`.\nTap *Check SMS code* on the order message, or cancel when the timer allow.`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (_) {}
+    return { done: false, exhausted: true };
+  }
+
+  // Chain next poll via HTTP so each Vercel invocation stays short
+  const nextUrl = `${baseUrl.replace(/\/$/, '')}/api/poll-status`;
+  setTimeout(() => {
+    axios
+      .post(
+        nextUrl,
+        {
+          telegram_user_id: String(telegramUserId),
+          order_id: String(orderId),
+          price: price || 0,
+          attempt: attempt + 1
+        },
+        {
+          timeout: 8000,
+          headers: {
+            'Content-Type': 'application/json',
+            ...(secret ? { 'x-internal-secret': secret } : {})
+          }
+        }
+      )
+      .catch((e) => console.error('[poll] chain', e.message));
+  }, Math.min(delayMs, 2000)); // schedule soon; actual wait is between invocations via attempt spacing
+
+  // Also wait a bit in-process once (helps first few checks)
+  if (attempt === 0) {
+    await sleep(Math.min(delayMs, 6000));
+    try {
+      const st2 = await grizzlyStatus(orderId);
+      if (st2.success && st2.code) {
+        await handleSmsStatusPayload({
+          order_id: orderId,
+          code: st2.code,
+          telegram_user_id: String(telegramUserId)
+        });
+        return { done: true, code: st2.code };
+      }
+    } catch (_) {}
+  }
+
+  return { done: false, scheduled: true, attempt: attempt + 1 };
+}
+
 // ---------- Vercel / local handler ----------
 
 module.exports = async (req, res) => {
@@ -3094,6 +3343,7 @@ module.exports = async (req, res) => {
     const proto = req.headers['x-forwarded-proto'] || 'https';
     const base = `${proto}://${host}`;
     const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+    const pathOnly = String(req.url || '').split('?')[0];
 
     if (req.method === 'GET' && (req.url === '/setup-webhook' || req.url?.startsWith('/setup-webhook'))) {
       if (!BOT_TOKEN) {
@@ -3140,7 +3390,7 @@ module.exports = async (req, res) => {
     }
 
     // Paystack webhook / callback credit
-    if (req.method === 'POST' && (req.url === '/paystack' || req.url?.startsWith('/paystack'))) {
+    if (req.method === 'POST' && (pathOnly === '/paystack' || pathOnly.startsWith('/paystack') || pathOnly === '/api/paystack')) {
       const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
       const event = body.event || '';
       const data = body.data || {};
@@ -3151,14 +3401,14 @@ module.exports = async (req, res) => {
         if (telegramUserId && reference && amountNgn > 0) {
           const session = await getUserSession(telegramUserId);
           if (session.last_credited_reference !== reference) {
-            session.balance = (Number(session.balance) || 0) + amountNgn;
+            session.balance = money(money(session.balance) + amountNgn);
             session.last_credited_reference = reference;
             session.pending_payment = null;
             await saveUserSession(telegramUserId, session);
             try {
               await bot.telegram.sendMessage(
                 telegramUserId,
-                `Payment confirmed ✅\n₦${amountNgn.toLocaleString()} don enter your wallet.\nNew balance: ₦${Number(session.balance).toLocaleString()}\n\nYou fit buy number now. Just tell me country and app.`
+                `Payment confirmed ✅\n₦${amountNgn.toLocaleString()} don enter your wallet.\nNew balance: ₦${money(session.balance).toLocaleString()}\n\nYou fit buy number now. Just tell me country and app.`
               );
             } catch (e) {
               console.error('notify user after paystack', e.message);
@@ -3168,6 +3418,57 @@ module.exports = async (req, res) => {
       }
       res.statusCode = 200;
       return res.end('ok');
+    }
+
+    // SMS status webhook (Grizzly / SMS-Activate style callback)
+    // URL: https://YOUR-BOT.vercel.app/api/status  or  /status
+    if (
+      req.method === 'POST' &&
+      (pathOnly === '/status' ||
+        pathOnly === '/api/status' ||
+        pathOnly === '/sms-status' ||
+        pathOnly === '/api/sms-status' ||
+        pathOnly.startsWith('/status'))
+    ) {
+      let body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : req.body || {};
+      // Also accept query-string style (some providers GET/POST form)
+      try {
+        const u = new URL(base + (req.url || '/'));
+        for (const [k, v] of u.searchParams) {
+          if (body[k] == null) body[k] = v;
+        }
+      } catch (_) {}
+      const result = await handleSmsStatusPayload(body);
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'application/json');
+      return res.end(JSON.stringify(result));
+    }
+
+    // Internal status poller (chained after purchase)
+    if (
+      req.method === 'POST' &&
+      (pathOnly === '/poll-status' || pathOnly === '/api/poll-status')
+    ) {
+      const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : req.body || {};
+      const internal = process.env.WEBHOOK_SECRET || process.env.INTERNAL_POLL_SECRET || '';
+      if (internal && req.headers['x-internal-secret'] !== internal) {
+        res.statusCode = 401;
+        return res.end('unauthorized');
+      }
+      const userId = body.telegram_user_id || body.userId;
+      const orderId = body.order_id || body.orderId;
+      const attempt = Number(body.attempt) || 0;
+      const price = body.price || 0;
+      if (!userId || !orderId) {
+        res.statusCode = 400;
+        return res.end(JSON.stringify({ error: 'userId and orderId required' }));
+      }
+      // Space polls: each invocation does one check; chain with delay
+      await sleep(Number(process.env.STATUS_POLL_MS) || 8000);
+      const out = await startStatusPolling(base, userId, orderId, price, attempt);
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'application/json');
+      return res.end(JSON.stringify(out));
     }
 
     if (req.method === 'POST') {
