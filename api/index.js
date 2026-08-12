@@ -301,7 +301,10 @@ async function getUserSession(userId) {
 }
 
 async function saveUserSession(userId, session) {
-  if (!SUPABASE_REST_URL || !SUPABASE_SERVICE_KEY) return;
+  if (!SUPABASE_REST_URL || !SUPABASE_SERVICE_KEY) {
+    console.error('saveUserSession: missing SUPABASE env');
+    return false;
+  }
   // Only columns that exist on user_sessions. conversation column is NOT in schema.
   const orders = [...(session.orders || [])].filter((o) => o && o.type !== '_meta');
   const pending = session.pendingService || session.serviceQuery || null;
@@ -314,7 +317,7 @@ async function saveUserSession(userId, session) {
   });
   const payload = {
     user_id: String(userId),
-    balance: Number(session.balance) || 0,
+    balance: money(session.balance),
     state: session.state || 'AWAITING_INPUT',
     country: session.country || null,
     country_id: session.countryId || null,
@@ -339,8 +342,10 @@ async function saveUserSession(userId, session) {
         headers: sbHeaders
       });
     }
+    return true;
   } catch (e) {
     console.error('saveUserSession', e.response?.status, e.response?.data || e.message);
+    return false;
   }
 }
 
@@ -879,7 +884,26 @@ function money(n) {
   return v > 0 ? v : 0;
 }
 
-/** Reload session, debit only if enough funds. Returns { ok, balance, session } */
+/**
+ * Nigerian amount parse: 2k → 2000, 5k → 5000, 1.5k → 1500, 10,000 → 10000, ₦3k → 3000
+ * Also plain digits. Returns 0 if nothing useful.
+ */
+function parseNairaAmount(text) {
+  const raw = String(text || '').trim().toLowerCase().replace(/,/g, '');
+  if (!raw) return 0;
+  // 2k, 5k, 10k, 1.5k, 2.5k
+  let m = raw.match(/(\d+(?:\.\d+)?)\s*k\b/);
+  if (m) return Math.round(parseFloat(m[1]) * 1000);
+  // 2 thousand / 5 thsd
+  m = raw.match(/(\d+(?:\.\d+)?)\s*(?:thousand|thsd|ths)\b/);
+  if (m) return Math.round(parseFloat(m[1]) * 1000);
+  // plain number (strip currency junk)
+  m = raw.match(/(\d+(?:\.\d+)?)/);
+  if (m) return Math.round(parseFloat(m[1]));
+  return 0;
+}
+
+/** Reload session, debit only if enough funds. Verifies persist. Returns { ok, balance, session, debited } */
 async function safeDebit(userId, amount, meta = {}) {
   const session = await getUserSession(userId);
   amount = money(amount);
@@ -888,10 +912,28 @@ async function safeDebit(userId, amount, meta = {}) {
   if (bal < amount) {
     return { ok: false, balance: bal, session, debited: 0, need: amount };
   }
-  session.balance = money(bal - amount);
-  await saveUserSession(userId, session);
-  console.log('[money] debit', userId, amount, '→', session.balance, meta);
-  return { ok: true, balance: session.balance, session, debited: amount };
+  const next = money(bal - amount);
+  session.balance = next;
+  const saved = await saveUserSession(userId, session);
+  if (!saved) {
+    console.error('[money] debit SAVE FAILED', userId, amount, meta);
+    return { ok: false, balance: bal, session: { ...session, balance: bal }, debited: 0, saveFailed: true };
+  }
+  // Re-read to confirm wallet actually moved
+  const verify = await getUserSession(userId);
+  const verifiedBal = money(verify.balance);
+  if (verifiedBal !== next) {
+    console.error('[money] debit VERIFY MISMATCH', userId, { expected: next, got: verifiedBal, meta });
+    // Force-write once more
+    verify.balance = next;
+    const saved2 = await saveUserSession(userId, verify);
+    if (!saved2) {
+      return { ok: false, balance: verifiedBal, session: verify, debited: 0, saveFailed: true };
+    }
+  }
+  const finalS = await getUserSession(userId);
+  console.log('[money] debit', userId, amount, '→', money(finalS.balance), meta);
+  return { ok: true, balance: money(finalS.balance), session: finalS, debited: amount };
 }
 
 /** Reload session, credit once. */
@@ -900,9 +942,14 @@ async function safeCredit(userId, amount, meta = {}) {
   amount = money(amount);
   if (amount <= 0) return { ok: true, balance: money(session.balance), session, credited: 0 };
   session.balance = money(money(session.balance) + amount);
-  await saveUserSession(userId, session);
-  console.log('[money] credit', userId, amount, '→', session.balance, meta);
-  return { ok: true, balance: session.balance, session, credited: amount };
+  const saved = await saveUserSession(userId, session);
+  if (!saved) {
+    console.error('[money] credit SAVE FAILED', userId, amount, meta);
+    return { ok: false, balance: money(session.balance) - amount, session, credited: 0, saveFailed: true };
+  }
+  const finalS = await getUserSession(userId);
+  console.log('[money] credit', userId, amount, '→', money(finalS.balance), meta);
+  return { ok: true, balance: money(finalS.balance), session: finalS, credited: amount };
 }
 
 function formatWait(sec) {
@@ -1875,16 +1922,16 @@ bot.command('fund', async (ctx) => {
     );
   }
 
-  let amount = parseInt(String(raw).replace(/[^\d]/g, ''), 10) || 0;
+  let amount = parseNairaAmount(raw);
   if (amount < 1000) {
     session.state = 'AWAITING_FUND_AMOUNT';
     await saveUserSession(ctx.from.id, session);
-    return ctx.reply('Minimum na ₦1,000. Example: 5000 (or /fund 5000)');
+    return ctx.reply('Minimum na ₦1,000. Example: *2k* or *5000*', { parse_mode: 'Markdown' });
   }
   if (amount > 200000) {
     session.state = 'AWAITING_FUND_AMOUNT';
     await saveUserSession(ctx.from.id, session);
-    return ctx.reply('Maximum na ₦200,000 for one payment. Example: 50000');
+    return ctx.reply('Maximum na ₦200,000 for one payment. Example: *50k*', { parse_mode: 'Markdown' });
   }
 
   const init = await paystackInitialize(amount, ctx.from.id, null);
@@ -2003,45 +2050,69 @@ bot.action(/^opt:(\d+):([^:]+):(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery('Buying…');
   const countryId = ctx.match[1];
   const serviceId = ctx.match[2];
-  const price = parseInt(ctx.match[3], 10) || 0;
+  const price = money(parseInt(ctx.match[3], 10) || 0);
   const userId = ctx.from.id;
-  const session = await getUserSession(userId);
+  let session = await getUserSession(userId);
 
-  if (price > 0 && session.balance < price) {
+  if (price > 0 && money(session.balance) < price) {
     return ctx.reply(
-      `Balance no reach. You need ₦${price.toLocaleString()}.\nYour balance: ₦${Number(session.balance || 0).toLocaleString()}.\n\nType /fund ${price} to top up.`
+      `Balance no reach o.\nYou need ₦${price.toLocaleString()} · you get ₦${money(session.balance).toLocaleString()}.\n\nType /fund ${price} make I top you up.`
     );
   }
 
   await ctx.reply('I dey grab the number… hold on.');
   const bought = await grizzlyBuy(serviceId, countryId);
   if (!bought.success) {
-    return ctx.reply(/502|503|gateway|unreachable|timeout/i.test(String(bought.message || '')) ? 'Supplier temporarily unavailable. Abeg try again in a few minutes.' : `E no work: ${bought.message || 'No number available. Try another option.'}`);
+    return ctx.reply(
+      /502|503|gateway|unreachable|timeout/i.test(String(bought.message || ''))
+        ? 'Supplier temporarily unavailable. Abeg try again in a few minutes.'
+        : `E no work: ${bought.message || 'No number available. Try another option.'}`
+    );
   }
 
-  // charge only after supplier success (already past bought.success)
-  {
-    const deb = await safeDebit(ctx.from.id, price, { orderId: bought.order_id });
-    session.balance = deb.balance;
-    Object.assign(session, deb.session);
+  // MUST debit after supplier success — never give free number
+  const deb = await safeDebit(userId, price, { orderId: bought.order_id, path: 'opt' });
+  if (price > 0 && !deb.ok) {
+    // Try cancel at supplier so customer isn't charged twice later
+    try {
+      await grizzlyCancel(bought.order_id);
+    } catch (_) {}
+    console.error('[buy] debit failed after getNumber', userId, price, bought.order_id, deb);
+    return ctx.reply(
+      deb.saveFailed
+        ? 'Number come out but wallet no update. Abeg contact /support with this id: `' +
+            bought.order_id +
+            '` — we go sort am.'
+        : `Balance no reach to complete this buy.\nNeed ₦${price.toLocaleString()} · you get ₦${money(deb.balance).toLocaleString()}.\n\nFund and try again.`,
+      { parse_mode: 'Markdown' }
+    );
   }
+
+  session = deb.session || (await getUserSession(userId));
   const order = {
     orderId: bought.order_id,
     provider: 'grizzly',
+    service: serviceId,
     serviceName: serviceId,
     phoneNumber: bought.number,
     price,
     status: 'Waiting SMS',
-    date: new Date().toISOString()
+    date: new Date().toISOString(),
+    charged: true,
+    refunded: false
   };
   session.orders = [...(session.orders || []), order].slice(-30);
   session.last_options = null;
+  session.state = 'AWAITING_INPUT';
+  session.pendingService = null;
   await saveUserSession(userId, session);
 
+  // Fresh balance for message
+  const balNow = money((await getUserSession(userId)).balance);
   const phone = String(bought.number || '');
   const cancelLabel = `⏳ Cancel (wait ${Math.round(MIN_CANCEL_MS / 60000)}m)`;
   await ctx.reply(
-    `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n\nUse am for the app to request OTP.\nWhen you ready, tap Check.\n\n_Cancel opens after ~${Math.round(MIN_CANCEL_MS / 60000)} minutes._`,
+    `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n₦${price.toLocaleString()} debited · Balance: ₦${balNow.toLocaleString()}\n\nUse am for the app to request OTP.\nWhen you ready, tap Check.\n\n_Cancel opens after ~${Math.round(MIN_CANCEL_MS / 60000)} minutes._`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
@@ -2080,9 +2151,19 @@ bot.action(/^buy:(\d+):([^:]+):(\d+)$/, async (ctx) => {
     );
   }
 
-  const deb = await safeDebit(userId, priceN, { orderId: bought.order_id, service: serviceId });
-  session.balance = deb.balance;
-  Object.assign(session, deb.session);
+  const deb = await safeDebit(userId, priceN, { orderId: bought.order_id, service: serviceId, path: 'buy' });
+  if (priceN > 0 && !deb.ok) {
+    try {
+      await grizzlyCancel(bought.order_id);
+    } catch (_) {}
+    return ctx.reply(
+      deb.saveFailed
+        ? `Number come out but wallet no update. Contact /support with id \`${bought.order_id}\`.`
+        : `Balance no reach. Need ₦${priceN.toLocaleString()} · you get ₦${money(deb.balance).toLocaleString()}.`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+  let sess = deb.session || (await getUserSession(userId));
   const order = {
     orderId: bought.order_id,
     provider: 'grizzly',
@@ -2092,22 +2173,23 @@ bot.action(/^buy:(\d+):([^:]+):(\d+)$/, async (ctx) => {
     price: priceN,
     status: 'Waiting for SMS',
     date: new Date().toISOString(),
-    charged: deb.ok,
+    charged: true,
     refunded: false
   };
-  session.orders = [...(session.orders || []), order].slice(-30);
-  await saveUserSession(userId, session);
+  sess.orders = [...(sess.orders || []), order].slice(-30);
+  await saveUserSession(userId, sess);
 
+  const balNow = money((await getUserSession(userId)).balance);
   const phone = String(bought.number || '');
   const cancelLabel = `⏳ Cancel (wait ${Math.round(MIN_CANCEL_MS / 60000)}m)`;
   await ctx.reply(
-    `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n\nTap below when the SMS arrives.\n\n_Cancel opens after ~${Math.round(MIN_CANCEL_MS / 60000)} minutes._`,
+    `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n₦${priceN.toLocaleString()} debited · Balance: ₦${balNow.toLocaleString()}\n\nTap Check when the SMS arrives.\n\n_Cancel opens after ~${Math.round(MIN_CANCEL_MS / 60000)} minutes._`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
         [{ text: '📋 Copy number', copy_text: { text: phone } }],
-        [Markup.button.callback('Check SMS code', `chk:${bought.order_id}:${price}`)],
-        [Markup.button.callback(cancelLabel.slice(0, 64), `can:${bought.order_id}:${price}`)]
+        [Markup.button.callback('Check SMS code', `chk:${bought.order_id}:${priceN}`)],
+        [Markup.button.callback(cancelLabel.slice(0, 64), `can:${bought.order_id}:${priceN}`)]
       ])
     }
   );
@@ -2229,36 +2311,31 @@ bot.action(/^can:([^:]+):(\d+)$/, async (ctx) => {
 // ---------- Mira smart flow (works without Gemini) ----------
 const MIRA = {
   greet:
-    'How far 👋 I be *Mira* — MJ SMS assistant.\n\nI fit get real number for WhatsApp, Telegram, Instagram, Google and more.\n\nJust type like:\n• *USA WhatsApp*\n• *Nigeria Telegram*\n• or say *I need number*\n\n/balance · /fund 2000 · /orders · /support',
-  askService: 'Which app you need the number for?\n(WhatsApp, Telegram, Instagram, Google, Facebook, TikTok…)',
+    'How far 👋 I be Mira.\n\nI go help you get real number for WhatsApp, Telegram, IG, Google and the rest.\n\nJust yarn e.g.\n• USA WhatsApp\n• UK Telegram\n• or “I need number”\n\nBalance · Fund (even *2k*) · Orders · Support — I dey.',
+  askService: 'Which app? WhatsApp, Telegram, Instagram, Google, Facebook, TikTok…',
   askCountry: (svc) =>
-    svc
-      ? `Which country for *${svc}*?\n\n_Reply with country name e.g. USA, UK, Nigeria_`
-      : 'Which country you want?',
-  noStock: 'That one no dey available right now. You fit try another country?',
+    svc ? `Which country for ${svc}? e.g. USA, UK, Nigeria, Canada` : 'Which country you want?',
+  noStock: 'That one no dey available right now. Try another country?',
   lowBal: (need, bal) =>
-    `Balance no reach.\nNeed ₦${Number(need).toLocaleString()} · you get ₦${Number(bal).toLocaleString()}.\n\nType /fund ${need} to top up.`,
-  yarn:
-    'I dey here. Tell me app + country e.g. *USA WhatsApp*\n\nOr ask me anything about MJ SMS / MJ Hub.',
+    `Balance no reach o.\nYou need ₦${Number(need).toLocaleString()} · you get ₦${Number(bal).toLocaleString()}.\n\nType /fund ${need} or just *fund ${Math.ceil(Number(need) / 1000)}k*.`,
+  yarn: 'I dey. Tell me country + app — like USA WhatsApp — or fund / balance.',
   about:
-    '*MJ Hub* na all-in-one marketplace:\n\n' +
-    '📱 *MJ SMS* — real non-VOIP numbers for OTP (this bot = Server 1)\n' +
-    '📋 *MJ Logs* — verified accounts (Facebook, IG, X, Gmail…)\n' +
-    '📈 *MJ Boosters* — followers, likes, views (IG, TikTok, YouTube…)\n\n' +
-    'Website: mjhub.store\nOne wallet on the site · separate wallet on this bot.\n\n' +
-    'Referral: you earn *2% for life* when people you invite fund their wallet on the site.',
+    'MJ Hub na one place for:\n\n' +
+    '• MJ SMS — real numbers for OTP (wetin we dey do here)\n' +
+    '• MJ Logs — verified accounts on the website\n' +
+    '• MJ Boosters — followers/likes/views on the website\n\n' +
+    'Site: mjhub.store\nThis bot wallet separate from the website wallet.\nReferral on the site: 2% for life when your people fund.',
   howSms:
-    '*How MJ SMS work:*\n\n' +
-    '1. Tell me country + app (e.g. USA WhatsApp)\n' +
-    '2. I show price → you buy from wallet\n' +
-    '3. You get the number → use am for OTP in the app\n' +
-    '4. Code usually drop within ~1 minute\n' +
-    '5. If code no come, you fit cancel for refund after ~3 min\n\n' +
-    'Numbers are *real mobile* (not VOIP) — better for WhatsApp & major apps.\n200+ countries.',
+    'E simple:\n\n' +
+    '1. Tell me country + app\n' +
+    '2. I show price, you buy from wallet\n' +
+    '3. You use the number request OTP\n' +
+    '4. Code usually land within about 1 minute — tap Check\n' +
+    '5. If e no come, cancel after ~3 min for refund\n\n' +
+    'Numbers here na real mobile, no be VOIP.',
   fundHelp:
-    'To fund this bot wallet:\n\n• Type `/fund 5000` (any amount ₦1,000–₦200,000)\n• Or type *fund* then the amount\n• Pay with Paystack → wallet credit automatic\n\nAfter pay you fit type: *I don pay*\n\nNote: bot wallet ≠ website wallet on mjhub.store.',
-  supportHelp:
-    'I fit help you buy number and check OTP here.\n\nNeed human? /support\nWebsite: mjhub.store',
+    'To fund:\n• /fund 2k  or  /fund 5000\n• or type fund then amount (2k, 5k, 10k…)\nPaystack go open — after pay, wallet update. You fit also type “I don pay”.\n\nBot wallet ≠ mjhub.store wallet.',
+  supportHelp: 'I fit handle number and OTP here. For human support type /support or use mjhub.store.',
 };
 
 function detectServiceOnly(text) {
@@ -2456,12 +2533,9 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
 
   if (wantsFund) {
     clearBuyState(session, userId);
-    const amtMatch =
-      lower.match(/(?:fund|top\s*up|topup|deposit|recharge)\s*[₦n]?\s*([\d,]+)/i) ||
-      lower.match(/\b([\d,]{3,})\b/);
-    if (amtMatch) {
-      const amount = parseInt(String(amtMatch[1]).replace(/[^\d]/g, ''), 10) || 0;
-      if (amount >= 1000 && amount <= 200000) {
+    const amount = parseNairaAmount(textMsg);
+    if (amount >= 1000 && amount <= 200000) {
+      {
         const init = await paystackInitialize(amount, userId, null);
         if (!init.success) {
           await saveUserSession(userId, session);
@@ -2488,7 +2562,7 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
     session.state = 'AWAITING_FUND_AMOUNT';
     await saveUserSession(userId, session);
     return ctx.reply(
-      'How much you wan fund?\n\nMin ₦1,000 · Max ₦200,000\n\nExample: *5000*',
+      'How much you wan fund?\n\nMin ₦1,000 · Max ₦200,000\n\nExample: *2k* or *5000*',
       { parse_mode: 'Markdown' }
     );
   }
@@ -2565,7 +2639,7 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
           ...Markup.inlineKeyboard([[Markup.button.callback('💳 Fund', 'menu:fund')]])
         });
       }
-      await ctx.reply('Hold on…');
+      await ctx.reply('I dey grab the number… hold on.');
       const bought = await grizzlyBuy(s.service_code, countryId);
       if (!bought.success) {
         return ctx.reply(
@@ -2574,9 +2648,20 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
             : `E no work: ${bought.message || 'No number'}`
         );
       }
-      const deb = await safeDebit(userId, price, { orderId: bought.order_id });
-      session.balance = deb.balance;
-      Object.assign(session, deb.session);
+      const deb = await safeDebit(userId, price, { orderId: bought.order_id, path: 'confirm' });
+      if (price > 0 && !deb.ok) {
+        try {
+          await grizzlyCancel(bought.order_id);
+        } catch (_) {}
+        return ctx.reply(
+          deb.saveFailed
+            ? `Number come out but wallet no update. Contact /support with id \`${bought.order_id}\`.`
+            : MIRA.lowBal(price, deb.balance),
+          { parse_mode: 'Markdown' }
+        );
+      }
+      Object.assign(session, deb.session || {});
+      session.balance = money(deb.balance);
       const order = {
         orderId: bought.order_id,
         service: s.service_code,
@@ -2586,7 +2671,7 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
         status: 'Waiting for SMS',
         date: new Date().toISOString(),
         countryId,
-        charged: deb.ok,
+        charged: true,
         refunded: false
       };
       session.orders = [...(session.orders || []), order].slice(-30);
@@ -2594,10 +2679,11 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
       session.pendingService = null;
       session.last_options = [];
       await saveUserSession(userId, session);
+      const balNow = money((await getUserSession(userId)).balance);
       const phone = String(bought.number || '');
       const cancelLabel = `⏳ Cancel (wait ${Math.round(MIN_CANCEL_MS / 60000)}m)`;
       return ctx.reply(
-        `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n\nUse am for OTP. Tap Check when you expect code.`,
+        `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n₦${price.toLocaleString()} debited · Balance: ₦${balNow.toLocaleString()}\n\nUse am for OTP. Tap Check when you expect code.`,
         {
           parse_mode: 'Markdown',
           ...Markup.inlineKeyboard([
@@ -2838,12 +2924,16 @@ bot.on('text', async (ctx) => {
   // --- FUND WALLET: user typed amount after "Fund wallet" button ---
   // This was the glitch: amount was treated as a country/service search.
   if (session.state === 'AWAITING_FUND_AMOUNT') {
-    const amount = parseInt(String(textMsg).replace(/[^\d]/g, ''), 10) || 0;
+    const amount = parseNairaAmount(textMsg);
     if (amount < 1000) {
-      return ctx.reply('Minimum na ₦1,000. Example: 5000\n\nOr type /fund 5000');
+      return ctx.reply('Minimum na ₦1,000. You fit type *2k*, *5k* or *5000*.', {
+        parse_mode: 'Markdown'
+      });
     }
     if (amount > 200000) {
-      return ctx.reply('Maximum na ₦200,000 for one payment. Example: 50000');
+      return ctx.reply('Maximum na ₦200,000 for one payment. Example: *50k*', {
+        parse_mode: 'Markdown'
+      });
     }
     const init = await paystackInitialize(amount, userId, null);
     if (!init.success) {
