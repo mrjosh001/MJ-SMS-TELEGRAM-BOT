@@ -14,6 +14,30 @@ if (SUPABASE_REST_URL && !/\/rest\/v1$/i.test(SUPABASE_REST_URL)) {
   SUPABASE_REST_URL = SUPABASE_REST_URL.replace(/\/$/, '') + '/rest/v1';
 }
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+
+// MJ HUB website is a DIFFERENT Supabase project. Bot sessions use SUPABASE_* above.
+// Catalog selling prices come from the website DB via these env vars (read-only).
+let MJ_HUB_REST_URL = (
+  process.env.MJ_HUB_REST_URL ||
+  process.env.MJ_HUB_SUPABASE_URL ||
+  process.env.MJHUB_SUPABASE_URL ||
+  ''
+).replace(/\/$/, '');
+if (MJ_HUB_REST_URL && !/\/rest\/v1$/i.test(MJ_HUB_REST_URL)) {
+  MJ_HUB_REST_URL = MJ_HUB_REST_URL + '/rest/v1';
+}
+const MJ_HUB_SERVICE_KEY =
+  process.env.MJ_HUB_SERVICE_KEY ||
+  process.env.MJ_HUB_SUPABASE_SERVICE_KEY ||
+  process.env.MJHUB_SERVICE_KEY ||
+  '';
+const mjHubHeaders = {
+  apikey: MJ_HUB_SERVICE_KEY || '',
+  Authorization: `Bearer ${MJ_HUB_SERVICE_KEY || ''}`,
+  'Content-Type': 'application/json',
+  Prefer: 'return=representation'
+};
+
 const USD_TO_NGN = Number(process.env.USD_TO_NGN_RATE) || 1500;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || process.env.PAYSTACK_SECRET || process.env.PAYSTACK_SECRET_KEY_LIVE || '';
@@ -263,49 +287,65 @@ async function grizzlyPrices(countryId) {
 
 // Pull selling prices from MJ HUB website catalog (number_services)
 async function fetchHubServices(countryId, serviceFilter) {
-  if (!SUPABASE_REST_URL || !SUPABASE_SERVICE_KEY) return [];
+  // Website catalog lives on a DIFFERENT Supabase than this bot
+  if (!MJ_HUB_REST_URL || !MJ_HUB_SERVICE_KEY) {
+    console.error(
+      'fetchHubServices: set MJ_HUB_SUPABASE_URL + MJ_HUB_SERVICE_KEY (website project, not bot DB)'
+    );
+    return [];
+  }
   try {
+    // Exact MJ HUB website selling prices from number_services
     let url =
-      `${SUPABASE_REST_URL}/number_services?select=service_id,service_name,country_id,country_name,price,available_quantity,is_available,supplier_price` +
+      `${MJ_HUB_REST_URL}/number_services?select=id,service_id,service_name,country_id,country_name,price,available_quantity,is_available,supplier_price` +
       `&country_id=eq.${encodeURIComponent(countryId)}` +
-      `&is_available=eq.true` +
       `&price=gt.0` +
       `&order=price.asc` +
-      `&limit=80`;
-    const res = await axios.get(url, { ...axiosCfg, headers: sbHeaders });
+      `&limit=100`;
+    const res = await axios.get(url, { ...axiosCfg, headers: mjHubHeaders });
     let rows = Array.isArray(res.data) ? res.data : [];
+    // Prefer available, but keep unavailable if that's all we have
+    const available = rows.filter((r) => r.is_available !== false && r.is_available !== 'false');
+    if (available.length) rows = available;
+
     if (serviceFilter) {
-      const q = String(serviceFilter).toLowerCase();
-      const code = SERVICE_MAP[q] || q;
+      const q = String(serviceFilter).toLowerCase().trim();
+      const code = (SERVICE_MAP[q] || q).toLowerCase();
       rows = rows.filter((r) => {
         const id = String(r.service_id || '').toLowerCase();
-        const name = String(r.service_name || '').toLowerCase();
-        return (
-          id === code ||
-          id === q ||
-          name.includes(q) ||
-          (code === 'wa' && (id === 'wa' || name.includes('whatsapp'))) ||
-          (code === 'tg' && (id === 'tg' || name.includes('telegram'))) ||
-          (code === 'go' && (id === 'go' || name.includes('google'))) ||
-          (code === 'ig' && (id === 'ig' || name.includes('instagram'))) ||
-          (code === 'fb' && (id === 'fb' || name.includes('facebook')))
-        );
+        const name = String(r.service_name || '').replace(/_/g, ' ').toLowerCase();
+        if (id === code || id === q) return true;
+        if (name === q || name === code) return true;
+        // Strict app matching — do NOT use startsWith('wa') (matches WAF etc.)
+        if (code === 'wa' || q === 'whatsapp') return id === 'wa' || name.includes('whatsapp');
+        if (code === 'tg' || q === 'telegram') return id === 'tg' || name.includes('telegram');
+        if (code === 'go' || q === 'google' || q === 'gmail') return id === 'go' || name.includes('google') || name.includes('gmail');
+        if (code === 'ig' || q === 'instagram') return id === 'ig' || name.includes('instagram');
+        if (code === 'fb' || q === 'facebook') return id === 'fb' || name.includes('facebook');
+        if (code === 'lf' || q === 'tiktok') return id === 'lf' || id === 'tk' || name.includes('tiktok');
+        if (code === 'fu' || q === 'snapchat') return id === 'fu' || id === 'sn' || name.includes('snapchat');
+        if (code === 'ds' || q === 'discord') return id === 'ds' || name.includes('discord');
+        return name.includes(q);
       });
     }
+
     return rows.map((r) => {
       const name = friendlyServiceName(r.service_id, r.service_name);
+      // Use EXACT website selling price — do not re-markup
+      const price = Math.ceil(Number(r.price) || 0);
       return {
         service_id: String(r.service_id),
         service_name: name,
         variant: detectVariant(name, r.service_id),
         stock: Number(r.available_quantity) || 0,
-        price_ngn: Math.ceil(Number(r.price) || 0),
+        price_ngn: price,
         price_usd: Number(r.supplier_price) || 0,
-        source: 'hub'
+        source: 'hub',
+        hub_id: r.id
       };
     }).filter((s) => s.price_ngn > 0);
   } catch (e) {
-    console.error('fetchHubServices', e.response?.status, e.response?.data || e.message);
+    console.error('fetchHubServices', e.response?.status, JSON.stringify(e.response?.data || e.message));
     return [];
   }
 }
@@ -314,12 +354,16 @@ async function fetchHubServices(countryId, serviceFilter) {
 async function getSellableServices(countryId, serviceFilter) {
   const hub = await fetchHubServices(countryId, serviceFilter);
   if (hub.length) {
-    // If filter left us empty variants but hub had data, still ok
+    console.log('[prices] using MJ HUB number_services', countryId, serviceFilter, hub.length, 'rows', hub.map(h => h.service_id + ':' + h.price_ngn).join(','));
     return hub;
   }
+  // Fallback only if Hub catalog empty for this country/app
+  console.warn('[prices] HUB empty — falling back to live Grizzly markup', countryId, serviceFilter);
   let live = await grizzlyPrices(countryId);
   if (serviceFilter) live = matchServices(live, serviceFilter);
-  return live;
+  // Website floor: never sell below ₦1000 on fallback path
+  const MIN_SALE = Number(process.env.MIN_NUMBER_PRICE_NGN) || 1000;
+  return live.map((s) => ({ ...s, price_ngn: Math.max(MIN_SALE, Number(s.price_ngn) || 0) }));
 }
 
 function optionButtons(countryId, services) {
@@ -976,8 +1020,8 @@ function matchServices(list, query) {
       name.includes(q) ||
       id.includes(code) ||
       // WhatsApp family: wa, wa_*, etc.
-      (code === 'wa' && (id === 'wa' || id.startsWith('wa') || name.includes('whatsapp'))) ||
-      (code === 'tg' && (id === 'tg' || id.startsWith('tg') || name.includes('telegram'))) ||
+      (code === 'wa' && (id === 'wa' || name.includes('whatsapp'))) ||
+      (code === 'tg' && (id === 'tg' || name.includes('telegram'))) ||
       (code === 'go' && (id === 'go' || name.includes('google') || name.includes('gmail'))) ||
       (code === 'ig' && (id === 'ig' || name.includes('instagram'))) ||
       (code === 'fb' && (id === 'fb' || name.includes('facebook')))
@@ -1182,11 +1226,13 @@ bot.action(/^opt:(\d+):([^:]+):(\d+)$/, async (ctx) => {
   session.last_options = null;
   await saveUserSession(userId, session);
 
+  const phone = String(bought.number || '');
   await ctx.reply(
-    `Number ready ✅\n📞 \`${bought.number}\`\n🆔 \`${bought.order_id}\`\n\nUse am for the app to request OTP.\nWhen you ready, tap Check.`,
+    `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n\nUse am for the app to request OTP.\nWhen you ready, tap Check.`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
+        [{ text: '📋 Copy number', copy_text: { text: phone } }],
         [Markup.button.callback('Check SMS code', `chk:${bought.order_id}:${price}`)],
         [Markup.button.callback('Cancel + refund', `can:${bought.order_id}:${price}`)]
       ])
@@ -1227,11 +1273,13 @@ bot.action(/^buy:(\d+):([^:]+):(\d+)$/, async (ctx) => {
   session.orders = [...(session.orders || []), order].slice(-30);
   await saveUserSession(userId, session);
 
+  const phone = String(bought.number || '');
   await ctx.reply(
-    `Number ready\n📞 \`${bought.number}\`\n🆔 \`${bought.order_id}\`\n\nTap below when the SMS arrives (or every ~10s).`,
+    `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n\nTap below when the SMS arrives.`,
     {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
+        [{ text: '📋 Copy number', copy_text: { text: phone } }],
         [Markup.button.callback('Check SMS code', `chk:${bought.order_id}:${price}`)],
         [Markup.button.callback('Cancel + refund', `can:${bought.order_id}:${price}`)]
       ])
