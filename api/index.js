@@ -261,6 +261,80 @@ async function grizzlyPrices(countryId) {
   }
 }
 
+
+// Pull selling prices from MJ HUB website catalog (number_services)
+async function fetchHubServices(countryId, serviceFilter) {
+  if (!SUPABASE_REST_URL || !SUPABASE_SERVICE_KEY) return [];
+  try {
+    let url =
+      `${SUPABASE_REST_URL}/number_services?select=service_id,service_name,country_id,country_name,price,available_quantity,is_available,supplier_price` +
+      `&country_id=eq.${encodeURIComponent(countryId)}` +
+      `&is_available=eq.true` +
+      `&price=gt.0` +
+      `&order=price.asc` +
+      `&limit=80`;
+    const res = await axios.get(url, { ...axiosCfg, headers: sbHeaders });
+    let rows = Array.isArray(res.data) ? res.data : [];
+    if (serviceFilter) {
+      const q = String(serviceFilter).toLowerCase();
+      const code = SERVICE_MAP[q] || q;
+      rows = rows.filter((r) => {
+        const id = String(r.service_id || '').toLowerCase();
+        const name = String(r.service_name || '').toLowerCase();
+        return (
+          id === code ||
+          id === q ||
+          name.includes(q) ||
+          (code === 'wa' && (id === 'wa' || name.includes('whatsapp'))) ||
+          (code === 'tg' && (id === 'tg' || name.includes('telegram'))) ||
+          (code === 'go' && (id === 'go' || name.includes('google'))) ||
+          (code === 'ig' && (id === 'ig' || name.includes('instagram'))) ||
+          (code === 'fb' && (id === 'fb' || name.includes('facebook')))
+        );
+      });
+    }
+    return rows.map((r) => {
+      const name = friendlyServiceName(r.service_id, r.service_name);
+      return {
+        service_id: String(r.service_id),
+        service_name: name,
+        variant: detectVariant(name, r.service_id),
+        stock: Number(r.available_quantity) || 0,
+        price_ngn: Math.ceil(Number(r.price) || 0),
+        price_usd: Number(r.supplier_price) || 0,
+        source: 'hub'
+      };
+    }).filter((s) => s.price_ngn > 0);
+  } catch (e) {
+    console.error('fetchHubServices', e.response?.status, e.response?.data || e.message);
+    return [];
+  }
+}
+
+// Prefer MJ HUB catalog prices; fall back to live Grizzly + markup
+async function getSellableServices(countryId, serviceFilter) {
+  const hub = await fetchHubServices(countryId, serviceFilter);
+  if (hub.length) {
+    // If filter left us empty variants but hub had data, still ok
+    return hub;
+  }
+  let live = await grizzlyPrices(countryId);
+  if (serviceFilter) live = matchServices(live, serviceFilter);
+  return live;
+}
+
+function optionButtons(countryId, services) {
+  // Telegram inline keyboard: 1 option per row for clarity (Normal vs Virtual)
+  const rows = services.slice(0, 8).map((s) => {
+    const label = `${s.variant === 'virtual' ? '👻 Virtual' : '📱 Normal'} · ${s.service_name} · ₦${Number(s.price_ngn).toLocaleString()}`;
+    // opt:countryId:serviceCode:price
+    const data = `opt:${countryId}:${s.service_id}:${s.price_ngn}`;
+    return [Markup.button.callback(label.slice(0, 64), data.slice(0, 64))];
+  });
+  rows.push([Markup.button.callback('⬅️ Cancel', 'opt:cancel')]);
+  return Markup.inlineKeyboard(rows);
+}
+
 async function grizzlyBuy(serviceId, countryId) {
   try {
     const raw = await grizzlyGet({
@@ -357,7 +431,7 @@ MJ SMS HOW E DEY WORK:
 
 NORMAL VS VIRTUAL / MULTIPLE OPTIONS (VERY IMPORTANT):
 - For some countries (especially USA and others), one app fit get more than one service option: Normal, Virtual, or alternate routes with different price and stock.
-- ANY time get_prices or buy_number return more than one option, you MUST list all options clear and ask the user to pick before buying.
+- ANY time get_prices or buy_number return more than one option, briefly list them AND tell the user to tap the buttons below (Normal / Virtual). Telegram will show tappable buttons. Wait for their pick before buy_number.
 - Format options simple, example:
   "USA WhatsApp get 2 options:
   1) Normal — ₦3,500 (stock 12)
@@ -582,60 +656,64 @@ async function executeGeminiFunction(fnName, args, telegramUserId, session) {
     case 'get_prices': {
       const c = resolveCountry(args.country);
       if (!c) return { error: `Unknown country "${args.country}". Ask the user to clarify or try list_countries.` };
-      let list = await grizzlyPrices(c.id);
+      const list = await getSellableServices(c.id, args.service || null);
       if (!list.length) return { error: `No services currently available for ${c.name}.` };
-      if (args.service) {
-        const filtered = matchServices(list, args.service);
-        if (filtered.length) list = filtered;
-      }
       session.country = c.name;
       session.countryId = c.id;
-      const services = list.slice(0, 15).map((s) => ({
+      session.last_options = list.slice(0, 8).map((s) => ({
         service_code: s.service_id,
         name: s.service_name,
         variant: s.variant || 'normal',
         price_ngn: s.price_ngn,
-        stock: s.stock
+        stock: s.stock,
+        country_id: c.id
       }));
-      // Flag when user must choose between options (e.g. normal vs virtual)
+      const services = session.last_options;
       const hasMultiple = services.length > 1;
       const hasVariants = new Set(services.map((s) => s.variant)).size > 1;
       return {
         country: c.name,
+        price_source: list[0]?.source === 'hub' ? 'MJ_HUB_catalog' : 'live_grizzly',
         must_choose: hasMultiple,
         has_normal_and_virtual: hasVariants,
         services,
         tip: hasMultiple
-          ? 'Show EVERY option with name, variant, price and stock. Ask user which one they want before buy_number. Prefer service_code when buying.'
-          : 'Only one option available for this filter.'
+          ? 'User will also see Telegram buttons to pick Normal/Virtual. Still list options briefly and wait for their pick. Do not buy yet.'
+          : 'Only one option — confirm once then buy if they agree.'
       };
     }
 
     case 'buy_number': {
       const c = resolveCountry(args.country);
       if (!c) return { error: `Unknown country "${args.country}".` };
-      const list = await grizzlyPrices(c.id);
+      const list = await getSellableServices(c.id, args.service || null);
       let svc = null;
-      // Prefer exact service_code if provided (user picked a specific option)
       if (args.service_code) {
         svc = list.find((s) => String(s.service_id).toLowerCase() === String(args.service_code).toLowerCase());
+        // If filter missed it, try full country list
+        if (!svc) {
+          const all = await getSellableServices(c.id, null);
+          svc = all.find((s) => String(s.service_id).toLowerCase() === String(args.service_code).toLowerCase());
+        }
       }
       if (!svc) {
-        const matched = matchServices(list, args.service || args.service_code);
+        const matched = args.service ? matchServices(list, args.service) : list;
         if (matched.length > 1 && !args.service_code) {
+          session.last_options = matched.slice(0, 8).map((s) => ({
+            service_code: s.service_id,
+            name: s.service_name,
+            variant: s.variant,
+            price_ngn: s.price_ngn,
+            stock: s.stock,
+            country_id: c.id
+          }));
           return {
             error: 'multiple_options',
-            message: 'More than one option exists. Show options and ask user to pick before buying.',
-            options: matched.slice(0, 8).map((s) => ({
-              service_code: s.service_id,
-              name: s.service_name,
-              variant: s.variant,
-              price_ngn: s.price_ngn,
-              stock: s.stock
-            }))
+            message: 'More than one option exists. User should tap a button or tell you which one.',
+            options: session.last_options
           };
         }
-        svc = matched[0] || list.find((s) => String(s.service_id).toLowerCase() === String(args.service).toLowerCase());
+        svc = matched[0];
       }
       if (!svc) return { error: `"${args.service || args.service_code}" isn't available in ${c.name} right now.` };
 
@@ -963,6 +1041,60 @@ bot.command('fund', async (ctx) => {
 });
 
 // Buy callback: buy:countryId:serviceId:priceNgn
+bot.action('opt:cancel', async (ctx) => {
+  await ctx.answerCbQuery();
+  const session = await getUserSession(ctx.from.id);
+  session.last_options = null;
+  await saveUserSession(ctx.from.id, session);
+  await ctx.reply('Alright, cancelled. Wetin you need instead?');
+});
+
+bot.action(/^opt:(\d+):([^:]+):(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery('Buying…');
+  const countryId = ctx.match[1];
+  const serviceId = ctx.match[2];
+  const price = parseInt(ctx.match[3], 10) || 0;
+  const userId = ctx.from.id;
+  const session = await getUserSession(userId);
+
+  if (price > 0 && session.balance < price) {
+    return ctx.reply(
+      `Balance no reach. You need ₦${price.toLocaleString()}.\nYour balance: ₦${Number(session.balance || 0).toLocaleString()}.\n\nType /fund ${price} to top up.`
+    );
+  }
+
+  await ctx.reply('I dey grab the number… hold on.');
+  const bought = await grizzlyBuy(serviceId, countryId);
+  if (!bought.success) {
+    return ctx.reply(`E no work: ${bought.message || 'No number available. Try another option.'}`);
+  }
+
+  if (price > 0) session.balance = Math.max(0, session.balance - price);
+  const order = {
+    orderId: bought.order_id,
+    provider: 'grizzly',
+    serviceName: serviceId,
+    phoneNumber: bought.number,
+    price,
+    status: 'Waiting SMS',
+    date: new Date().toISOString()
+  };
+  session.orders = [...(session.orders || []), order].slice(-30);
+  session.last_options = null;
+  await saveUserSession(userId, session);
+
+  await ctx.reply(
+    `Number ready ✅\n📞 \`${bought.number}\`\n🆔 \`${bought.order_id}\`\n\nUse am for the app to request OTP.\nWhen you ready, tap Check.`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('Check SMS code', `chk:${bought.order_id}:${price}`)],
+        [Markup.button.callback('Cancel + refund', `can:${bought.order_id}:${price}`)]
+      ])
+    }
+  );
+});
+
 bot.action(/^buy:(\d+):([^:]+):(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from.id;
@@ -1088,9 +1220,28 @@ bot.on('text', async (ctx) => {
       }
     }
 
-    const sendOpts = payUrl
-      ? Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', payUrl)]])
-      : {};
+    let sendOpts = {};
+    if (payUrl) {
+      sendOpts = Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', payUrl)]]);
+    } else if (session.last_options && session.last_options.length > 1) {
+      const cid = session.last_options[0].country_id || session.countryId;
+      sendOpts = optionButtons(cid, session.last_options.map((o) => ({
+        service_id: o.service_code,
+        service_name: o.name,
+        variant: o.variant,
+        price_ngn: o.price_ngn
+      })));
+    } else if (session.last_options && session.last_options.length === 1) {
+      const o = session.last_options[0];
+      const cid = o.country_id || session.countryId;
+      sendOpts = Markup.inlineKeyboard([
+        [Markup.button.callback(
+          `✅ Buy ${o.name} · ₦${Number(o.price_ngn).toLocaleString()}`,
+          `opt:${cid}:${o.service_code}:${o.price_ngn}`.slice(0, 64)
+        )],
+        [Markup.button.callback('⬅️ Cancel', 'opt:cancel')]
+      ]);
+    }
     try {
       await ctx.reply(textOut, { parse_mode: 'Markdown', ...sendOpts });
     } catch (_) {
