@@ -72,6 +72,8 @@ const COUNTRY_MAP = {
   thailand: 52, th: 52,
   malaysia: 7, my: 7,
   australia: 175, au: 175,
+  belarus: 51, by: 51,
+
   japan: 182, jp: 182,
   'south korea': 103, korea: 103, kr: 103,
   uae: 95, dubai: 95, emirates: 95, 'united arab emirates': 95,
@@ -327,23 +329,67 @@ async function grizzlyCountries() {
   } catch (e) {
     console.error('grizzlyCountries', e.message);
   }
-  // Fallback: unique ids from COUNTRY_MAP
-  const byId = new Map();
+  // Fallback catalog when Grizzly getCountries is down (502 etc.)
+  // Names are searchable free-text; ids are SMS-Activate / Grizzly compatible.
+  const FALLBACK = [
+    [0,'Russia'],[1,'Ukraine'],[2,'Kazakhstan'],[3,'China'],[4,'Philippines'],
+    [5,'Myanmar'],[6,'Indonesia'],[7,'Malaysia'],[8,'Kenya'],[9,'Tanzania'],
+    [10,'Vietnam'],[11,'Kyrgyzstan'],[12,'USA'],[13,'Israel'],[14,'Hong Kong'],
+    [15,'Poland'],[16,'United Kingdom'],[17,'Madagascar'],[18,'Congo'],[19,'Nigeria'],
+    [20,'Macau'],[21,'Egypt'],[22,'India'],[23,'Ireland'],[24,'Cambodia'],
+    [25,'Laos'],[26,'Haiti'],[27,'Ivory Coast'],[28,'Gambia'],[29,'Serbia'],
+    [30,'Yemen'],[31,'South Africa'],[32,'Romania'],[33,'Colombia'],[34,'Estonia'],
+    [35,'Azerbaijan'],[36,'Canada'],[37,'Morocco'],[38,'Ghana'],[39,'Argentina'],
+    [40,'Uzbekistan'],[41,'Cameroon'],[42,'Chad'],[43,'Germany'],[44,'Lithuania'],
+    [45,'Croatia'],[46,'Sweden'],[47,'Iraq'],[48,'Netherlands'],[49,'Latvia'],
+    [50,'Austria'],[51,'Belarus'],[52,'Thailand'],[53,'Saudi Arabia'],[54,'Mexico'],
+    [55,'Taiwan'],[56,'Spain'],[57,'Iran'],[58,'Algeria'],[59,'Slovenia'],
+    [60,'Bangladesh'],[61,'Senegal'],[62,'Turkey'],[63,'Czech Republic'],[64,'Sri Lanka'],
+    [65,'Peru'],[66,'Pakistan'],[67,'New Zealand'],[68,'Guinea'],[69,'Mali'],
+    [70,'Venezuela'],[71,'Ethiopia'],[72,'Mongolia'],[73,'Brazil'],[74,'Afghanistan'],
+    [75,'Uganda'],[76,'Angola'],[77,'Cyprus'],[78,'France'],[79,'Papua New Guinea'],
+    [80,'Mozambique'],[81,'Nepal'],[82,'Belgium'],[83,'Bulgaria'],[84,'Hungary'],
+    [85,'Moldova'],[86,'Italy'],[87,'Paraguay'],[88,'Honduras'],[89,'Tunisia'],
+    [90,'Nicaragua'],[91,'Timor-Leste'],[92,'Bolivia'],[93,'Costa Rica'],[94,'Guatemala'],
+    [95,'UAE'],[96,'Zimbabwe'],[97,'Puerto Rico'],[98,'Sudan'],[99,'Togo'],
+    [100,'Kuwait'],[101,'El Salvador'],[102,'Libya'],[103,'South Korea'],[104,'Jamaica'],
+    [105,'Trinidad and Tobago'],[109,'Ecuador'],[114,'Lebanon'],[117,'Portugal'],
+    [129,'Greece'],[141,'Georgia'],[151,'Chile'],[163,'Finland'],[172,'Denmark'],
+    [173,'Switzerland'],[174,'Norway'],[175,'Australia'],[176,'Eritrea'],[179,'Niger'],
+    [182,'Japan'],[187,'USA'],[196,'Singapore']
+  ];
+  const byId = new Map(FALLBACK);
   for (const [name, id] of Object.entries(COUNTRY_MAP)) {
     if (name.length <= 2) continue;
     if (!byId.has(id)) byId.set(id, name);
   }
-  return [...byId.entries()].map(([id, name]) => ({ id, name }));
+  const list = [...byId.entries()].map(([id, name]) => ({ id, name: String(name) }));
+  console.log('[countries] using fallback list', list.length);
+  return list;
+}
+
+function isGrizzlyHubRow(r) {
+  // Strict: only MJ HUB rows that belong to Grizzly / Server 1 SMS — not log-domain / other servers
+  const blob = [
+    r.supplier, r.provider, r.server, r.domain, r.source, r.platform,
+    r.supplier_name, r.server_name, r.product_type, r.category
+  ].map((x) => String(x || '').toLowerCase()).join(' ');
+  if (!blob.trim()) return true; // no metadata → allow (legacy rows)
+  if (/log\s*domain|logdomain|server\s*2|hero|sms-?man|5sim|daisy/.test(blob)) return false;
+  if (/grizzly|server\s*1|server_1|server1/.test(blob)) return true;
+  // If metadata exists but doesn't look like another SMS supplier, keep
+  if (/log|account|boost/.test(blob) && !/grizzly|sms|number/.test(blob)) return false;
+  return true;
 }
 
 async function fetchHubPriceByServiceIds(countryId, serviceIds) {
   if (!MJ_HUB_REST_URL || !MJ_HUB_SERVICE_KEY) return new Map();
   const ids = [...new Set((serviceIds || []).map((s) => String(s).trim()).filter(Boolean))];
   if (!ids.length) return new Map();
-  const priceMap = new Map(); // key: service_id lower -> hub row
+  const priceMap = new Map(); // key: service_id lower -> ONE hub row (grizzly only)
+  // Request common supplier fields if present (PostgREST ignores unknown? use * safe subset)
   const select =
-    'id,service_id,service_name,country_id,country_name,price,available_quantity,is_available,supplier_price';
-  // Batch in chunks of 25 to keep URL reasonable
+    'id,service_id,service_name,country_id,country_name,price,available_quantity,is_available,supplier_price,supplier,server,domain,provider,source';
   for (let i = 0; i < ids.length; i += 25) {
     const chunk = ids.slice(i, i + 25);
     const inList = chunk.map((id) => `"${String(id).replace(/"/g, '')}"`).join(',');
@@ -353,26 +399,39 @@ async function fetchHubPriceByServiceIds(countryId, serviceIds) {
         `&country_id=eq.${encodeURIComponent(countryId)}` +
         `&service_id=in.(${inList})` +
         `&price=gt.0&order=price.asc&limit=100`;
-      let res = await axios.get(url, { ...axiosCfg, headers: mjHubHeaders });
+      let res;
+      try {
+        res = await axios.get(url, { ...axiosCfg, headers: mjHubHeaders });
+      } catch (colErr) {
+        // Table may not have supplier/server/domain columns — retry minimal select
+        const selectMin =
+          'id,service_id,service_name,country_id,country_name,price,available_quantity,is_available,supplier_price';
+        url =
+          `${MJ_HUB_REST_URL}/number_services?select=${selectMin}` +
+          `&country_id=eq.${encodeURIComponent(countryId)}` +
+          `&service_id=in.(${inList})` +
+          `&price=gt.0&order=price.asc&limit=100`;
+        res = await axios.get(url, { ...axiosCfg, headers: mjHubHeaders });
+      }
       let rows = Array.isArray(res.data) ? res.data : [];
+      rows = rows.filter(isGrizzlyHubRow);
       for (const r of rows) {
         if (r.is_available === false || r.is_available === 'false') continue;
         const sid = String(r.service_id || '').toLowerCase();
         const price = Math.ceil(Number(r.price) || 0);
         if (!(price > 0) || !sid) continue;
-        const prev = priceMap.get(sid);
-        if (!prev || price < prev.price_ngn) {
-          priceMap.set(sid, {
-            service_id: String(r.service_id),
-            service_name: friendlyServiceName(r.service_id, r.service_name),
-            price_ngn: price,
-            stock: Number(r.available_quantity) || 0,
-            price_usd: Number(r.supplier_price) || 0,
-            hub_id: r.id,
-            country_name: r.country_name || null,
-            source: 'hub'
-          });
-        }
+        // One price per service_id only (first = cheapest due to order=price.asc)
+        if (priceMap.has(sid)) continue;
+        priceMap.set(sid, {
+          service_id: String(r.service_id),
+          service_name: friendlyServiceName(r.service_id, r.service_name),
+          price_ngn: price,
+          stock: Number(r.available_quantity) || 0,
+          price_usd: Number(r.supplier_price) || 0,
+          hub_id: r.id,
+          country_name: r.country_name || null,
+          source: 'hub'
+        });
       }
     } catch (e) {
       console.error('fetchHubPriceByServiceIds', e.response?.status, e.message);
@@ -593,13 +652,35 @@ async function getSellableServices(countryId, serviceFilter) {
   });
 
   const hubCount = out.filter((s) => s.source === 'hub').length;
-  const deduped = dedupeServices(out);
+  let deduped = dedupeServices(out);
+
+  // If user asked for a specific app, keep primary service_id + real variants only
+  if (serviceFilter) {
+    const code = (SERVICE_MAP[String(serviceFilter).toLowerCase().trim()] || '').toLowerCase();
+    if (code) {
+      const primary = deduped.filter((s) => String(s.service_id).toLowerCase() === code);
+      const variants = deduped.filter((s) => {
+        const id = String(s.service_id).toLowerCase();
+        const name = String(s.service_name).toLowerCase();
+        if (id === code) return false;
+        return (
+          new RegExp(`^${code}_`).test(id) ||
+          /virtual|voip|alternate/.test(name) ||
+          /virtual|voip|alternate/.test(id)
+        );
+      });
+      if (primary.length || variants.length) {
+        deduped = dedupeServices([...primary, ...variants]);
+      }
+    }
+  }
+
   console.log(
-    '[prices] grizzly services',
+    '[prices] grizzly-only catalog',
     live.length,
-    '| after dedupe',
+    '| final',
     deduped.length,
-    '| hub matched by service_id',
+    '| hub price overlay',
     hubCount,
     '| country',
     countryId,
@@ -1668,7 +1749,7 @@ bot.action(/^opt:(\d+):([^:]+):(\d+)$/, async (ctx) => {
   await ctx.reply('I dey grab the number… hold on.');
   const bought = await grizzlyBuy(serviceId, countryId);
   if (!bought.success) {
-    return ctx.reply(`E no work: ${bought.message || 'No number available. Try another option.'}`);
+    return ctx.reply(/502|503|gateway|unreachable|timeout/i.test(String(bought.message || '')) ? 'Supplier temporarily unavailable. Abeg try again in a few minutes.' : `E no work: ${bought.message || 'No number available. Try another option.'}`);
   }
 
   if (price > 0) session.balance = Math.max(0, session.balance - price);
