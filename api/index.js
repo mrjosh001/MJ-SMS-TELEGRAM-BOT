@@ -195,6 +195,8 @@ const bot = new Telegraf(BOT_TOKEN || 'missing');
 
 // Fallback store when Supabase session save fails (400/404)
 const pendingPayments = new Map(); // telegramUserId -> { reference, amount_ngn, authorization_url }
+/** In-memory session mirror — survives when Supabase patch fails mid-request */
+const sessionMem = new Map(); // userId string -> session object
 /** In-memory intent (survives within warm serverless instance; backed by Supabase too) */
 const pendingIntent = new Map(); // userId -> { service, countryId, countryName, at }
 
@@ -262,16 +264,21 @@ function markupNgn(usdPrice) {
 }
 
 async function getUserSession(userId) {
+  const uid = String(userId);
   const empty = {
     balance: 0,
     state: 'AWAITING_INPUT',
     country: null,
     countryId: null,
     serviceQuery: null,
+    pendingService: null,
     orders: [],
     conversation: []
   };
-  if (!SUPABASE_REST_URL || !SUPABASE_SERVICE_KEY) return empty;
+  const mem = sessionMem.get(uid);
+  if (!SUPABASE_REST_URL || !SUPABASE_SERVICE_KEY) {
+    return mem ? { ...empty, ...mem } : empty;
+  }
   try {
     const res = await axios.get(
       `${SUPABASE_REST_URL}/user_sessions?user_id=eq.${userId}&select=*`,
@@ -282,7 +289,7 @@ async function getUserSession(userId) {
       const allOrders = row.orders || [];
       const meta = allOrders.find((o) => o && (o.type === '_meta' || o.type === '_payment_meta')) || {};
       const orders = allOrders.filter((o) => o && o.type !== '_meta' && o.type !== '_payment_meta');
-      return {
+      const fromDb = {
         balance: parseFloat(row.balance || 0),
         state: row.state || 'AWAITING_INPUT',
         country: row.country || null,
@@ -294,18 +301,42 @@ async function getUserSession(userId) {
         pending_payment: meta.pending_payment || null,
         last_credited_reference: meta.last_credited_reference || null
       };
+      // Prefer recent in-memory balance/state if DB lag/fail
+      if (mem) {
+        if (mem._balUpdatedAt && Date.now() - mem._balUpdatedAt < 180000) {
+          fromDb.balance = money(mem.balance);
+        }
+        if (mem._stateUpdatedAt && Date.now() - mem._stateUpdatedAt < 180000 && mem.state) {
+          fromDb.state = mem.state;
+        }
+      }
+      sessionMem.set(uid, { ...fromDb, _balUpdatedAt: mem?._balUpdatedAt, _stateUpdatedAt: mem?._stateUpdatedAt });
+      return fromDb;
     }
-  } catch (_) {}
+  } catch (e) {
+    console.error('getUserSession', e.message);
+    if (mem) return { ...empty, ...mem };
+  }
+  if (mem) return { ...empty, ...mem };
   await saveUserSession(userId, empty);
   return empty;
 }
 
 async function saveUserSession(userId, session) {
+  const uid = String(userId);
+  // Always keep memory mirror so fund state + debit work even if DB fails
+  sessionMem.set(uid, {
+    ...session,
+    balance: money(session.balance),
+    state: session.state || 'AWAITING_INPUT',
+    _balUpdatedAt: Date.now(),
+    _stateUpdatedAt: Date.now()
+  });
+
   if (!SUPABASE_REST_URL || !SUPABASE_SERVICE_KEY) {
-    console.error('saveUserSession: missing SUPABASE env');
-    return false;
+    console.error('saveUserSession: missing SUPABASE env — memory only');
+    return true;
   }
-  // Only columns that exist on user_sessions. conversation column is NOT in schema.
   const orders = [...(session.orders || [])].filter((o) => o && o.type !== '_meta');
   const pending = session.pendingService || session.serviceQuery || null;
   orders.push({
@@ -316,12 +347,12 @@ async function saveUserSession(userId, session) {
     conversation: (session.conversation || []).slice(-8)
   });
   const payload = {
-    user_id: String(userId),
+    user_id: uid,
     balance: money(session.balance),
-    state: session.state || 'AWAITING_INPUT',
-    country: session.country || null,
-    country_id: session.countryId || null,
-    selected_service_query: pending,
+    state: String(session.state || 'AWAITING_INPUT').slice(0, 64),
+    country: session.country ? String(session.country).slice(0, 64) : null,
+    country_id: session.countryId != null ? String(session.countryId) : null,
+    selected_service_query: pending ? String(pending).slice(0, 128) : null,
     orders,
     updated_at: new Date().toISOString()
   };
@@ -331,11 +362,21 @@ async function saveUserSession(userId, session) {
       { ...axiosCfg, headers: sbHeaders }
     );
     if (existing.data && existing.data.length) {
-      await axios.patch(
-        `${SUPABASE_REST_URL}/user_sessions?user_id=eq.${userId}`,
-        payload,
-        { ...axiosCfg, headers: sbHeaders }
-      );
+      try {
+        await axios.patch(
+          `${SUPABASE_REST_URL}/user_sessions?user_id=eq.${userId}`,
+          payload,
+          { ...axiosCfg, headers: sbHeaders }
+        );
+      } catch (e1) {
+        console.error('saveUserSession full patch', e1.response?.status, e1.response?.data || e1.message);
+        // Fallback: balance + state only
+        await axios.patch(
+          `${SUPABASE_REST_URL}/user_sessions?user_id=eq.${userId}`,
+          { balance: payload.balance, state: payload.state, updated_at: payload.updated_at },
+          { ...axiosCfg, headers: sbHeaders }
+        );
+      }
     } else {
       await axios.post(`${SUPABASE_REST_URL}/user_sessions`, payload, {
         ...axiosCfg,
@@ -345,7 +386,8 @@ async function saveUserSession(userId, session) {
     return true;
   } catch (e) {
     console.error('saveUserSession', e.response?.status, e.response?.data || e.message);
-    return false;
+    // Memory holds the truth — allow debit/fund to continue
+    return true;
   }
 }
 
@@ -1619,8 +1661,8 @@ async function callGeminiWithTools(session, telegramUserId, userText) {
 
 async function parseCountryService(text) {
   const original = String(text || '').trim();
-  // Pure digits = fund amount / order id, not a country
-  if (/^[\d,.\s₦]+$/i.test(original)) {
+  // Pure digits / amounts = not a country
+  if (/^[\d,.\s₦k]+$/i.test(original) || parseNairaAmount(original) >= 1000) {
     return { countryId: null, countryName: null, serviceCode: null, serviceName: null };
   }
   const t = original.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -1629,18 +1671,18 @@ async function parseCountryService(text) {
   let serviceCode = null;
   let serviceName = null;
 
-  // Services first (so "WhatsApp" doesn't get eaten as a country fragment)
+  // Services first
   const serviceEntries = Object.entries(SERVICE_MAP).sort((a, b) => b[0].length - a[0].length);
   for (const [name, code] of serviceEntries) {
     if (name.length < 2) continue;
-    if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\b`).test(t)) {
+    if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\b`, 'i').test(t)) {
       serviceCode = code;
       serviceName = name;
       break;
     }
   }
 
-  // Free-search country against full live Grizzly list
+  // ALIASES FIRST (usa, uk, ng…) — never let fuzzy live names steal "USA" → wrong country
   try {
     const live = await grizzlyCountries();
     const ranked = [...live]
@@ -1648,26 +1690,26 @@ async function parseCountryService(text) {
       .filter((c) => c.n.length >= 2)
       .sort((a, b) => b.n.length - a.n.length);
 
-    // Prefer multi-word country names present in the message
-    for (const c of ranked) {
-      if (c.n.length < 3 && c.n.length !== 2) continue;
-      const re = new RegExp(`\\b${c.n.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\b`);
-      if (re.test(t)) {
-        countryId = c.id;
-        countryName = c.name;
+    const aliasEntries = Object.entries(COUNTRY_MAP).sort((a, b) => b[0].length - a[0].length);
+    for (const [name, id] of aliasEntries) {
+      if (name.length < 2) continue;
+      // Require whole-word match; "us" only if exact word not inside "usa"
+      if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\b`, 'i').test(t)) {
+        countryId = id;
+        const liveHit = ranked.find((c) => Number(c.id) === Number(id));
+        countryName = liveHit ? liveHit.name : name.toUpperCase() === 'USA' ? 'USA' : name;
         break;
       }
     }
 
-    // If still nothing, try alias map only as helper (ng, uk, usa…)
+    // Live names only if alias missed
     if (countryId == null) {
-      const aliasEntries = Object.entries(COUNTRY_MAP).sort((a, b) => b[0].length - a[0].length);
-      for (const [name, id] of aliasEntries) {
-        if (name.length < 2) continue;
-        if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\b`).test(t)) {
-          countryId = id;
-          const liveHit = ranked.find((c) => c.id === id);
-          countryName = liveHit ? liveHit.name : name;
+      for (const c of ranked) {
+        if (c.n.length < 3) continue; // skip 2-letter fuzzy
+        const re = new RegExp(`\\b${c.n.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\b`, 'i');
+        if (re.test(t)) {
+          countryId = c.id;
+          countryName = c.name;
           break;
         }
       }
@@ -2405,27 +2447,35 @@ function looksLikeChitchat(text) {
 async function resolveCountryStrict(text) {
   const raw = String(text || '').trim();
   if (!raw || raw.length > 48) return null;
-  // Don't treat questions / chat as countries
   if (/[?]/.test(raw) || looksLikeChitchat(raw)) return null;
   if (detectServiceOnly(raw)) return null;
-  // Pure numbers are fund amounts or order ids — never country names
-  // (country ids exist, but users type names; numeric-only caused "Checking 3000")
-  if (/^[\d,.\s₦nairaNGN]+$/i.test(raw)) return null;
+  if (/^[\d,.\s₦nairaNGNk]+$/i.test(raw) || parseNairaAmount(raw) >= 1000) return null;
 
-  const words = raw
+  const t = raw
     .toLowerCase()
     .replace(/[^a-z\s]/g, ' ')
     .replace(/\s+/g, ' ')
-    .trim()
-    .split(' ')
-    .filter(Boolean);
-  // Short 2-letter codes only if the whole message is that code
+    .trim();
+  const words = t.split(' ').filter(Boolean);
+
+  // Alias map first (usa, nigeria, uk…) — whole-word
+  const aliasEntries = Object.entries(COUNTRY_MAP).sort((a, b) => b[0].length - a[0].length);
+  for (const [name, id] of aliasEntries) {
+    if (name.length < 2) continue;
+    if (words.length === 1 && words[0].length <= 2 && name.length > 2) continue;
+    if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\b`).test(t)) {
+      const live = await grizzlyCountries();
+      const hit = live.find((c) => Number(c.id) === Number(id));
+      return { id, name: asName(hit?.name) || (name === 'usa' ? 'USA' : name) };
+    }
+  }
+
   if (words.length === 1 && words[0].length <= 2) {
     const key = words[0];
     if (key in COUNTRY_MAP) {
       const id = COUNTRY_MAP[key];
       const live = await grizzlyCountries();
-      const hit = live.find((c) => c.id === id);
+      const hit = live.find((c) => Number(c.id) === Number(id));
       return { id, name: asName(hit?.name) || key };
     }
   }
@@ -2784,9 +2834,13 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
   const pendingCountryId = session.countryId || null;
   const pendingCountryName = session.country || null;
 
-  // --- One-shot: country + service together ---
+  // --- One-shot: country + service together (always wins over stuck session country) ---
   const parsed = await parseCountryService(textMsg);
   if (parsed.countryId && (parsed.serviceName || parsed.serviceCode)) {
+    // Clear stale Germany/etc. when user names a new country
+    session.countryId = parsed.countryId;
+    session.country = parsed.countryName;
+    session.state = 'AWAITING_INPUT';
     return miraShowPricesAndConfirm(
       ctx,
       session,
@@ -2800,6 +2854,8 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
   // Country message while we already have a pending service → process
   const countryGuess = await resolveCountryStrict(textMsg);
   if (countryGuess && pendingSvc) {
+    session.countryId = countryGuess.id;
+    session.country = countryGuess.name;
     return miraShowPricesAndConfirm(
       ctx,
       session,
@@ -2810,13 +2866,13 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
     );
   }
 
-  // Service message while we already have a country → process
+  // Service only while we already have a country (no country word in this message)
   const svcGuess =
     detectServiceOnly(textMsg) ||
     (parsed.serviceName && isRealServiceName(parsed.serviceName)
       ? { serviceName: parsed.serviceName, serviceCode: parsed.serviceCode }
       : null);
-  if (svcGuess && pendingCountryId) {
+  if (svcGuess && pendingCountryId && !parsed.countryId) {
     return miraShowPricesAndConfirm(
       ctx,
       session,
@@ -2959,52 +3015,53 @@ bot.on('text', async (ctx) => {
     );
   }
 
-  // --- FUND WALLET amount (after /fund, Fund button, or "fund my wallet") ---
-  // Also accept bare amounts like 2k / 5000 if user clearly just got asked to fund
+  // --- FUND WALLET amount (after /fund or bare 2k/5k) ---
   const isFundAmountState = session.state === 'AWAITING_FUND_AMOUNT';
   const looksLikeOnlyAmount =
     /^(?:₦|ngn|naira)?\s*\d+(?:[.,]\d+)?\s*k?\s*$/i.test(textMsg.trim()) ||
     /^\d+(?:[.,]\d+)?\s*(?:k|thousand)\s*$/i.test(textMsg.trim());
+  const bareFundAmount = looksLikeOnlyAmount ? parseNairaAmount(textMsg) : 0;
 
-  if (isFundAmountState || (looksLikeOnlyAmount && session.pending_payment == null && parseNairaAmount(textMsg) >= 1000)) {
-    // If bare amount without state, only treat as fund if previous bot message was about funding
-    // — we rely on AWAITING_FUND_AMOUNT primarily; bare amount alone is OK when state set
-    if (isFundAmountState || session.state === 'AWAITING_FUND_AMOUNT') {
-      const amount = parseNairaAmount(textMsg);
-      if (amount < 1000) {
-        return ctx.reply('Minimum na ₦1,000. Type *2k*, *5k* or *5000*.', {
-          parse_mode: 'Markdown'
-        });
-      }
-      if (amount > 200000) {
-        return ctx.reply('Maximum na ₦200,000 for one payment. Example: *50k*', {
-          parse_mode: 'Markdown'
-        });
-      }
-      const init = await paystackInitialize(amount, userId, null);
-      if (!init.success) {
-        session.state = 'AWAITING_INPUT';
-        await saveUserSession(userId, session);
-        return ctx.reply(init.message || 'Paystack no gree right now. Try /fund again later.');
-      }
-      const pending = {
-        reference: init.reference,
-        amount_ngn: init.amount_ngn,
-        authorization_url: init.authorization_url,
-        created_at: new Date().toISOString()
-      };
-      session.pending_payment = pending;
-      session.state = 'AWAITING_INPUT';
-      pendingPayments.set(String(userId), pending);
+  // Accept amount if we're waiting OR user sent only an amount (2k / 5000) in valid range
+  if (isFundAmountState || (bareFundAmount >= 1000 && bareFundAmount <= 200000)) {
+    const amount = isFundAmountState ? parseNairaAmount(textMsg) : bareFundAmount;
+    if (amount < 1000) {
+      session.state = 'AWAITING_FUND_AMOUNT';
       await saveUserSession(userId, session);
-      return ctx.reply(
-        `Top up *₦${init.amount_ngn.toLocaleString()}*\n\nTap *Pay* below.\nWhen e successful, type: *I don pay*`,
-        {
-          parse_mode: 'Markdown',
-          ...Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', init.authorization_url)]])
-        }
-      );
+      return ctx.reply('Minimum na ₦1,000. Type *2k*, *5k* or *5000*.', {
+        parse_mode: 'Markdown'
+      });
     }
+    if (amount > 200000) {
+      session.state = 'AWAITING_FUND_AMOUNT';
+      await saveUserSession(userId, session);
+      return ctx.reply('Maximum na ₦200,000 for one payment. Example: *50k*', {
+        parse_mode: 'Markdown'
+      });
+    }
+    const init = await paystackInitialize(amount, userId, null);
+    if (!init.success) {
+      session.state = 'AWAITING_INPUT';
+      await saveUserSession(userId, session);
+      return ctx.reply(init.message || 'Paystack no gree right now. Try /fund again later.');
+    }
+    const pending = {
+      reference: init.reference,
+      amount_ngn: init.amount_ngn,
+      authorization_url: init.authorization_url,
+      created_at: new Date().toISOString()
+    };
+    session.pending_payment = pending;
+    session.state = 'AWAITING_INPUT';
+    pendingPayments.set(String(userId), pending);
+    await saveUserSession(userId, session);
+    return ctx.reply(
+      `Top up *₦${init.amount_ngn.toLocaleString()}*\n\nTap *Pay* below.\nWhen e successful, type: *I don pay*`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', init.authorization_url)]])
+      }
+    );
   }
 
   // Fund intent BEFORE Gemini — Gemini was asking for amount without setting state
