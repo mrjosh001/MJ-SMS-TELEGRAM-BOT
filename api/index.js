@@ -674,9 +674,47 @@ async function grizzlyStatus(orderId) {
 }
 
 async function grizzlyCancel(orderId) {
+  // Grizzly / SMS-Activate: status 8 = cancel activation
+  // Success response: ACCESS_CANCEL
+  // Common failures: NO_ACTIVATION, BAD_STATUS, EARLY_CANCEL_DENIED (often < ~2 min)
+  if (!orderId) {
+    return { success: false, message: 'Missing order id', raw: '' };
+  }
   try {
-    await grizzlyGet({ action: 'setStatus', id: orderId, status: 8 });
-  } catch (_) {}
+    const raw = await grizzlyGet({
+      action: 'setStatus',
+      id: String(orderId).trim(),
+      status: '8'
+    });
+    const text = typeof raw === 'string' ? raw.trim() : JSON.stringify(raw || '');
+    console.log('[cancel]', orderId, text);
+    if (/ACCESS_CANCEL/i.test(text)) {
+      return { success: true, message: 'Cancelled at supplier', raw: text };
+    }
+    if (/EARLY_CANCEL|TOO_EARLY|WAIT/i.test(text)) {
+      return {
+        success: false,
+        early: true,
+        message: 'Too early to cancel. Wait about 2 minutes after buying, then try again.',
+        raw: text
+      };
+    }
+    if (/NO_ACTIVATION/i.test(text)) {
+      return { success: false, message: 'Supplier has no record of this order.', raw: text };
+    }
+    if (/BAD_STATUS|STATUS_CANCEL|already/i.test(text)) {
+      // Already cancelled on supplier — treat as success so wallet can refund once
+      return { success: true, message: 'Already cancelled at supplier', raw: text };
+    }
+    return {
+      success: false,
+      message: 'Could not cancel this order right now. Try again shortly.',
+      raw: text
+    };
+  } catch (e) {
+    console.error('grizzlyCancel', e.message);
+    return { success: false, message: 'Supplier unreachable. Try again in a few minutes.', raw: e.message || '' };
+  }
 }
 
 async function grizzlyBalance() {
@@ -1109,16 +1147,34 @@ async function executeGeminiFunction(fnName, args, telegramUserId, session) {
       const orderId = args.order_id || (session.orders || []).slice(-1)[0]?.orderId;
       if (!orderId) return { error: 'No recent order found for this customer.' };
       const order = (session.orders || []).find((o) => String(o.orderId) === String(orderId));
-      await grizzlyCancel(orderId);
+      if (order && /cancelled/i.test(order.status || '')) {
+        return { order_id: orderId, already_cancelled: true, balance_ngn: session.balance };
+      }
+      const result = await grizzlyCancel(orderId);
+      if (!result.success) {
+        return {
+          error: result.message,
+          early: !!result.early,
+          order_id: orderId,
+          message: result.early
+            ? result.message
+            : 'Cancel failed at supplier. Do NOT tell user they were refunded.'
+        };
+      }
       let refunded = 0;
-      if (order && order.price > 0 && !/cancelled/i.test(order.status || '')) {
+      if (order && order.price > 0) {
         refunded = order.price;
-        session.balance += refunded;
+        session.balance = (Number(session.balance) || 0) + refunded;
       }
       session.orders = (session.orders || []).map((o) =>
         String(o.orderId) === String(orderId) ? { ...o, status: 'Cancelled' } : o
       );
-      return { order_id: orderId, refunded_ngn: refunded, new_balance_ngn: session.balance };
+      return {
+        success: true,
+        order_id: orderId,
+        refunded_ngn: refunded,
+        new_balance_ngn: session.balance
+      };
     }
 
     case 'get_balance':
@@ -1707,19 +1763,40 @@ bot.action(/^chk:([^:]+):(\d+)$/, async (ctx) => {
 });
 
 bot.action(/^can:([^:]+):(\d+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
+  await ctx.answerCbQuery('Cancelling…');
   const orderId = ctx.match[1];
   const price = parseInt(ctx.match[2], 10) || 0;
-  await grizzlyCancel(orderId);
-  if (price > 0) {
-    const session = await getUserSession(ctx.from.id);
-    session.balance += price;
-    session.orders = (session.orders || []).map((o) =>
-      String(o.orderId) === String(orderId) ? { ...o, status: 'Cancelled' } : o
-    );
-    await saveUserSession(ctx.from.id, session);
+  const session = await getUserSession(ctx.from.id);
+  const order = (session.orders || []).find((o) => String(o.orderId) === String(orderId));
+
+  // Already cancelled locally — don't double-refund
+  if (order && /cancelled/i.test(order.status || '')) {
+    return ctx.reply('This order already cancelled.');
   }
-  await ctx.reply(price > 0 ? `Cancelled. ₦${price} refunded.` : 'Cancelled.');
+
+  const result = await grizzlyCancel(orderId);
+  if (!result.success) {
+    return ctx.reply(
+      result.early
+        ? result.message
+        : `${result.message}\n\nNo refund yet — order still active on supplier.`
+    );
+  }
+
+  let refunded = 0;
+  if (price > 0) {
+    refunded = price;
+    session.balance = (Number(session.balance) || 0) + price;
+  }
+  session.orders = (session.orders || []).map((o) =>
+    String(o.orderId) === String(orderId) ? { ...o, status: 'Cancelled' } : o
+  );
+  await saveUserSession(ctx.from.id, session);
+  await ctx.reply(
+    refunded > 0
+      ? `Cancelled ✅\n₦${refunded.toLocaleString()} refunded.\nBalance: ₦${Number(session.balance).toLocaleString()}`
+      : 'Cancelled ✅'
+  );
 });
 
 bot.on('text', async (ctx) => {
