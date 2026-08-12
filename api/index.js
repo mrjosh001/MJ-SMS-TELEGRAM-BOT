@@ -42,6 +42,8 @@ const USD_TO_NGN = Number(process.env.USD_TO_NGN_RATE) || 1500;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || process.env.PAYSTACK_SECRET || process.env.PAYSTACK_SECRET_KEY_LIVE || '';
 const ADMIN_TELEGRAM_ID = process.env.ADMIN_TELEGRAM_ID || '7466363018';
+// Grizzly blocks cancel shortly after getNumber (often ~2 min). Use 3 min default; override with MIN_CANCEL_SECONDS.
+const MIN_CANCEL_MS = (Number(process.env.MIN_CANCEL_SECONDS) || 180) * 1000;
 
 // Common Grizzly / SMS-Activate style country ids
 const COUNTRY_MAP = {
@@ -776,7 +778,7 @@ async function grizzlyCancel(orderId) {
       return {
         success: false,
         early: true,
-        message: 'Too early to cancel. Wait about 2 minutes after buying, then try again.',
+        message: 'Too early to cancel. Wait a few more minutes after buying, then try again.',
         raw: text
       };
     }
@@ -796,6 +798,24 @@ async function grizzlyCancel(orderId) {
     console.error('grizzlyCancel', e.message);
     return { success: false, message: 'Supplier unreachable. Try again in a few minutes.', raw: e.message || '' };
   }
+}
+
+
+function cancelWaitInfo(order) {
+  const boughtAt = order?.date || order?.created_at || order?.bought_at || null;
+  if (!boughtAt) return { allowed: true, waitMs: 0, waitSec: 0 };
+  const elapsed = Date.now() - new Date(boughtAt).getTime();
+  if (!Number.isFinite(elapsed) || elapsed < 0) return { allowed: true, waitMs: 0, waitSec: 0 };
+  if (elapsed >= MIN_CANCEL_MS) return { allowed: true, waitMs: 0, waitSec: 0 };
+  const waitMs = MIN_CANCEL_MS - elapsed;
+  return { allowed: false, waitMs, waitSec: Math.ceil(waitMs / 1000) };
+}
+
+function formatWait(sec) {
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  if (m <= 0) return `${s}s`;
+  return s ? `${m}m ${s}s` : `${m}m`;
 }
 
 async function grizzlyBalance() {
@@ -1230,6 +1250,16 @@ async function executeGeminiFunction(fnName, args, telegramUserId, session) {
       const order = (session.orders || []).find((o) => String(o.orderId) === String(orderId));
       if (order && /cancelled/i.test(order.status || '')) {
         return { order_id: orderId, already_cancelled: true, balance_ngn: session.balance };
+      }
+      const wait = cancelWaitInfo(order);
+      if (!wait.allowed) {
+        return {
+          error: 'too_early',
+          early: true,
+          wait_seconds: wait.waitSec,
+          order_id: orderId,
+          message: `Too early to cancel. Tell user to wait about ${formatWait(wait.waitSec)} more (supplier needs ~${Math.round(MIN_CANCEL_MS / 60000)} min after purchase). Do NOT refund.`
+        };
       }
       const result = await grizzlyCancel(orderId);
       if (!result.success) {
@@ -1855,11 +1885,20 @@ bot.action(/^can:([^:]+):(\d+)$/, async (ctx) => {
     return ctx.reply('This order already cancelled.');
   }
 
+  // Local timer aligned with supplier early-cancel window (default 3 minutes)
+  const wait = cancelWaitInfo(order);
+  if (!wait.allowed) {
+    return ctx.reply(
+      `Too early to cancel.\n\nSupplier needs about ${Math.round(MIN_CANCEL_MS / 60000)} minutes after purchase.\nTry again in *${formatWait(wait.waitSec)}*.`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
   const result = await grizzlyCancel(orderId);
   if (!result.success) {
     return ctx.reply(
       result.early
-        ? result.message
+        ? `Supplier still blocking cancel.\n\nWait a bit more (about ${Math.round(MIN_CANCEL_MS / 60000)} min from purchase), then try again.\nNo refund yet.`
         : `${result.message}\n\nNo refund yet — order still active on supplier.`
     );
   }
