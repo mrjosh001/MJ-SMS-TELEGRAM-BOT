@@ -956,18 +956,25 @@ Personality:
 - No dey sound like robot or script
 - Always helpful and solution-focused
 
-About MJ Hub:
+About MJ Hub (know this deep so you fit answer customer questions alone):
 - All-in-one marketplace: MJ Logs (verified accounts), MJ SMS (real numbers for OTP), MJ Boosters (followers/likes/views)
 - One dashboard, one wallet (Naira or USD)
-- Website: mjhub.store
+- Website: https://mjhub.store
+- Support: same WhatsApp + Telegram as on the site; use /support for links
+- Referral: members earn 2% for life when people they invite fund their wallet
+- MJ Logs: premium Facebook, Instagram, X, Gmail, Spotify, dating accounts etc. — ordered on the website
+- MJ Boosters: SMM panel (followers, likes, views, comments) for IG, TikTok, YouTube, Telegram, X — ordered on the website
+- This Telegram bot is ONLY for MJ SMS (Server 1). For logs/boosters, point them to mjhub.store
 
 About MJ SMS (this bot = Server 1 numbers):
-- Real mobile numbers (not VOIP)
-- Works for WhatsApp, Telegram, Instagram, Google, Facebook, TikTok, Snapchat and plenty more
-- Over 200 countries
-- Pay from wallet on this bot (/fund) or mjhub.store
-- OTP usually drops within about 1 minute
-- If code no drop after some time, user fit cancel/refund when supplier allows
+- Real mobile numbers (not VOIP) — better success for WhatsApp and major apps
+- Works for WhatsApp, Telegram, Instagram, Google, Facebook, TikTok, Snapchat, Discord, Microsoft, Apple, Netflix, and plenty more
+- Over 200 countries available
+- Pay from wallet on this bot (/fund AMOUNT) or fund on mjhub.store (balances are separate: bot wallet vs website wallet)
+- OTP usually drops within about 1 minute after they request the code in the app
+- If code no drop after some time, user fit cancel/refund when supplier allows (usually wait ~3 minutes after buy)
+- Prices shown in Naira; stock changes live — always use tools, never invent
+- You can fund any amount between ₦1,000 and ₦200,000 per payment via Paystack
 
 How you handle SMS request (step by step):
 1. If dem no mention app → ask which service (WhatsApp, Telegram, Instagram, Google…)
@@ -1320,7 +1327,7 @@ async function executeGeminiFunction(fnName, args, telegramUserId, session) {
 
       const priceN = money(svc.price_ngn);
       if (priceN > 0) {
-        const deb = await safeDebit(userId, priceN, { orderId: bought.order_id });
+        const deb = await safeDebit(telegramUserId, priceN, { orderId: bought.order_id });
         Object.assign(session, deb.session);
       }
       const order = {
@@ -1397,7 +1404,7 @@ async function executeGeminiFunction(fnName, args, telegramUserId, session) {
       }
       const refunded = money(order?.price || 0);
       if (refunded > 0) {
-        const cr = await safeCredit(userId, refunded, { orderId, reason: 'cancel' });
+        const cr = await safeCredit(telegramUserId, refunded, { orderId, reason: 'cancel' });
         Object.assign(session, cr.session);
       }
       session.orders = (session.orders || []).map((o) =>
@@ -2549,6 +2556,68 @@ bot.on('text', async (ctx) => {
   const session = await getUserSession(userId);
   const lower = textMsg.toLowerCase();
 
+  // --- "I don pay" / payment confirmation (works without Gemini) ---
+  if (/^(i\s*don\s*pay|i\s*have\s*paid|i\s*paid|payment\s*done|don\s*pay|paid)\b/i.test(lower)) {
+    const mem = pendingPayments.get(String(userId));
+    const ref = session.pending_payment?.reference || mem?.reference;
+    if (!ref) {
+      return ctx.reply('I no see any pending payment. Type /fund 2000 (or amount) first, pay, then come back.');
+    }
+    const verified = await paystackVerify(ref);
+    if (!verified.success) {
+      return ctx.reply(
+        verified.message ||
+          'Payment never show success yet. If you don pay, wait 30 seconds and type: I don pay'
+      );
+    }
+    if (session.last_credited_reference === ref || creditedRefs.has(ref)) {
+      return ctx.reply(
+        `This payment already credited.\nBalance: ₦${money(session.balance).toLocaleString()}`
+      );
+    }
+    session.balance = money(money(session.balance) + money(verified.amount_ngn));
+    session.last_credited_reference = ref;
+    session.pending_payment = null;
+    pendingPayments.delete(String(userId));
+    creditedRefs.add(ref);
+    await saveUserSession(userId, session);
+    return ctx.reply(
+      `Payment confirmed ✅\n₦${money(verified.amount_ngn).toLocaleString()} don enter your wallet.\nNew balance: ₦${money(session.balance).toLocaleString()}\n\nYou fit buy number now — tell me country + app.`
+    );
+  }
+
+  // --- FUND WALLET: user typed amount after "Fund wallet" button ---
+  // This was the glitch: amount was treated as a country/service search.
+  if (session.state === 'AWAITING_FUND_AMOUNT') {
+    const amount = parseInt(String(textMsg).replace(/[^\d]/g, ''), 10) || 0;
+    if (amount < 1000) {
+      return ctx.reply('Minimum na ₦1,000. Example: 5000\n\nOr type /fund 5000');
+    }
+    if (amount > 200000) {
+      return ctx.reply('Maximum na ₦200,000 for one payment. Example: 50000');
+    }
+    const init = await paystackInitialize(amount, userId, null);
+    if (!init.success) {
+      session.state = 'AWAITING_INPUT';
+      await saveUserSession(userId, session);
+      return ctx.reply(init.message || 'Paystack no gree right now. Try /fund again later.');
+    }
+    const pending = {
+      reference: init.reference,
+      amount_ngn: init.amount_ngn,
+      authorization_url: init.authorization_url,
+      created_at: new Date().toISOString()
+    };
+    session.pending_payment = pending;
+    session.state = 'AWAITING_INPUT';
+    pendingPayments.set(String(userId), pending);
+    await saveUserSession(userId, session);
+    return ctx.reply(
+      `Top up ₦${init.amount_ngn.toLocaleString()}\n\nTap Pay below.\nWhen e successful, type: I don pay`,
+      Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', init.authorization_url)]])
+    );
+  }
+
   // Keep country session if still browsing
   if (session.countryId && session.state === 'AWAITING_APP') {
     const svc = detectServiceOnly(textMsg) || (await parseCountryService(textMsg));
@@ -2566,19 +2635,48 @@ bot.on('text', async (ctx) => {
 
   if (GEMINI_API_KEY && !buyIntent && session.state === 'AWAITING_INPUT') {
     try {
-      const result = await runGeminiAgent(textMsg, session, userId);
+      const result = await callGeminiWithTools(session, userId, textMsg);
+      // Persist conversation + any side-effects from tools (balance, pending_payment, etc.)
+      if (result?.contents) {
+        session.conversation = result.contents
+          .filter((c) => c.role === 'user' || c.role === 'model')
+          .slice(-MAX_CONVERSATION_TURNS);
+      }
       await saveUserSession(userId, session);
-      if (result?.text) {
+
+      if (result?.quota) {
+        return miraHandleSmartText(ctx, session, userId, textMsg);
+      }
+      if (result?.modelFail) {
+        return miraHandleSmartText(ctx, session, userId, textMsg);
+      }
+      const replyText = result?.reply;
+      if (replyText && replyText !== 'QUOTA_EXCEEDED' && replyText !== 'MODEL_UNAVAILABLE') {
+        // If create_payment tool ran, attach Pay button instead of raw URL
+        if (session.pending_payment?.authorization_url) {
+          return ctx.reply(
+            replyText.slice(0, 3500),
+            Markup.inlineKeyboard([
+              [Markup.button.url('💳 Pay here', session.pending_payment.authorization_url)]
+            ])
+          );
+        }
         const opts = session.last_options || [];
         if (opts.length > 1 && session.countryId) {
-          return ctx.reply(result.text.slice(0, 4000), optionButtons(session.countryId, opts.map((o) => ({
-            service_id: o.service_code,
-            service_name: o.name,
-            price_ngn: o.price_ngn,
-            variant: o.variant
-          }))));
+          return ctx.reply(
+            replyText.slice(0, 4000),
+            optionButtons(
+              session.countryId,
+              opts.map((o) => ({
+                service_id: o.service_code,
+                service_name: o.name,
+                price_ngn: o.price_ngn,
+                variant: o.variant
+              }))
+            )
+          );
         }
-        return ctx.reply(result.text.slice(0, 4000));
+        return ctx.reply(replyText.slice(0, 4000));
       }
     } catch (e) {
       console.error('gemini text', e.message);
