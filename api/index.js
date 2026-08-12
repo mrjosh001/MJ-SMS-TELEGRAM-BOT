@@ -1572,6 +1572,10 @@ async function callGeminiWithTools(session, telegramUserId, userText) {
 
 async function parseCountryService(text) {
   const original = String(text || '').trim();
+  // Pure digits = fund amount / order id, not a country
+  if (/^[\d,.\s₦]+$/i.test(original)) {
+    return { countryId: null, countryName: null, serviceCode: null, serviceName: null };
+  }
   const t = original.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
   let countryId = null;
   let countryName = null;
@@ -2224,13 +2228,37 @@ bot.action(/^can:([^:]+):(\d+)$/, async (ctx) => {
 
 // ---------- Mira smart flow (works without Gemini) ----------
 const MIRA = {
-  greet: 'How far 👋 I be Mira.\nWetin you need number for — WhatsApp, Telegram, which app?',
-  askService: 'Which app? (WhatsApp, Telegram, Instagram, Google…)',
-  askCountry: (svc) => (svc ? `Which country for ${svc}?` : 'Which country?'),
-  noStock: 'That one no dey available right now. Try another country?',
+  greet:
+    'How far 👋 I be *Mira* — MJ SMS assistant.\n\nI fit get real number for WhatsApp, Telegram, Instagram, Google and more.\n\nJust type like:\n• *USA WhatsApp*\n• *Nigeria Telegram*\n• or say *I need number*\n\n/balance · /fund 2000 · /orders · /support',
+  askService: 'Which app you need the number for?\n(WhatsApp, Telegram, Instagram, Google, Facebook, TikTok…)',
+  askCountry: (svc) =>
+    svc
+      ? `Which country for *${svc}*?\n\n_Reply with country name e.g. USA, UK, Nigeria_`
+      : 'Which country you want?',
+  noStock: 'That one no dey available right now. You fit try another country?',
   lowBal: (need, bal) =>
-    `Balance no reach.\nNeed ₦${Number(need).toLocaleString()} · you get ₦${Number(bal).toLocaleString()}.\nType /fund ${need}`,
-  yarn: 'I dey here. Tell me app + country e.g. USA WhatsApp.',
+    `Balance no reach.\nNeed ₦${Number(need).toLocaleString()} · you get ₦${Number(bal).toLocaleString()}.\n\nType /fund ${need} to top up.`,
+  yarn:
+    'I dey here. Tell me app + country e.g. *USA WhatsApp*\n\nOr ask me anything about MJ SMS / MJ Hub.',
+  about:
+    '*MJ Hub* na all-in-one marketplace:\n\n' +
+    '📱 *MJ SMS* — real non-VOIP numbers for OTP (this bot = Server 1)\n' +
+    '📋 *MJ Logs* — verified accounts (Facebook, IG, X, Gmail…)\n' +
+    '📈 *MJ Boosters* — followers, likes, views (IG, TikTok, YouTube…)\n\n' +
+    'Website: mjhub.store\nOne wallet on the site · separate wallet on this bot.\n\n' +
+    'Referral: you earn *2% for life* when people you invite fund their wallet on the site.',
+  howSms:
+    '*How MJ SMS work:*\n\n' +
+    '1. Tell me country + app (e.g. USA WhatsApp)\n' +
+    '2. I show price → you buy from wallet\n' +
+    '3. You get the number → use am for OTP in the app\n' +
+    '4. Code usually drop within ~1 minute\n' +
+    '5. If code no come, you fit cancel for refund after ~3 min\n\n' +
+    'Numbers are *real mobile* (not VOIP) — better for WhatsApp & major apps.\n200+ countries.',
+  fundHelp:
+    'To fund this bot wallet:\n\n• Type `/fund 5000` (any amount ₦1,000–₦200,000)\n• Or type *fund* then the amount\n• Pay with Paystack → wallet credit automatic\n\nAfter pay you fit type: *I don pay*\n\nNote: bot wallet ≠ website wallet on mjhub.store.',
+  supportHelp:
+    'I fit help you buy number and check OTP here.\n\nNeed human? /support\nWebsite: mjhub.store',
 };
 
 function detectServiceOnly(text) {
@@ -2257,24 +2285,38 @@ function isNo(text) {
 }
 
 function looksLikeNeedNumber(text) {
-  return /\b(number|sms|otp|verify|verification|i need|get me|buy)\b/i.test(String(text || ''));
+  return /\b(number|sms|otp|verify|verification|i need|get me|buy|i wan|i want|give me|get number|need number)\b/i.test(
+    String(text || '')
+  );
 }
 
 function looksLikeChitchat(text) {
   const t = String(text || '').toLowerCase().trim();
-  return /^(hi|hello|hey|yo|awfa|how far|how you dey|how far na|wetin be your name|what is your name|who are you|good morning|good evening|sup|mira)\b/i.test(t)
-    || /your name|who you be|you be who/.test(t);
+  return (
+    /^(hi|hello|hey|yo|awfa|how far|how you dey|how far na|wetin be your name|what is your name|who are you|good morning|good evening|good afternoon|sup|mira|thanks|thank you|ok|okay|alright|sharp)\b/i.test(
+      t
+    ) || /your name|who you be|you be who|wetin you (fit|can) do/.test(t)
+  );
 }
 
-/** Resolve country only if message is mainly a country name (not random chat) */
+/** Resolve country only if message is mainly a country name (not random chat / amounts) */
 async function resolveCountryStrict(text) {
   const raw = String(text || '').trim();
   if (!raw || raw.length > 48) return null;
   // Don't treat questions / chat as countries
   if (/[?]/.test(raw) || looksLikeChitchat(raw)) return null;
   if (detectServiceOnly(raw)) return null;
+  // Pure numbers are fund amounts or order ids — never country names
+  // (country ids exist, but users type names; numeric-only caused "Checking 3000")
+  if (/^[\d,.\s₦nairaNGN]+$/i.test(raw)) return null;
 
-  const words = raw.toLowerCase().replace(/[^a-z\s]/g, ' ').replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
+  const words = raw
+    .toLowerCase()
+    .replace(/[^a-z\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(Boolean);
   // Short 2-letter codes only if the whole message is that code
   if (words.length === 1 && words[0].length <= 2) {
     const key = words[0];
@@ -2547,6 +2589,110 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
     );
   }
 
+  // --- Natural "fund / top up" intent (no / command needed) ---
+  if (
+    /\b(fund|top\s*up|topup|deposit|recharge|add\s*money|load\s*wallet|pay\s*in)\b/i.test(lower) &&
+    !detectServiceOnly(textMsg)
+  ) {
+    // e.g. "fund 5000" or "top up 2000"
+    const amtMatch = lower.match(/(?:fund|top\s*up|topup|deposit|recharge)\s*[₦n]?\s*([\d,]+)/i)
+      || lower.match(/([\d,]+)\s*(?:naira|ngn|₦)?/);
+    if (amtMatch) {
+      const amount = parseInt(String(amtMatch[1]).replace(/[^\d]/g, ''), 10) || 0;
+      if (amount >= 1000 && amount <= 200000) {
+        const init = await paystackInitialize(amount, userId, null);
+        if (!init.success) {
+          return ctx.reply(init.message || 'Paystack no gree right now. Try /fund later.');
+        }
+        const pending = {
+          reference: init.reference,
+          amount_ngn: init.amount_ngn,
+          authorization_url: init.authorization_url,
+          created_at: new Date().toISOString()
+        };
+        session.pending_payment = pending;
+        session.state = 'AWAITING_INPUT';
+        pendingPayments.set(String(userId), pending);
+        await saveUserSession(userId, session);
+        return ctx.reply(
+          `Top up ₦${init.amount_ngn.toLocaleString()}\n\nTap Pay below.\nWhen e successful, type: I don pay`,
+          Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', init.authorization_url)]])
+        );
+      }
+    }
+    session.state = 'AWAITING_FUND_AMOUNT';
+    await saveUserSession(userId, session);
+    return ctx.reply(MIRA.fundHelp + '\n\nHow much you wan fund? (e.g. 5000)');
+  }
+
+  // --- Balance check in natural language ---
+  if (/\b(balance|my\s*wallet|how\s*much\s*(i\s*get|dey|left)|wallet\s*balance)\b/i.test(lower)) {
+    return ctx.reply(`Balance: *₦${money(session.balance).toLocaleString()}*`, { parse_mode: 'Markdown' });
+  }
+
+  // --- Knowledge / FAQ (Gemini-style answers without Gemini) ---
+  if (
+    /\b(what\s*is\s*mj\s*(hub|sms)|about\s*mj|wetin\s*be\s*mj|mj\s*hub\s*na\s*wetin|tell\s*me\s*about)\b/i.test(
+      lower
+    ) ||
+    /^(about|info|information)$/i.test(lower)
+  ) {
+    return ctx.reply(MIRA.about, { parse_mode: 'Markdown' });
+  }
+  if (
+    /\b(how\s*(does|do|e\s*dey)\s*work|how\s*to\s*(buy|get|use)|how\s*sms\s*work|how\s*i\s*(go|fit)\s*(buy|get))\b/i.test(
+      lower
+    )
+  ) {
+    return ctx.reply(MIRA.howSms, { parse_mode: 'Markdown' });
+  }
+  if (/\b(referral|refer\s*&?\s*earn|2%|commission|invite)\b/i.test(lower)) {
+    return ctx.reply(
+      'On *mjhub.store* every member get unique referral link.\n\n' +
+        'When someone you invite *funds their wallet*, you earn *2% of that deposit — for life*.\n\n' +
+        'Credit enters your NGN wallet automatic. This bot wallet is separate — referrals are on the website.',
+      { parse_mode: 'Markdown' }
+    );
+  }
+  if (/\b(voip|real\s*number|physical|virtual\s*number|is\s*it\s*real)\b/i.test(lower)) {
+    return ctx.reply(
+      'Numbers for this bot are *real mobile lines* (non-VOIP). Dem work better for WhatsApp, Telegram, Google and major apps than pure virtual/VOIP numbers.\n\nTell me country + app make I check price.',
+      { parse_mode: 'Markdown' }
+    );
+  }
+  if (/\b(cancel|refund|code\s*no\s*(come|drop|show)|otp\s*no)\b/i.test(lower)) {
+    return ctx.reply(
+      'If OTP no drop:\n\n1. Tap *Check SMS code* on the order message\n2. Wait ~3 minutes after buy (supplier blocks early cancel)\n3. Then tap *Cancel* — wallet refund automatic when supplier confirms\n\nOr send your order id and I go guide you. Type /orders to see recent numbers.'
+    );
+  }
+  if (/\b(price|how\s*much|cost|rate)\b/i.test(lower) && !detectServiceOnly(textMsg) && !(await resolveCountryStrict(textMsg))) {
+    return ctx.reply(
+      'Price depend on country + app and stock.\n\nTell me e.g. *USA WhatsApp* or *UK Telegram* — I go check live price for you.',
+      { parse_mode: 'Markdown' }
+    );
+  }
+  if (/\b(support|help\s*me|human|customer\s*care|agent)\b/i.test(lower) && !looksLikeNeedNumber(textMsg)) {
+    return ctx.reply(MIRA.supportHelp);
+  }
+  if (/\b(orders?|history|my\s*numbers?|numbers?\s*i\s*buy)\b/i.test(lower)) {
+    const list = (session.orders || []).filter((o) => o && o.orderId && o.type !== '_meta');
+    if (!list.length) {
+      return ctx.reply('No orders yet.\n\nType country + app e.g. *USA WhatsApp* to buy.', {
+        parse_mode: 'Markdown'
+      });
+    }
+    const lines = list
+      .slice(-8)
+      .reverse()
+      .map((o, i) => {
+        const phone = String(o.phoneNumber || o.number || '').trim() || '—';
+        const svc = o.serviceName || o.service || 'SMS';
+        return `${i + 1}. *${svc}* · \`${phone}\` · ${o.status || '—'}`;
+      })
+      .join('\n');
+    return ctx.reply(`*Your recent orders*\n\n${lines}`, { parse_mode: 'Markdown' });
+  }
+
   if (looksLikeNeedNumber(textMsg)) {
     session.state = 'AWAITING_SERVICE';
     session.pendingService = null;
@@ -2555,14 +2701,23 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
   }
 
   if (looksLikeChitchat(textMsg)) {
-    return ctx.reply(MIRA.greet);
+    return ctx.reply(MIRA.greet, { parse_mode: 'Markdown' });
   }
 
-  if (lower === 'menu' || lower === 'help') {
-    return ctx.reply('Type e.g. USA WhatsApp\nOr /balance · /fund · /orders · /support');
+  if (lower === 'menu' || lower === 'help' || lower === 'start') {
+    return ctx.reply(MIRA.greet, { parse_mode: 'Markdown' });
   }
 
-  return ctx.reply(MIRA.yarn);
+  // Soft fallback — still helpful, not robotic
+  return ctx.reply(
+    'I no too catch that one sharp.\n\n' +
+      'You fit:\n' +
+      '• Type *USA WhatsApp* (country + app)\n' +
+      '• Say *I need number*\n' +
+      '• /fund 2000 · /balance · /orders · /support\n' +
+      '• Ask *wetin be MJ Hub?* or *how e dey work?*',
+    { parse_mode: 'Markdown' }
+  );
 }
 
 bot.on('text', async (ctx) => {
