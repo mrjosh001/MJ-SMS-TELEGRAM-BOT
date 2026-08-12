@@ -250,6 +250,7 @@ async function getUserSession(userId) {
         country: row.country || null,
         countryId: row.country_id || null,
         serviceQuery: row.selected_service_query || null,
+        pendingService: row.selected_service_query || meta.pendingService || null,
         orders,
         conversation: meta.conversation || [],
         pending_payment: meta.pending_payment || null,
@@ -265,11 +266,12 @@ async function saveUserSession(userId, session) {
   if (!SUPABASE_REST_URL || !SUPABASE_SERVICE_KEY) return;
   // Only columns that exist on user_sessions. conversation column is NOT in schema.
   const orders = [...(session.orders || [])].filter((o) => o && o.type !== '_meta');
+  const pending = session.pendingService || session.serviceQuery || null;
   orders.push({
     type: '_meta',
     pending_payment: session.pending_payment || null,
     last_credited_reference: session.last_credited_reference || null,
-    // keep short conversation in JSON orders meta (no dedicated column)
+    pendingService: pending,
     conversation: (session.conversation || []).slice(-8)
   });
   const payload = {
@@ -278,7 +280,7 @@ async function saveUserSession(userId, session) {
     state: session.state || 'AWAITING_INPUT',
     country: session.country || null,
     country_id: session.countryId || null,
-    selected_service_query: session.serviceQuery || null,
+    selected_service_query: pending,
     orders,
     updated_at: new Date().toISOString()
   };
@@ -2345,32 +2347,39 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
   }
 
   // --- Waiting for country (service already known) ---
-  if (state === 'AWAITING_COUNTRY') {
+  if (state === 'AWAITING_COUNTRY' || (session.pendingService || session.serviceQuery)) {
     const c = await resolveCountryStrict(textMsg);
-    if (!c) {
-      return ctx.reply(`Which country for ${session.pendingService || 'the number'}? e.g. USA, UK, Nigeria`);
+    if (c && (session.pendingService || session.serviceQuery)) {
+      const svc = session.pendingService || session.serviceQuery || '';
+      return miraShowPricesAndConfirm(ctx, session, userId, c.id, c.name, svc);
     }
-    const svc = session.pendingService || session.serviceQuery || '';
-    return miraShowPricesAndConfirm(ctx, session, userId, c.id, c.name, svc);
+    if (state === 'AWAITING_COUNTRY' && !c) {
+      return ctx.reply(`Which country for ${session.pendingService || session.serviceQuery || 'WhatsApp'}?`);
+    }
   }
 
   // --- Waiting for service (country already known) ---
-  if (state === 'AWAITING_SERVICE') {
+  if (state === 'AWAITING_SERVICE' || session.countryId) {
     const svc = detectServiceOnly(textMsg);
-    if (!svc) {
+    if (svc && session.countryId) {
+      return miraShowPricesAndConfirm(
+        ctx,
+        session,
+        userId,
+        session.countryId,
+        session.country || session.countryId,
+        svc.serviceName
+      );
+    }
+    if (state === 'AWAITING_SERVICE' && !svc) {
       return ctx.reply(MIRA.askService);
     }
-    const countryId = session.countryId;
-    const countryName = session.country || countryId;
-    if (countryId) {
-      return miraShowPricesAndConfirm(ctx, session, userId, countryId, countryName, svc.serviceName);
-    }
-    session.pendingService = svc.serviceName;
-    session.serviceQuery = svc.serviceName;
-    session.state = 'AWAITING_COUNTRY';
-    await saveUserSession(userId, session);
-    return ctx.reply(MIRA.askCountry(svc.serviceName));
   }
+
+  // Recover pending service / country from session
+  const pendingSvc = session.pendingService || session.serviceQuery || null;
+  const pendingCountryId = session.countryId || null;
+  const pendingCountryName = session.country || null;
 
   // --- One-shot: country + service together ---
   const parsed = await parseCountryService(textMsg);
@@ -2385,30 +2394,56 @@ async function miraHandleSmartText(ctx, session, userId, textMsg) {
     );
   }
 
-  // Service only → ask country
-  if (parsed.serviceName || parsed.serviceCode || detectServiceOnly(textMsg)) {
-    const svc = detectServiceOnly(textMsg) || {
+  // Country message while we already have a pending service → process (fixes lost state)
+  const countryGuess = await resolveCountryStrict(textMsg);
+  if (countryGuess && pendingSvc) {
+    return miraShowPricesAndConfirm(
+      ctx,
+      session,
+      userId,
+      countryGuess.id,
+      countryGuess.name,
+      pendingSvc
+    );
+  }
+
+  // Service message while we already have a country → process
+  const svcGuess = detectServiceOnly(textMsg) || (
+    parsed.serviceName ? { serviceName: parsed.serviceName, serviceCode: parsed.serviceCode } : null
+  );
+  if (svcGuess && pendingCountryId) {
+    return miraShowPricesAndConfirm(
+      ctx,
+      session,
+      userId,
+      pendingCountryId,
+      pendingCountryName || pendingCountryId,
+      svcGuess.serviceName || svcGuess.serviceCode
+    );
+  }
+
+  // Service only → ask country (keep service in session)
+  if (svcGuess || parsed.serviceName || parsed.serviceCode) {
+    const svc = svcGuess || {
       serviceName: parsed.serviceName,
       serviceCode: parsed.serviceCode
     };
     session.pendingService = svc.serviceName || svc.serviceCode;
     session.serviceQuery = session.pendingService;
     session.state = 'AWAITING_COUNTRY';
-    session.countryId = null;
-    session.country = null;
+    // keep country if any; don't wipe blindly
     await saveUserSession(userId, session);
     return ctx.reply(MIRA.askCountry(session.pendingService));
   }
 
-  // Country only (strict) → ask service
-  const onlyCountry = await resolveCountryStrict(textMsg);
-  if (onlyCountry) {
-    session.countryId = onlyCountry.id;
-    session.country = onlyCountry.name;
+  // Country only (no pending service) → ask service
+  if (countryGuess) {
+    session.countryId = countryGuess.id;
+    session.country = countryGuess.name;
     session.state = 'AWAITING_SERVICE';
-    session.pendingService = null;
+    // do not clear pendingService if somehow set
     await saveUserSession(userId, session);
-    return ctx.reply(`Country set: ${asName(onlyCountry.name)}.\n${MIRA.askService}`);
+    return ctx.reply(`Which app for ${asName(countryGuess.name)}?`);
   }
 
   if (looksLikeNeedNumber(textMsg)) {
