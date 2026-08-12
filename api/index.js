@@ -8,11 +8,15 @@ const axios = require('axios');
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const GRIZZLY_KEY = process.env.GRIZZLYSMS_API_KEY;
 const GRIZZLY_BASE = 'https://api.grizzlysms.com/stubs/handler_api.php';
-const SUPABASE_REST_URL = (process.env.SUPABASE_REST_URL || '').replace(/\/$/, '');
+let SUPABASE_REST_URL = (process.env.SUPABASE_REST_URL || process.env.SUPABASE_URL || '').replace(/\/$/, '');
+if (SUPABASE_REST_URL && !/\/rest\/v1$/i.test(SUPABASE_REST_URL)) {
+  // Allow either full REST URL or project root URL
+  SUPABASE_REST_URL = SUPABASE_REST_URL.replace(/\/$/, '') + '/rest/v1';
+}
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const USD_TO_NGN = Number(process.env.USD_TO_NGN_RATE) || 1500;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
+const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || process.env.PAYSTACK_SECRET || process.env.PAYSTACK_SECRET_KEY_LIVE || '';
 const ADMIN_TELEGRAM_ID = process.env.ADMIN_TELEGRAM_ID || '7466363018';
 
 // Common Grizzly / SMS-Activate style country ids
@@ -281,7 +285,7 @@ async function grizzlyBalance() {
 // old rigid parseCountryService flow below instead of breaking.
 // ===========================================================================
 
-const GEMINI_MODEL = 'gemini-2.0-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 const MAX_CONVERSATION_TURNS = 16;
 const MAX_TOOL_ROUNDTRIPS = 6;
@@ -414,7 +418,8 @@ const GEMINI_TOOLS = [{
 
 async function paystackInitialize(amountNgn, telegramUserId, email) {
   if (!PAYSTACK_SECRET_KEY) {
-    return { success: false, message: 'Paystack no dey configured yet. Abeg contact admin.' };
+    console.error('PAYSTACK_SECRET_KEY missing on this deployment');
+    return { success: false, message: 'Paystack no dey configured yet. Abeg set PAYSTACK_SECRET_KEY on Vercel and redeploy.' };
   }
   const amount = Math.max(500, Math.ceil(Number(amountNgn) || 0));
   const reference = `MJSMS_${telegramUserId}_${Date.now()}`;
