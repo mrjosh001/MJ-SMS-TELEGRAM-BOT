@@ -42,6 +42,11 @@ const USD_TO_NGN = Number(process.env.USD_TO_NGN_RATE) || 1500;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || process.env.PAYSTACK_SECRET || process.env.PAYSTACK_SECRET_KEY_LIVE || '';
 const ADMIN_TELEGRAM_ID = process.env.ADMIN_TELEGRAM_ID || '7466363018';
+// Same support channels as MJ Hub website (index.html ADMIN_WA + t.me/mj_hub_tg)
+const SUPPORT_WA = (process.env.SUPPORT_WA || '14305583021').replace(/[^0-9]/g, '');
+const SUPPORT_WA_LINK = `https://wa.me/${SUPPORT_WA}`;
+const SUPPORT_TG_LINK = process.env.SUPPORT_TG || 'https://t.me/mj_hub_tg';
+const SUPPORT_SITE = process.env.SUPPORT_SITE || 'https://mjhub.store';
 // Grizzly blocks cancel shortly after getNumber (often ~2 min). Use 3 min default; override with MIN_CANCEL_SECONDS.
 const MIN_CANCEL_MS = (Number(process.env.MIN_CANCEL_SECONDS) || 180) * 1000;
 
@@ -1739,18 +1744,24 @@ bot.command('privacy', async (ctx) => {
 });
 
 bot.command('support', async (ctx) => {
+  const prefill = encodeURIComponent(
+    `Hello MJ Hub support, I need help on MJ SMS Telegram bot.\nTelegram: @${ctx.from.username || 'n/a'} (id ${ctx.from.id})`
+  );
+  const waUrl = `${SUPPORT_WA_LINK}?text=${prefill}`;
   await ctx.reply(
     `*MJ SMS Support*\n\n` +
       `I be *Mira* — I fit help you buy number and check OTP here.\n\n` +
-      `For human support:\n` +
-      `• Website: mjhub.store\n` +
-      `• Telegram / WhatsApp support (use the contacts on the site)\n\n` +
-      `Quick commands:\n` +
-      `/balance — wallet\n` +
-      `/fund 2000 — top up\n` +
-      `/orders — your numbers\n\n` +
-      `Or just type e.g. *USA WhatsApp*`,
-    { parse_mode: 'Markdown' }
+      `Need human support? Same channels as *mjhub.store*:`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.url('💬 WhatsApp Support', waUrl)],
+        [Markup.button.url('✈️ Telegram Support', SUPPORT_TG_LINK)],
+        [Markup.button.url('🌐 MJ Hub website', SUPPORT_SITE)],
+        [Markup.button.callback('💰 Balance', 'menu:bal')],
+        [Markup.button.callback('💳 Fund wallet', 'menu:fund')]
+      ])
+    }
   );
 });
 
@@ -2144,26 +2155,21 @@ bot.action(/^can:([^:]+):(\d+)$/, async (ctx) => {
 });
 
 
+
 // ---------- Mira smart flow (works without Gemini) ----------
 const MIRA = {
-  askService:
-    'Okay. Which service you need the number for?\n(WhatsApp, Telegram, Instagram, Google, Facebook, TikTok…)',
-  askCountry: (svc) =>
-    svc
-      ? `Alright. Which country you want for *${svc}*?`
-      : 'Which country you want?',
-  confirm: (country, svc, priceLine) =>
-    `Alright, *${country}* ${svc || ''}.${priceLine ? `\n${priceLine}` : ''}\n\nYou ready make I get the number for you now?`.trim(),
-  noStock: 'That particular one no dey available for now.\nYou fit try another country?',
+  greet: 'How far 👋 I be Mira.\nWetin you need number for — WhatsApp, Telegram, which app?',
+  askService: 'Which app? (WhatsApp, Telegram, Instagram, Google…)',
+  askCountry: (svc) => (svc ? `Which country for ${svc}?` : 'Which country?'),
+  noStock: 'That one no dey available right now. Try another country?',
   lowBal: (need, bal) =>
-    `You never get enough balance.\nNeed about ₦${Number(need).toLocaleString()} · you get ₦${Number(bal).toLocaleString()}.\n\nYou fit /fund or fund on mjhub.store.\nHow you wan do am?`,
-  greet:
-    'How far 👋 I be *Mira* — MJ SMS assistant.\n\nI fit get real number for WhatsApp, Telegram, Instagram, Google and more.\n\nWetin you need? Type like *USA WhatsApp* or tell me the app first.',
-  yarn: 'I dey here. Wetin you need — number for which app?',
+    `Balance no reach.\nNeed ₦${Number(need).toLocaleString()} · you get ₦${Number(bal).toLocaleString()}.\nType /fund ${need}`,
+  yarn: 'I dey here. Tell me app + country e.g. USA WhatsApp.',
 };
 
 function detectServiceOnly(text) {
   const t = String(text || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!t || t.length > 40) return null;
   const entries = Object.entries(SERVICE_MAP).sort((a, b) => b[0].length - a[0].length);
   for (const [name, code] of entries) {
     if (name.length < 2) continue;
@@ -2175,7 +2181,7 @@ function detectServiceOnly(text) {
 }
 
 function isYes(text) {
-  return /^(yes|y|yeah|yep|ok|okay|sure|go|process|buy|do am|i ready|ready|proceed|sharp|abeg|yes please)\b/i.test(
+  return /^(yes|y|yeah|yep|ok|okay|sure|go|process|buy|do am|ready|proceed|sharp|abeg)\b/i.test(
     String(text || '').trim()
   );
 }
@@ -2185,27 +2191,55 @@ function isNo(text) {
 }
 
 function looksLikeNeedNumber(text) {
-  return /\b(number|sms|otp|verify|verification|i need|get me|buy|virtual number)\b/i.test(
-    String(text || '')
-  );
+  return /\b(number|sms|otp|verify|verification|i need|get me|buy)\b/i.test(String(text || ''));
+}
+
+function looksLikeChitchat(text) {
+  const t = String(text || '').toLowerCase().trim();
+  return /^(hi|hello|hey|yo|awfa|how far|how you dey|how far na|wetin be your name|what is your name|who are you|good morning|good evening|sup|mira)\b/i.test(t)
+    || /your name|who you be|you be who/.test(t);
+}
+
+/** Resolve country only if message is mainly a country name (not random chat) */
+async function resolveCountryStrict(text) {
+  const raw = String(text || '').trim();
+  if (!raw || raw.length > 48) return null;
+  // Don't treat questions / chat as countries
+  if (/[?]/.test(raw) || looksLikeChitchat(raw)) return null;
+  if (detectServiceOnly(raw)) return null;
+
+  const words = raw.toLowerCase().replace(/[^a-z\s]/g, ' ').replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
+  // Short 2-letter codes only if the whole message is that code
+  if (words.length === 1 && words[0].length <= 2) {
+    const key = words[0];
+    if (key in COUNTRY_MAP) {
+      const id = COUNTRY_MAP[key];
+      const live = await grizzlyCountries();
+      const hit = live.find((c) => c.id === id);
+      return { id, name: asName(hit?.name) || key };
+    }
+  }
+  return resolveCountry(raw);
 }
 
 async function miraShowPricesAndConfirm(ctx, session, userId, countryId, countryName, serviceQuery) {
   countryName = asName(countryName) || String(countryName);
-  await ctx.reply(`Checking *${countryName}* ${serviceQuery || ''}…`, { parse_mode: 'Markdown' });
+  serviceQuery = asName(serviceQuery) || serviceQuery || '';
+  await ctx.reply(`Checking ${countryName}${serviceQuery ? ' · ' + serviceQuery : ''}…`);
+
   let list = await getSellableServices(countryId, serviceQuery);
   if (!list.length) {
     list = await getSellableServices(countryId, null);
     if (serviceQuery) list = matchServices(list, serviceQuery);
   }
+  list = dedupeServices(list || []);
   if (!list.length) {
     session.state = 'AWAITING_INPUT';
-    session.pendingService = serviceQuery || session.pendingService;
+    session.pendingService = null;
     await saveUserSession(userId, session);
     return ctx.reply(MIRA.noStock);
   }
 
-  list = dedupeServices(list);
   session.country = countryName;
   session.countryId = countryId;
   session.serviceQuery = serviceQuery;
@@ -2223,60 +2257,55 @@ async function miraShowPricesAndConfirm(ctx, session, userId, countryId, country
 
   if (list.length === 1) {
     const s = list[0];
-    const priceLine = `*${s.service_name}* · ₦${Number(s.price_ngn).toLocaleString()}`;
-    return ctx.reply(MIRA.confirm(countryName, serviceQuery || s.service_name, priceLine), {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([
+    return ctx.reply(
+      `${countryName} ${serviceQuery || s.service_name}\n₦${Number(s.price_ngn).toLocaleString()}\n\nYou ready?`,
+      Markup.inlineKeyboard([
         [
           Markup.button.callback(
-            `✅ Yes · Buy ₦${Number(s.price_ngn).toLocaleString()}`,
+            `✅ Buy · ₦${Number(s.price_ngn).toLocaleString()}`,
             `opt:${countryId}:${s.service_id}:${s.price_ngn}`.slice(0, 64)
           )
         ],
-        [Markup.button.callback('❌ No', 'opt:cancel')]
+        [Markup.button.callback('❌ Cancel', 'opt:cancel')]
       ])
-    });
+    );
   }
 
   return ctx.reply(
-    `Alright, *${countryName}* ${serviceQuery || ''}.\nPick option:`,
-    {
-      parse_mode: 'Markdown',
-      ...optionButtons(countryId, list.slice(0, 8))
-    }
+    `${countryName} · ${serviceQuery || 'options'}\nPick one:`,
+    optionButtons(countryId, list.slice(0, 8))
   );
 }
 
-async function miraHandleSmartText(ctx, session, userId, text) {
-  const lower = String(text || '').trim().toLowerCase();
-  const state = session.state || 'AWAITING_INPUT';
+async function miraHandleSmartText(ctx, session, userId, textMsg) {
+  const lower = String(textMsg || '').trim().toLowerCase();
+  let state = session.state || 'AWAITING_INPUT';
 
-  // --- Confirm step ---
+  // --- Confirm ---
   if (state === 'AWAITING_CONFIRM') {
     if (isNo(lower)) {
       session.state = 'AWAITING_INPUT';
       session.pendingService = null;
+      session.last_options = [];
       await saveUserSession(userId, session);
-      return ctx.reply('Okay, cancelled. Wetin you need instead?');
+      return ctx.reply('Alright. Wetin else?');
     }
     if (isYes(lower) && session.last_options?.length) {
-      // Trigger same as tapping buy on first option
       const s = session.last_options[0];
       const countryId = session.countryId || s.country_id;
-      // Reuse opt handler logic by simulating — call buy path inline
-      const price = Number(s.price_ngn) || 0;
-      if (session.balance < price) {
+      const price = money(s.price_ngn);
+      if (money(session.balance) < price) {
         return ctx.reply(MIRA.lowBal(price, session.balance), {
-          ...Markup.inlineKeyboard([[Markup.button.callback('💳 Fund wallet', 'menu:fund')]])
+          ...Markup.inlineKeyboard([[Markup.button.callback('💳 Fund', 'menu:fund')]])
         });
       }
-      await ctx.reply('I dey grab the number… hold on.');
+      await ctx.reply('Hold on…');
       const bought = await grizzlyBuy(s.service_code, countryId);
       if (!bought.success) {
         return ctx.reply(
           /502|503|gateway|unreachable|timeout/i.test(String(bought.message || ''))
-            ? 'Supplier temporarily unavailable. Abeg try again in a few minutes.'
-            : `E no work: ${bought.message || 'No number available.'}`
+            ? 'Supplier offline now. Try again small time.'
+            : `E no work: ${bought.message || 'No number'}`
         );
       }
       const deb = await safeDebit(userId, price, { orderId: bought.order_id });
@@ -2287,7 +2316,7 @@ async function miraHandleSmartText(ctx, session, userId, text) {
         service: s.service_code,
         serviceName: s.name,
         phoneNumber: bought.number,
-        price: money(price),
+        price,
         status: 'Waiting for SMS',
         date: new Date().toISOString(),
         countryId,
@@ -2296,12 +2325,13 @@ async function miraHandleSmartText(ctx, session, userId, text) {
       };
       session.orders = [...(session.orders || []), order].slice(-30);
       session.state = 'AWAITING_INPUT';
+      session.pendingService = null;
       session.last_options = [];
       await saveUserSession(userId, session);
       const phone = String(bought.number || '');
       const cancelLabel = `⏳ Cancel (wait ${Math.round(MIN_CANCEL_MS / 60000)}m)`;
       return ctx.reply(
-        `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n\nUse am for the app to request OTP.\nWhen you ready, tap Check.\n\n_Cancel opens after ~${Math.round(MIN_CANCEL_MS / 60000)} minutes._`,
+        `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n\nUse am for OTP. Tap Check when you expect code.`,
         {
           parse_mode: 'Markdown',
           ...Markup.inlineKeyboard([
@@ -2312,36 +2342,38 @@ async function miraHandleSmartText(ctx, session, userId, text) {
         }
       );
     }
-    // not yes/no — fall through to re-parse
   }
 
-  // --- Waiting for country after service ---
+  // --- Waiting for country (service already known) ---
   if (state === 'AWAITING_COUNTRY') {
-    const c = await resolveCountry(text);
+    const c = await resolveCountryStrict(textMsg);
     if (!c) {
-      return ctx.reply('I no catch that country. Type country name e.g. *USA*, *UK*, *Nigeria*.', {
-        parse_mode: 'Markdown'
-      });
+      return ctx.reply(`Which country for ${session.pendingService || 'the number'}? e.g. USA, UK, Nigeria`);
     }
     const svc = session.pendingService || session.serviceQuery || '';
     return miraShowPricesAndConfirm(ctx, session, userId, c.id, c.name, svc);
   }
 
-  // --- Waiting for service ---
+  // --- Waiting for service (country already known) ---
   if (state === 'AWAITING_SERVICE') {
-    const svc = detectServiceOnly(text);
+    const svc = detectServiceOnly(textMsg);
     if (!svc) {
       return ctx.reply(MIRA.askService);
+    }
+    const countryId = session.countryId;
+    const countryName = session.country || countryId;
+    if (countryId) {
+      return miraShowPricesAndConfirm(ctx, session, userId, countryId, countryName, svc.serviceName);
     }
     session.pendingService = svc.serviceName;
     session.serviceQuery = svc.serviceName;
     session.state = 'AWAITING_COUNTRY';
     await saveUserSession(userId, session);
-    return ctx.reply(MIRA.askCountry(svc.serviceName), { parse_mode: 'Markdown' });
+    return ctx.reply(MIRA.askCountry(svc.serviceName));
   }
 
-  // --- Full parse: country + service in one message ---
-  const parsed = await parseCountryService(text);
+  // --- One-shot: country + service together ---
+  const parsed = await parseCountryService(textMsg);
   if (parsed.countryId && (parsed.serviceName || parsed.serviceCode)) {
     return miraShowPricesAndConfirm(
       ctx,
@@ -2352,63 +2384,50 @@ async function miraHandleSmartText(ctx, session, userId, text) {
       parsed.serviceName || parsed.serviceCode
     );
   }
-  if (parsed.countryId && !parsed.serviceName) {
-    session.countryId = parsed.countryId;
-    session.country = parsed.countryName;
-    session.state = 'AWAITING_SERVICE';
-    await saveUserSession(userId, session);
-    return ctx.reply(
-      `Country: *${asName(parsed.countryName)}*\n\n${MIRA.askService}`,
-      { parse_mode: 'Markdown' }
-    );
-  }
-  if (!parsed.countryId && (parsed.serviceName || parsed.serviceCode)) {
-    session.pendingService = parsed.serviceName || parsed.serviceCode;
+
+  // Service only → ask country
+  if (parsed.serviceName || parsed.serviceCode || detectServiceOnly(textMsg)) {
+    const svc = detectServiceOnly(textMsg) || {
+      serviceName: parsed.serviceName,
+      serviceCode: parsed.serviceCode
+    };
+    session.pendingService = svc.serviceName || svc.serviceCode;
     session.serviceQuery = session.pendingService;
     session.state = 'AWAITING_COUNTRY';
+    session.countryId = null;
+    session.country = null;
     await saveUserSession(userId, session);
-    return ctx.reply(MIRA.askCountry(session.pendingService), { parse_mode: 'Markdown' });
+    return ctx.reply(MIRA.askCountry(session.pendingService));
   }
 
-  // Country-only free resolve
-  const onlyCountry = await resolveCountry(text);
-  if (onlyCountry && String(text).trim().split(/\s+/).length <= 3) {
+  // Country only (strict) → ask service
+  const onlyCountry = await resolveCountryStrict(textMsg);
+  if (onlyCountry) {
     session.countryId = onlyCountry.id;
     session.country = onlyCountry.name;
     session.state = 'AWAITING_SERVICE';
+    session.pendingService = null;
     await saveUserSession(userId, session);
-    return ctx.reply(
-      `Country: *${asName(onlyCountry.name)}*\n\n${MIRA.askService}`,
-      { parse_mode: 'Markdown' }
-    );
+    return ctx.reply(`Country set: ${asName(onlyCountry.name)}.\n${MIRA.askService}`);
   }
 
-  // "I need number" style
-  if (looksLikeNeedNumber(text)) {
+  if (looksLikeNeedNumber(textMsg)) {
     session.state = 'AWAITING_SERVICE';
+    session.pendingService = null;
     await saveUserSession(userId, session);
     return ctx.reply(MIRA.askService);
   }
 
-  // Greetings
-  if (/^(hi|hello|hey|yo|awfa|how far|how you dey|good morning|good evening|sup|wetin|mira)\b/i.test(lower)) {
-    return ctx.reply(MIRA.greet, { parse_mode: 'Markdown' });
+  if (looksLikeChitchat(textMsg)) {
+    return ctx.reply(MIRA.greet);
   }
 
   if (lower === 'menu' || lower === 'help') {
-    return ctx.reply(
-      'Type country + app e.g. *Australia WhatsApp*\nOr say *I need number* make I guide you.\n\n/fund · /balance · /orders',
-      { parse_mode: 'Markdown' }
-    );
+    return ctx.reply('Type e.g. USA WhatsApp\nOr /balance · /fund · /orders · /support');
   }
 
-  // Soft fallback — still Mira, not robotic
-  return ctx.reply(
-    `${MIRA.yarn}\n\nExample: *UK Telegram* or *Nigeria WhatsApp*`,
-    { parse_mode: 'Markdown' }
-  );
+  return ctx.reply(MIRA.yarn);
 }
-
 
 bot.on('text', async (ctx) => {
   const textMsg = (ctx.message.text || '').trim();
