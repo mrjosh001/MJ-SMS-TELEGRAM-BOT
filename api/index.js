@@ -710,21 +710,22 @@ async function fetchHubServices(countryId, serviceFilter) {
   }
 }
 
-async function getSellableServices(countryId, serviceFilter) {
+async function getSellableServicesForOneCountry(countryId, serviceFilter) {
   // 1) Full service catalog from Grizzly for this country
   let live = await grizzlyPrices(countryId);
   if (serviceFilter) live = matchServices(live, serviceFilter);
   if (!live.length) {
-    // Secondary: try hub-only list if Grizzly empty
     const hubOnly = await fetchHubServices(countryId, serviceFilter);
     if (hubOnly.length) {
-      console.log('[prices] Grizzly empty — using hub-only', countryId, serviceFilter, hubOnly.length);
-      return hubOnly;
+      return hubOnly.map((s) => ({
+        ...s,
+        country_id: s.country_id != null ? s.country_id : countryId,
+        country_name: s.country_name || countryPoolLabel(countryId)
+      }));
     }
     return [];
   }
 
-  // 2) Pull MJ HUB selling prices by exact service_id (+ country_id)
   const hubMap = await fetchHubPriceByServiceIds(
     countryId,
     live.map((s) => s.service_id)
@@ -743,21 +744,21 @@ async function getSellableServices(countryId, serviceFilter) {
         price_usd: hub.price_usd || s.price_usd,
         source: 'hub',
         hub_id: hub.hub_id,
-        country_name: hub.country_name || null
+        country_id: countryId,
+        country_name: hub.country_name || countryPoolLabel(countryId)
       };
     }
-    // No hub row for this service_id → live Grizzly markup (floor)
     return {
       ...s,
       price_ngn: Math.max(MIN_SALE, Number(s.price_ngn) || 0),
-      source: 'live_grizzly'
+      source: 'live_grizzly',
+      country_id: countryId,
+      country_name: countryPoolLabel(countryId)
     };
   });
 
-  const hubCount = out.filter((s) => s.source === 'hub').length;
   let deduped = dedupeServices(out);
 
-  // If user asked for a specific app, keep primary service_id + real variants only
   if (serviceFilter) {
     const code = (SERVICE_MAP[String(serviceFilter).toLowerCase().trim()] || '').toLowerCase();
     if (code) {
@@ -777,40 +778,167 @@ async function getSellableServices(countryId, serviceFilter) {
       }
     }
   }
+  return deduped;
+}
+
+/** Fetch sellable options — expands USA → USA + USA (2) when both have stock */
+async function getSellableServices(countryId, serviceFilter) {
+  const ids = siblingCountryIds(countryId);
+  const merged = [];
+  for (const cid of ids) {
+    try {
+      const part = await getSellableServicesForOneCountry(cid, serviceFilter);
+      for (const s of part) {
+        merged.push({
+          ...s,
+          country_id: s.country_id != null ? s.country_id : cid,
+          country_name: s.country_name || countryPoolLabel(cid)
+        });
+      }
+    } catch (e) {
+      console.error('getSellableServices sibling', cid, e.message);
+    }
+  }
+
+  // Also pull hub rows by country_name for USA family (catches USA (2) labeled rows)
+  if (ids.includes(12) || ids.includes(187)) {
+    try {
+      const hubExtra = await fetchHubServicesUsaFamily(serviceFilter);
+      for (const s of hubExtra) {
+        const exists = merged.some(
+          (m) =>
+            String(m.service_id).toLowerCase() === String(s.service_id).toLowerCase() &&
+            Number(m.price_ngn) === Number(s.price_ngn) &&
+            String(m.country_name || '') === String(s.country_name || '')
+        );
+        if (!exists) merged.push(s);
+      }
+    } catch (e) {
+      console.error('usa family hub', e.message);
+    }
+  }
+
+  const deduped = dedupeServices(merged);
+  // Prefer cheaper first within same pool, but keep both pools
+  deduped.sort((a, b) => {
+    const ca = String(a.country_name || a.country_id || '');
+    const cb = String(b.country_name || b.country_id || '');
+    if (ca !== cb) return ca.localeCompare(cb);
+    return Number(a.price_ngn) - Number(b.price_ngn);
+  });
 
   console.log(
-    '[prices] grizzly-only catalog',
-    live.length,
+    '[prices] multi-pool',
+    ids.join(','),
     '| final',
     deduped.length,
-    '| hub price overlay',
-    hubCount,
-    '| country',
-    countryId,
+    '|',
+    deduped.map((s) => `${s.country_name || s.country_id}:${s.service_id}:₦${s.price_ngn}`).join(' · '),
     serviceFilter || '(all)'
   );
   return deduped;
 }
 
+/** Hub rows for any country_name containing USA (covers USA + USA (2)) */
+async function fetchHubServicesUsaFamily(serviceFilter) {
+  if (!MJ_HUB_REST_URL || !MJ_HUB_SERVICE_KEY) return [];
+  try {
+    const select =
+      'id,service_id,service_name,country_id,country_name,price,available_quantity,is_available,supplier_price';
+    let serviceQuery = '';
+    if (serviceFilter) {
+      const q = String(serviceFilter).toLowerCase().trim();
+      const code = (SERVICE_MAP[q] || q).toLowerCase();
+      const namePat =
+        code === 'wa' || q.includes('whatsapp')
+          ? 'whatsapp'
+          : code === 'tg' || q.includes('telegram')
+            ? 'telegram'
+            : code === 'go' || q.includes('google') || q.includes('gmail')
+              ? 'google'
+              : code === 'ig' || q.includes('instagram')
+                ? 'instagram'
+                : code === 'fb' || q.includes('facebook')
+                  ? 'facebook'
+                  : code === 'lf' || q.includes('tiktok')
+                    ? 'tiktok'
+                    : code === 'fu' || q.includes('snapchat')
+                      ? 'snapchat'
+                      : q.replace(/[^a-z0-9]/g, '');
+      const exclude =
+        namePat === 'whatsapp' ? '&service_id=neq.waf&service_name=not.ilike.*waf*' : '';
+      serviceQuery =
+        `&or=(service_id.eq.${encodeURIComponent(code)},service_name.ilike.*${encodeURIComponent(namePat)}*)` +
+        exclude;
+    }
+    const url =
+      `${MJ_HUB_REST_URL}/number_services?select=${select}` +
+      `&country_name=ilike.*USA*` +
+      `&price=gt.0` +
+      serviceQuery +
+      `&order=price.asc&limit=40`;
+    const res = await axios.get(url, { ...axiosCfg, headers: mjHubHeaders });
+    let rows = Array.isArray(res.data) ? res.data : [];
+    rows = rows.filter((r) => r.is_available !== false && r.is_available !== 'false');
+    const out = [];
+    const seen = new Set();
+    for (const r of rows) {
+      const price = Math.ceil(Number(r.price) || 0);
+      if (!(price > 0)) continue;
+      if (serviceFilter && /whatsapp|^wa$/i.test(String(serviceFilter))) {
+        const id = String(r.service_id || '').toLowerCase();
+        const nm = String(r.service_name || '').toLowerCase();
+        if (id === 'waf' || (id !== 'wa' && !nm.includes('whatsapp'))) continue;
+      }
+      const key = `${r.country_id}|${r.service_id}|${price}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        service_id: String(r.service_id),
+        service_name: friendlyServiceName(r.service_id, r.service_name),
+        variant: detectVariant(r.service_name, r.service_id),
+        stock: Number(r.available_quantity) || 0,
+        price_ngn: price,
+        price_usd: Number(r.supplier_price) || 0,
+        source: 'hub',
+        hub_id: r.id,
+        country_id: r.country_id,
+        country_name: r.country_name || countryPoolLabel(r.country_id)
+      });
+    }
+    return out;
+  } catch (e) {
+    console.error('fetchHubServicesUsaFamily', e.message);
+    return [];
+  }
+}
+
 function optionButtons(countryId, services) {
-  // Only show Normal/Virtual labels when supplier actually returned distinct variants
+  const pools = new Set(
+    services.map((s) => String(s.country_name || s.country_id || countryId).trim()).filter(Boolean)
+  );
+  const showPool = pools.size > 1;
   const variants = new Set(services.map((s) => s.variant || 'normal'));
-  const showVariantLabel = services.length > 1 && variants.size > 1;
-  const rows = services.slice(0, 12).map((s, idx) => {
+  const showVariantLabel = services.length > 1 && variants.size > 1 && !showPool;
+  const rows = services.slice(0, 12).map((s) => {
+    const cid = s.country_id != null ? s.country_id : countryId;
+    const pool = countryPoolLabel(cid, null, s.country_name);
     let label;
-    if (showVariantLabel) {
+    if (showPool) {
+      // USA · WhatsApp · ₦2,500  vs  USA (2) · WhatsApp · ₦3,200
+      label = `${pool} · ${s.service_name} · ₦${Number(s.price_ngn).toLocaleString()}`;
+    } else if (showVariantLabel) {
       const tag =
         s.variant === 'virtual' ? '👻 Virtual' :
         s.variant === 'alternate' ? '🔀 Alternate' :
         '📱 Normal';
       label = `${tag} · ${s.service_name} · ₦${Number(s.price_ngn).toLocaleString()}`;
     } else if (services.length > 1) {
-      // Multiple real service_ids but same variant class — show name + price only
       label = `${s.service_name} · ₦${Number(s.price_ngn).toLocaleString()}`;
     } else {
       label = `✅ Buy · ₦${Number(s.price_ngn).toLocaleString()}`;
     }
-    const data = `opt:${countryId}:${s.service_id}:${s.price_ngn}`;
+    const data = `opt:${cid}:${s.service_id}:${s.price_ngn}`;
     return [Markup.button.callback(label.slice(0, 64), data.slice(0, 64))];
   });
   rows.push([Markup.button.callback('⬅️ Cancel', 'opt:cancel')]);
@@ -1784,11 +1912,37 @@ function dedupeServices(list) {
   const out = [];
   for (const s of list || []) {
     const id = String(s.service_id || '').toLowerCase();
-    if (!id || seen.has(id)) continue;
-    seen.add(id);
+    if (!id) continue;
+    // Keep same service across different country pools (USA vs USA (2))
+    const cid = s.country_id != null ? String(s.country_id) : '';
+    const key = `${cid}|${id}|${Number(s.price_ngn) || 0}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
     out.push(s);
   }
   return out;
+}
+
+/**
+ * Some countries have multiple supplier pools with the same label.
+ * Grizzly: USA = 12 and USA (2) = 187. When user asks "USA WhatsApp"
+ * we show both pools (if in stock) with their own prices.
+ */
+function siblingCountryIds(countryId) {
+  const id = Number(countryId);
+  // USA / USA (2)
+  if (id === 12 || id === 187) return [12, 187];
+  // UK variants if any appear later — keep single for now
+  return [id];
+}
+
+function countryPoolLabel(countryId, countryName, hubCountryName) {
+  const cn = String(hubCountryName || countryName || '').trim();
+  if (cn) return cn;
+  const id = Number(countryId);
+  if (id === 12) return 'USA';
+  if (id === 187) return 'USA (2)';
+  return String(countryName || countryId);
 }
 
 
@@ -2512,20 +2666,26 @@ async function miraShowPricesAndConfirm(ctx, session, userId, countryId, country
     variant: s.variant || 'normal',
     price_ngn: s.price_ngn,
     stock: s.stock,
-    country_id: countryId
+    country_id: s.country_id != null ? s.country_id : countryId,
+    country_name: s.country_name || countryPoolLabel(s.country_id != null ? s.country_id : countryId)
   }));
   session.state = 'AWAITING_CONFIRM';
   await saveUserSession(userId, session);
 
-  if (list.length === 1) {
-    const s = list[0];
+  const top = list.slice(0, 8);
+  const multiPool = new Set(top.map((s) => String(s.country_name || s.country_id))).size > 1;
+
+  if (top.length === 1) {
+    const s = top[0];
+    const cid = s.country_id != null ? s.country_id : countryId;
+    const pool = countryPoolLabel(cid, countryName, s.country_name);
     return ctx.reply(
-      `${countryName} ${serviceQuery || s.service_name}\n₦${Number(s.price_ngn).toLocaleString()}\n\nYou ready?`,
+      `${pool} ${serviceQuery || s.service_name}\n₦${Number(s.price_ngn).toLocaleString()}\n\nYou ready?`,
       Markup.inlineKeyboard([
         [
           Markup.button.callback(
             `✅ Buy · ₦${Number(s.price_ngn).toLocaleString()}`,
-            `opt:${countryId}:${s.service_id}:${s.price_ngn}`.slice(0, 64)
+            `opt:${cid}:${s.service_id}:${s.price_ngn}`.slice(0, 64)
           )
         ],
         [Markup.button.callback('❌ Cancel', 'opt:cancel')]
@@ -2533,10 +2693,14 @@ async function miraShowPricesAndConfirm(ctx, session, userId, countryId, country
     );
   }
 
-  return ctx.reply(
-    `${countryName} · ${serviceQuery || 'options'}\nPick one:`,
-    optionButtons(countryId, list.slice(0, 8))
-  );
+  const header = multiPool
+    ? `${countryName} ${serviceQuery || ''} — pick pool + price:\n_USA and USA (2) na different number pools._`
+    : `${countryName} · ${serviceQuery || 'options'}\nPick one:`;
+
+  return ctx.reply(header, {
+    parse_mode: 'Markdown',
+    ...optionButtons(countryId, top)
+  });
 }
 
 /** Only real apps count as a service — never junk like "cheaper ones" */
