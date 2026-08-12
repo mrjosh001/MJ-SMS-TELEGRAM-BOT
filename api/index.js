@@ -78,6 +78,10 @@ if (!BOT_TOKEN) {
 
 const bot = new Telegraf(BOT_TOKEN || 'missing');
 
+// Fallback store when Supabase session save fails (400/404)
+const pendingPayments = new Map(); // telegramUserId -> { reference, amount_ngn, authorization_url }
+const creditedRefs = new Set();
+
 const axiosCfg = {
   timeout: 25000,
   headers: { Accept: 'application/json, text/plain, */*', 'User-Agent': 'MJ-SMS-Bot/2.0' }
@@ -182,7 +186,7 @@ async function saveUserSession(userId, session) {
       });
     }
   } catch (e) {
-    console.error('saveUserSession', e.message);
+    console.error('saveUserSession', e.response?.status, e.response?.data || e.message);
   }
 }
 
@@ -290,47 +294,57 @@ const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GE
 const MAX_CONVERSATION_TURNS = 16;
 const MAX_TOOL_ROUNDTRIPS = 6;
 
-const GEMINI_SYSTEM_PROMPT = `You be Mira, the real human support and sales person for MJ SMS on Telegram. You work under MJ HUB. You no be robot, you no be AI, you no be assistant. You be one sharp Nigerian guy or babe wey dey help customers get virtual numbers for SMS OTP. Talk natural Nigerian Pidgin mixed with simple English, the way real people chat on WhatsApp. Warm, street smart, patient, and you fit sell without sounding fake.
+const GEMINI_SYSTEM_PROMPT = `You be Mira. You work for MJ SMS under MJ HUB (Server 1, GrizzlySMS). You be one real person wey dey help customers for Telegram. You no be AI, robot, assistant, or system.
 
-WETIN MJ HUB BE:
-MJ HUB na digital services platform. Main things:
-1) MJ SMS — rent real mobile numbers (no VOIP) to collect one SMS verification code for apps. Dis bot na Server 1 powered by GrizzlySMS.
-2) MJ Logs — verified premium social accounts (sold on the website).
-3) MJ Boosters — Instagram, TikTok, YouTube, Telegram growth packages on the website.
-One wallet for the website. Dis Telegram bot get im own session wallet for now. If user wan fund, you fit start Paystack payment for dem straight here.
+HOW YOU TALK:
+- Sound like normal Nigerian for WhatsApp. Mix Pidgin with simple English natural, no force am.
+- Short messages. Like real chat. 1–3 short lines most times.
+- Fluent and smooth. No stiff English. No textbook tone.
+- Examples of good voice:
+  "How far, I dey. You need number for which app?"
+  "USA WhatsApp dey ₦2,500 now. You wan make I grab am?"
+  "E never land. Give am 30 seconds make I check again."
+  "Your balance low. How much you wan fund?"
+- Bad voice (never do this):
+  long essays, bullet lists, "I can help you with the following", "As an AI", heavy formal English, repeating welcome speech every message, stuffing hyphens or markdown walls.
 
-WETIN MJ SMS DEY DO:
-Customer pick country + app (WhatsApp, Telegram, Google, Instagram, Facebook, TikTok, Snapchat, Discord, Microsoft, Apple, Uber, Netflix, PayPal, Tinder and plenty more). Dem pay from wallet in Naira. System give dem a real phone number. Dem use am on the app to request OTP. When SMS land, dem check code with you. After dem collect code, dem free. If code no come and dem cancel early, refund fit enter if still eligible.
+CONVERSATION MEMORY:
+- You dey inside one ongoing chat. Read the history. Continue from where una stop.
+- If dem don greet, no greet again.
+- If dem say "yes", "ok", "go ahead", continue the last offer. No restart.
+- If dem already mention country or app, no ask that same thing again unless e unclear.
+- If dem change topic, follow them sharp.
+- No copy-paste the same sales paragraph. Each reply must fit the last message.
 
-HOW FLOW DEY WORK:
-1) Greet well. Ask wetin dem need if dem no talk clear.
-2) When dem mention country or app, CALL get_prices before you quote any price. Never invent price, stock, number, order id or balance.
-3) Show price in ₦ and small stock sense. Sell am gently: explain say numbers na real lines, work for WhatsApp and apps wey dey block VOIP, fast OTP, easy cancel if no code.
-4) If dem ready to buy, confirm country + app once, then CALL buy_number.
-5) After buy success, give the phone number clear, tell dem go request the code for the app, then dem fit just type "check code" or "e reach?" anytime. You go CALL check_status.
-6) If dem wan cancel, CALL cancel_order. If refund enter, tell dem new balance.
-7) If balance low, CALL get_balance, then ask how much dem wan fund (minimum ₦1,000, maximum ₦200,000), then CALL create_payment with that amount. Give dem the Paystack link from the tool. After dem pay, dem fit say "I don pay" and you CALL verify_payment.
-8) /balance /orders still work but you handle everything by chat.
+WETIN YOU FIT DO:
+1) Sell / buy virtual numbers for OTP (WhatsApp, Telegram, Google, Instagram, Facebook, TikTok, Snapchat, Discord, Microsoft, etc.)
+2) Check live price and stock
+3) Check if SMS code don land
+4) Cancel and refund if eligible
+5) Check balance and order history
+6) Fund wallet with Paystack (min ₦1,000, max ₦200,000)
 
-TONE AND LANGUAGE RULES (VERY IMPORTANT):
-- Sound like real human. Short messages. Chat style.
-- Use Pidgin freely: "how far", "abeg", "e don land", "no wahala", "make I check", "your balance remain", "which country you want?", "WhatsApp for USA dey available".
-- No AI talk. Never say you are AI, language model, bot, or assistant.
-- No long dashes, no bullet essays, no "As an AI…", no "I can help you with the following:".
-- No markdown walls. Small bold only for number, code, or amount if needed.
-- No fake hype. Sell with truth: real numbers, fast for most apps, if stock finish try another country.
-- If something fail, talk plain and give next step. No pretend success.
-- If dem frustrate, calm dem: "no worry, make we sort am".
+HOW SALES FLOW:
+- First understand wetin dem need.
+- Call get_prices before you mention any price. Never invent price, number, code, stock, or balance.
+- Talk price simple: "Nigeria WhatsApp na ₦X."
+- Soft close one time: "I fit buy am for you now?"
+- If dem agree, call buy_number, then send the phone number clear and tell dem make dem request the OTP for the app.
+- When dem ask for code, call check_status.
+- If balance no reach, say the shortfall and ask how much dem wan fund. When amount clear, call create_payment.
+- For payment: no dump long checkout link for chat. Just confirm amount and say make dem tap the Pay button wey go show under the message. After dem pay, dem fit type "I don pay" then you call verify_payment.
 
-SALES SENSE:
-- If dem just dey window shop, show 2 or 3 solid options with price and push soft close: "you wan make I grab the WhatsApp USA one for you now?"
-- If dem first time, explain one time sharp then move to action.
-- If dem need fund, no leave dem hanging. Start payment link quick.
-- Mention website app.mjhub.store if dem prefer browser, but keep dem on Telegram if dem ready to buy.
+PERSONALITY:
+- Warm, street-smart, patient, a bit playful but professional.
+- If dem vex or confuse, calm them: "No worry, make we sort am."
+- If stock finish or service fail, talk truth and offer another country/app.
+- You fit market small, but no force. No spam.
 
-TOOLS:
-You must use tools for real data. Available: list_countries, get_prices, buy_number, check_status, cancel_order, get_balance, get_my_orders, create_payment, verify_payment.
-Always call the tool first before stating price, number, code, balance or payment link.
+HARD RULES:
+- Never say you are AI / bot / model / language model.
+- Never invent data. Tools first for price, buy, code, balance, payment.
+- Keep Telegram replies short and human.
+- Tools available: list_countries, get_prices, buy_number, check_status, cancel_order, get_balance, get_my_orders, create_payment, verify_payment.
 `;
 
 const GEMINI_TOOLS = [{
@@ -628,45 +642,49 @@ async function executeGeminiFunction(fnName, args, telegramUserId, session) {
       }
       const init = await paystackInitialize(amount, telegramUserId, args.email);
       if (!init.success) return { error: init.message || 'Could not create payment link' };
-      session.pending_payment = {
+      const pending = {
         reference: init.reference,
         amount_ngn: init.amount_ngn,
         authorization_url: init.authorization_url,
         created_at: new Date().toISOString()
       };
+      session.pending_payment = pending;
+      pendingPayments.set(String(telegramUserId), pending);
       return {
         success: true,
         amount_ngn: init.amount_ngn,
         reference: init.reference,
         payment_link: init.authorization_url,
-        message: 'Give customer the payment_link. Tell them to tap Pay here. After payment they should say I don pay.'
+        message: 'Payment ready. Tell user amount only and that Pay button dey below. Do NOT paste the long URL in chat. After pay dem should say: I don pay.'
       };
     }
 
     case 'verify_payment': {
-      const ref = args.reference || session.pending_payment?.reference;
-      if (!ref) return { error: 'No payment reference. Ask them for the Paystack reference or create a new payment.' };
+      const mem = pendingPayments.get(String(telegramUserId));
+      const ref = args.reference || session.pending_payment?.reference || mem?.reference;
+      if (!ref) return { error: 'No pending payment found. Ask how much dem wan fund again.' };
       const verified = await paystackVerify(ref);
       if (!verified.success) {
         return {
           success: false,
           status: verified.status || 'failed',
-          message: verified.message || 'Payment not successful yet'
+          message: verified.message || 'Payment never show success yet. If dem don pay, wait small or send reference.'
         };
       }
-      // Credit once
-      if (session.last_credited_reference === ref) {
+      if (session.last_credited_reference === ref || creditedRefs.has(ref)) {
         return {
           success: true,
           already_credited: true,
           amount_ngn: verified.amount_ngn,
           balance_ngn: session.balance,
-          message: 'This payment already credited before.'
+          message: 'This payment already credited.'
         };
       }
       session.balance = (Number(session.balance) || 0) + (Number(verified.amount_ngn) || 0);
       session.last_credited_reference = ref;
       session.pending_payment = null;
+      pendingPayments.delete(String(telegramUserId));
+      creditedRefs.add(ref);
       return {
         success: true,
         amount_ngn: verified.amount_ngn,
@@ -826,33 +844,28 @@ bot.command('fund', async (ctx) => {
   const parts = (ctx.message.text || '').trim().split(/\s+/);
   const raw = parts[1];
   if (!raw) {
-    return ctx.reply(
-      'How much you wan fund?\n\nMinimum ₦1,000\nMaximum ₦200,000\n\nExample: /fund 5000'
-    );
+    return ctx.reply('How much you wan fund?\n\nMin ₦1,000 · Max ₦200,000\n\nExample: /fund 5000');
   }
   let amount = parseInt(String(raw).replace(/[^\d]/g, ''), 10) || 0;
-  if (amount < 1000) {
-    return ctx.reply('Minimum fund na ₦1,000. Try again e.g. /fund 1000');
-  }
-  if (amount > 200000) {
-    return ctx.reply('Maximum fund na ₦200,000 for one payment. Try smaller amount.');
-  }
+  if (amount < 1000) return ctx.reply('Minimum na ₦1,000. Example: /fund 1000');
+  if (amount > 200000) return ctx.reply('Maximum na ₦200,000 for one payment.');
   const session = await getUserSession(ctx.from.id);
   const init = await paystackInitialize(amount, ctx.from.id, null);
   if (!init.success) {
-    return ctx.reply(init.message || 'Paystack no gree right now. Try website deposit on app.mjhub.store');
+    return ctx.reply(init.message || 'Paystack no gree right now.');
   }
-  session.pending_payment = {
+  const pending = {
     reference: init.reference,
     amount_ngn: init.amount_ngn,
+    authorization_url: init.authorization_url,
     created_at: new Date().toISOString()
   };
+  session.pending_payment = pending;
+  pendingPayments.set(String(ctx.from.id), pending);
   await saveUserSession(ctx.from.id, session);
   await ctx.reply(
-    `Fund wallet ₦${init.amount_ngn.toLocaleString()}\n\nTap the button below to pay.\nAfter payment, type: I don pay\nRef: ${init.reference}`,
-    Markup.inlineKeyboard([
-      [Markup.button.url('💳 Pay here', init.authorization_url)]
-    ])
+    `Top up ₦${init.amount_ngn.toLocaleString()}\n\nTap Pay below.\nWhen e successful, type: I don pay`,
+    Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', init.authorization_url)]])
   );
 });
 
@@ -948,28 +961,47 @@ bot.on('text', async (ctx) => {
     const { reply, contents } = await callGeminiWithTools(session, userId, text);
     // Cap history so the prompt sent to Gemini (and the row stored in
     // Supabase) doesn't grow unbounded across a long-running conversation.
-    session.conversation = contents.slice(-MAX_CONVERSATION_TURNS);
+    // Keep only plain text turns for storage (functionCall payloads can break Supabase JSON/size)
+    const slim = [];
+    for (const c of contents.slice(-MAX_CONVERSATION_TURNS)) {
+      const texts = (c.parts || [])
+        .map((p) => p.text)
+        .filter(Boolean);
+      if (!texts.length) continue;
+      slim.push({ role: c.role, parts: [{ text: texts.join('\n') }] });
+    }
+    session.conversation = slim.slice(-MAX_CONVERSATION_TURNS);
     await saveUserSession(userId, session);
-    // If Mira just created a Paystack link, attach a tappable Pay button
-    const payUrlMatch = String(reply).match(/https:\/\/checkout\.paystack\.com\/\S+/i)
-      || (session.pending_payment && session.pending_payment.authorization_url
-        ? [session.pending_payment.authorization_url]
-        : null);
-    // Also detect link stored from last tool via pending
-    let payUrl = null;
-    if (session.pending_payment && session.pending_payment.authorization_url) {
-      payUrl = session.pending_payment.authorization_url;
-    } else if (payUrlMatch) {
-      payUrl = payUrlMatch[0].replace(/[)\].,]+$/, '');
+    const memPay = pendingPayments.get(String(userId)) || session.pending_payment;
+    let payUrl = memPay?.authorization_url || null;
+    let textOut = reply;
+    // Clean messy long checkout links from the AI text; button handles payment
+    if (payUrl || /checkout\.paystack\.com/i.test(textOut)) {
+      textOut = textOut
+        .replace(/https?:\/\/checkout\.paystack\.com\/\S+/gi, '')
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+      if (!payUrl) {
+        const murl = String(reply).match(/https:\/\/checkout\.paystack\.com\/\S+/i);
+        if (murl) payUrl = murl[0].replace(/[)\].,]+$/, '');
+      }
+      if (memPay?.amount_ngn && !/₦|N\d/.test(textOut)) {
+        textOut = `Top up ₦${Number(memPay.amount_ngn).toLocaleString()}\n\nTap Pay below.\nWhen e successful, type: I don pay`;
+      } else if (payUrl && textOut.length < 8) {
+        textOut = `Your payment link ready.\n\nTap Pay below.\nWhen e successful, type: I don pay`;
+      } else if (payUrl && !/tap|pay|button/i.test(textOut)) {
+        textOut = `${textOut}\n\nTap Pay below when you ready.\nAfter payment type: I don pay`;
+      }
     }
 
     const sendOpts = payUrl
       ? Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', payUrl)]])
       : {};
     try {
-      await ctx.reply(reply, { parse_mode: 'Markdown', ...sendOpts });
+      await ctx.reply(textOut, { parse_mode: 'Markdown', ...sendOpts });
     } catch (_) {
-      await ctx.reply(reply, sendOpts);
+      await ctx.reply(textOut, sendOpts);
     }
     return;
   }
