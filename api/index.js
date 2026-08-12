@@ -161,8 +161,8 @@ async function getUserSession(userId) {
     if (res.data && res.data[0]) {
       const row = res.data[0];
       const allOrders = row.orders || [];
-      const meta = allOrders.find((o) => o && o.type === '_payment_meta') || {};
-      const orders = allOrders.filter((o) => o && o.type !== '_payment_meta');
+      const meta = allOrders.find((o) => o && (o.type === '_meta' || o.type === '_payment_meta')) || {};
+      const orders = allOrders.filter((o) => o && o.type !== '_meta' && o.type !== '_payment_meta');
       return {
         balance: parseFloat(row.balance || 0),
         state: row.state || 'AWAITING_INPUT',
@@ -170,7 +170,7 @@ async function getUserSession(userId) {
         countryId: row.country_id || null,
         serviceQuery: row.selected_service_query || null,
         orders,
-        conversation: row.conversation || [],
+        conversation: meta.conversation || [],
         pending_payment: meta.pending_payment || null,
         last_credited_reference: meta.last_credited_reference || null
       };
@@ -182,24 +182,23 @@ async function getUserSession(userId) {
 
 async function saveUserSession(userId, session) {
   if (!SUPABASE_REST_URL || !SUPABASE_SERVICE_KEY) return;
-  // Pack payment meta into orders list so we don't need extra Supabase columns.
-  const orders = [...(session.orders || [])].filter((o) => o && o.type !== '_payment_meta');
-  if (session.pending_payment || session.last_credited_reference) {
-    orders.push({
-      type: '_payment_meta',
-      pending_payment: session.pending_payment || null,
-      last_credited_reference: session.last_credited_reference || null
-    });
-  }
+  // Only columns that exist on user_sessions. conversation column is NOT in schema.
+  const orders = [...(session.orders || [])].filter((o) => o && o.type !== '_meta');
+  orders.push({
+    type: '_meta',
+    pending_payment: session.pending_payment || null,
+    last_credited_reference: session.last_credited_reference || null,
+    // keep short conversation in JSON orders meta (no dedicated column)
+    conversation: (session.conversation || []).slice(-8)
+  });
   const payload = {
     user_id: String(userId),
-    balance: session.balance || 0,
+    balance: Number(session.balance) || 0,
     state: session.state || 'AWAITING_INPUT',
     country: session.country || null,
     country_id: session.countryId || null,
     selected_service_query: session.serviceQuery || null,
     orders,
-    conversation: session.conversation || [],
     updated_at: new Date().toISOString()
   };
   try {
@@ -402,7 +401,7 @@ async function grizzlyBalance() {
 // old rigid parseCountryService flow below instead of breaking.
 // ===========================================================================
 
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 const MAX_CONVERSATION_TURNS = 16;
 const MAX_TOOL_ROUNDTRIPS = 6;
@@ -872,7 +871,24 @@ async function callGeminiWithTools(session, telegramUserId, userText) {
         { ...axiosCfg, headers: { 'Content-Type': 'application/json' } }
       );
     } catch (e) {
-      console.error('gemini call failed', e.response?.data || e.message);
+      const errData = e.response?.data || e.message;
+      console.error('gemini call failed', errData);
+      const status = e.response?.status;
+      const msg = String(e.response?.data?.error?.message || e.message || '');
+      if (status === 429 || /quota|rate.?limit|resource.?exhausted/i.test(msg)) {
+        return {
+          reply: 'QUOTA_EXCEEDED',
+          contents,
+          quota: true
+        };
+      }
+      if (status === 404 || /no longer available|not found/i.test(msg)) {
+        return {
+          reply: 'MODEL_UNAVAILABLE',
+          contents,
+          modelFail: true
+        };
+      }
       return {
         reply: 'Network dey do me somehow now. Abeg try that message again sharp sharp.',
         contents
@@ -1183,75 +1199,75 @@ bot.on('text', async (ctx) => {
     try {
       await ctx.sendChatAction('typing');
     } catch (_) {}
-    const { reply, contents } = await callGeminiWithTools(session, userId, text);
-    // Cap history so the prompt sent to Gemini (and the row stored in
-    // Supabase) doesn't grow unbounded across a long-running conversation.
-    // Keep only plain text turns for storage (functionCall payloads can break Supabase JSON/size)
-    const slim = [];
-    for (const c of contents.slice(-MAX_CONVERSATION_TURNS)) {
-      const texts = (c.parts || [])
-        .map((p) => p.text)
-        .filter(Boolean);
-      if (!texts.length) continue;
-      slim.push({ role: c.role, parts: [{ text: texts.join('\n') }] });
-    }
-    session.conversation = slim.slice(-MAX_CONVERSATION_TURNS);
-    await saveUserSession(userId, session);
-    const memPay = pendingPayments.get(String(userId)) || session.pending_payment;
-    let payUrl = memPay?.authorization_url || null;
-    let textOut = reply;
-    // Clean messy long checkout links from the AI text; button handles payment
-    if (payUrl || /checkout\.paystack\.com/i.test(textOut)) {
-      textOut = textOut
-        .replace(/https?:\/\/checkout\.paystack\.com\/\S+/gi, '')
-        .replace(/[ \t]+\n/g, '\n')
-        .replace(/\n{3,}/g, '\n\n')
-        .trim();
-      if (!payUrl) {
-        const murl = String(reply).match(/https:\/\/checkout\.paystack\.com\/\S+/i);
-        if (murl) payUrl = murl[0].replace(/[)\].,]+$/, '');
-      }
-      if (memPay?.amount_ngn && !/₦|N\d/.test(textOut)) {
-        textOut = `Top up ₦${Number(memPay.amount_ngn).toLocaleString()}\n\nTap Pay below.\nWhen e successful, type: I don pay`;
-      } else if (payUrl && textOut.length < 8) {
-        textOut = `Your payment link ready.\n\nTap Pay below.\nWhen e successful, type: I don pay`;
-      } else if (payUrl && !/tap|pay|button/i.test(textOut)) {
-        textOut = `${textOut}\n\nTap Pay below when you ready.\nAfter payment type: I don pay`;
-      }
-    }
+    const geminiResult = await callGeminiWithTools(session, userId, text);
 
-    let sendOpts = {};
-    if (payUrl) {
-      sendOpts = Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', payUrl)]]);
-    } else if (session.last_options && session.last_options.length > 1) {
-      const cid = session.last_options[0].country_id || session.countryId;
-      sendOpts = optionButtons(cid, session.last_options.map((o) => ({
-        service_id: o.service_code,
-        service_name: o.name,
-        variant: o.variant,
-        price_ngn: o.price_ngn
-      })));
-    } else if (session.last_options && session.last_options.length === 1) {
-      const o = session.last_options[0];
-      const cid = o.country_id || session.countryId;
-      sendOpts = Markup.inlineKeyboard([
-        [Markup.button.callback(
-          `✅ Buy ${o.name} · ₦${Number(o.price_ngn).toLocaleString()}`,
-          `opt:${cid}:${o.service_code}:${o.price_ngn}`.slice(0, 64)
-        )],
-        [Markup.button.callback('⬅️ Cancel', 'opt:cancel')]
-      ]);
+    // Quota / model failure → fall through to classic keyword flow so bot still works
+    if (!(geminiResult.quota || geminiResult.modelFail || geminiResult.reply === 'QUOTA_EXCEEDED' || geminiResult.reply === 'MODEL_UNAVAILABLE')) {
+      const { reply, contents } = geminiResult;
+      const slim = [];
+      for (const c of (contents || []).slice(-MAX_CONVERSATION_TURNS)) {
+        const texts = (c.parts || []).map((p) => p.text).filter(Boolean);
+        if (!texts.length) continue;
+        slim.push({ role: c.role, parts: [{ text: texts.join('\n') }] });
+      }
+      session.conversation = slim.slice(-MAX_CONVERSATION_TURNS);
+      await saveUserSession(userId, session);
+
+      const memPay = pendingPayments.get(String(userId)) || session.pending_payment;
+      let payUrl = memPay?.authorization_url || null;
+      let textOut = reply;
+
+      if (payUrl || /checkout\.paystack\.com/i.test(textOut || '')) {
+        textOut = String(textOut || '')
+          .replace(/https?:\/\/checkout\.paystack\.com\/\S+/gi, '')
+          .replace(/[ \t]+\n/g, '\n')
+          .replace(/\n{3,}/g, '\n\n')
+          .trim();
+        if (!payUrl) {
+          const murl = String(reply).match(/https:\/\/checkout\.paystack\.com\/\S+/i);
+          if (murl) payUrl = murl[0].replace(/[)\].,]+$/, '');
+        }
+        if (memPay?.amount_ngn && !/₦|N\d/.test(textOut)) {
+          textOut = `Top up ₦${Number(memPay.amount_ngn).toLocaleString()}\n\nTap Pay below.\nWhen e successful, type: I don pay`;
+        } else if (payUrl && textOut.length < 8) {
+          textOut = `Your payment link ready.\n\nTap Pay below.\nWhen e successful, type: I don pay`;
+        } else if (payUrl && !/tap|pay|button/i.test(textOut)) {
+          textOut = `${textOut}\n\nTap Pay below when you ready.\nAfter payment type: I don pay`;
+        }
+      }
+
+      let sendOpts = {};
+      if (payUrl) {
+        sendOpts = Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', payUrl)]]);
+      } else if (session.last_options && session.last_options.length > 1) {
+        const cid = session.last_options[0].country_id || session.countryId;
+        sendOpts = optionButtons(cid, session.last_options.map((o) => ({
+          service_id: o.service_code,
+          service_name: o.name,
+          variant: o.variant,
+          price_ngn: o.price_ngn
+        })));
+      } else if (session.last_options && session.last_options.length === 1) {
+        const o = session.last_options[0];
+        const cid = o.country_id || session.countryId;
+        sendOpts = Markup.inlineKeyboard([
+          [Markup.button.callback(
+            `✅ Buy ${o.name} · ₦${Number(o.price_ngn).toLocaleString()}`,
+            `opt:${cid}:${o.service_code}:${o.price_ngn}`.slice(0, 64)
+          )],
+          [Markup.button.callback('⬅️ Cancel', 'opt:cancel')]
+        ]);
+      }
+      try {
+        await ctx.reply(textOut, { parse_mode: 'Markdown', ...sendOpts });
+      } catch (_) {
+        await ctx.reply(textOut, sendOpts);
+      }
+      return;
     }
-    try {
-      await ctx.reply(textOut, { parse_mode: 'Markdown', ...sendOpts });
-    } catch (_) {
-      await ctx.reply(textOut, sendOpts);
-    }
-    return;
   }
 
-  // Fallback used only if GEMINI_API_KEY isn't configured — the original
-  // rigid substring/keyword flow, kept working rather than removed.
+  // Fallback: classic flow when Gemini is off, quota exceeded, or model failed
   const parsed = parseCountryService(text);
   if (!parsed.countryId) {
     return ctx.reply(
