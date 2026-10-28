@@ -1,39 +1,12 @@
-# MJ SMS Telegram Bot (Grizzly only)
+# MJ SMS Telegram Bot v3
 
-Deploy on **Vercel**. Supplier: **GrizzlySMS** (same as MJ HUB Server 1).
+Server 1 = Grizzly · Server 2 = SMS-Bus (same account/prices as mjhub.store).
 
-## Env vars (Vercel → Project → Settings → Environment Variables)
+## Deploy order
+1. DB (already applied to the website Supabase project): `supabase/migrations/20261017_bot_wallet.sql`
+2. Vercel env (existing ones keep working): `BOT_TOKEN`, `WEBHOOK_SECRET` (**now required**), `GRIZZLYSMS_API_KEY`,
+   `SMSBUS_API_TOKEN` (new), `MJ_HUB_REST_URL`, `MJ_HUB_SERVICE_KEY`, `PAYSTACK_SECRET_KEY`, `ADMIN_TELEGRAM_ID` (no default now), optional `GEMINI_API_KEY`.
+3. Deploy, then open `https://YOUR-APP.vercel.app/setup-webhook?secret=WEBHOOK_SECRET` once (also installs the Menu button list).
+4. Paystack webhook URL: `https://YOUR-APP.vercel.app/paystack`.
 
-| Name | Required | Notes |
-|------|----------|--------|
-| `BOT_TOKEN` | Yes | From @BotFather |
-| `GRIZZLYSMS_API_KEY` | Yes | Same key as main website |
-| `SUPABASE_REST_URL` | Yes | e.g. `https://xxxx.supabase.co/rest/v1` |
-| `SUPABASE_SERVICE_KEY` | Yes | Service role key |
-| `USD_TO_NGN_RATE` | No | Default `1500` |
-| `WEBHOOK_SECRET` | Recommended | Telegram webhook secret |
-| `GEMINI_API_KEY` | Recommended | Mira AI chat (Pidgin, full tools) |
-| `PAYSTACK_SECRET_KEY` | Recommended | Wallet top-up via Paystack |
-| `ADMIN_TELEGRAM_ID` | No | Admin Telegram numeric id |
-
-## Deploy
-
-1. Push this repo to GitHub
-2. Import project on vercel.com
-3. Set env vars
-4. Deploy
-5. Open once: `https://YOUR-PROJECT.vercel.app/setup-webhook?secret=YOUR_WEBHOOK_SECRET`
-6. In Paystack Dashboard → Settings → Webhooks, add:
-   `https://YOUR-PROJECT.vercel.app/paystack`
-   Event: `charge.success`
-
-## Features
-
-- Natural Pidgin + English agent (Mira) with full tool calling
-- Buy numbers, check OTP, cancel/refund
-- Paystack funding (`/fund 2000` or chat "fund my wallet")
-- GrizzlySMS Server 1 only
-
-## Stop Render
-
-On Render: suspend/delete the old service so it does not fight the webhook.
+Old balances in the paused "MJ SMS BOT" project are not migrated (restore it and ask for a one-off import if needed).

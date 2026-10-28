@@ -1,12 +1,14 @@
 {
   "name": "mj-sms-telegram-bot",
-  "version": "2.0.0",
-  "description": "MJ SMS Telegram bot — GrizzlySMS only, Vercel webhook",
+  "version": "3.0.0",
+  "description": "MJ SMS Telegram bot — Server 1 (Grizzly) + Server 2 (SMS-Bus), Vercel webhook",
   "main": "api/index.js",
   "scripts": {
-    "start": "node api/index.js"
+    "start": "node api/index.js",
+    "check": "node --check api/index.js && node --check lib/wallet.js && node --check lib/providers.js && node --check lib/catalog.js"
   },
   "dependencies": {
+    "@vercel/functions": "^1.5.0",
     "axios": "^1.7.0",
     "telegraf": "^4.16.0"
   },
