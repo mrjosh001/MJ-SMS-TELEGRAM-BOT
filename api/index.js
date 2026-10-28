@@ -1,3818 +1,528 @@
 /**
- * MJ SMS Telegram Bot — GrizzlySMS only (MJ HUB Server 1)
- * Deploy on Vercel as a serverless webhook (no Render long-running process).
+ * MJ SMS Telegram Bot v3 — Server 1 (Grizzly) + Server 2 (SMS-Bus)
+ * Vercel serverless webhook. Money/orders live in Postgres (bot_* tables) and change only
+ * through atomic SQL functions — see lib/wallet.js and supabase/migrations.
  */
 const { Telegraf, Markup } = require('telegraf');
-const axios = require('axios');
+const wallet = require('../lib/wallet');
+const paystack = require('../lib/paystack');
+const catalog = require('../lib/catalog');
+const gemini = require('../lib/gemini');
+const { providers, byServer, grizzly, smsbus } = require('../lib/providers');
+const U = require('../lib/util');
+const { COUNTRY_MAP, SERVICE_MAP, money, ngn, sleep, esc, parseNaira, formatWait } = U;
+
+let waitUntil = (p) => { Promise.resolve(p).catch(() => {}); };
+try { waitUntil = require('@vercel/functions').waitUntil; } catch (_) { /* optional dependency */ }
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const GRIZZLY_KEY = process.env.GRIZZLYSMS_API_KEY;
-const GRIZZLY_BASE = 'https://api.grizzlysms.com/stubs/handler_api.php';
-let SUPABASE_REST_URL = (process.env.SUPABASE_REST_URL || process.env.SUPABASE_URL || '').replace(/\/$/, '');
-if (SUPABASE_REST_URL && !/\/rest\/v1$/i.test(SUPABASE_REST_URL)) {
-  // Allow either full REST URL or project root URL
-  SUPABASE_REST_URL = SUPABASE_REST_URL.replace(/\/$/, '') + '/rest/v1';
-}
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-
-// MJ HUB website is a DIFFERENT Supabase project. Bot sessions use SUPABASE_* above.
-// Catalog selling prices come from the website DB via these env vars (read-only).
-let MJ_HUB_REST_URL = (
-  process.env.MJ_HUB_REST_URL ||
-  process.env.MJ_HUB_SUPABASE_URL ||
-  process.env.MJHUB_SUPABASE_URL ||
-  ''
-).replace(/\/$/, '');
-if (MJ_HUB_REST_URL && !/\/rest\/v1$/i.test(MJ_HUB_REST_URL)) {
-  MJ_HUB_REST_URL = MJ_HUB_REST_URL + '/rest/v1';
-}
-const MJ_HUB_SERVICE_KEY =
-  process.env.MJ_HUB_SERVICE_KEY ||
-  process.env.MJ_HUB_SUPABASE_SERVICE_KEY ||
-  process.env.MJHUB_SERVICE_KEY ||
-  '';
-const mjHubHeaders = {
-  apikey: MJ_HUB_SERVICE_KEY || '',
-  Authorization: `Bearer ${MJ_HUB_SERVICE_KEY || ''}`,
-  'Content-Type': 'application/json',
-  Prefer: 'return=representation'
-};
-
-const USD_TO_NGN = Number(process.env.USD_TO_NGN_RATE) || 1500;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || process.env.PAYSTACK_SECRET || process.env.PAYSTACK_SECRET_KEY_LIVE || '';
-const ADMIN_TELEGRAM_ID = process.env.ADMIN_TELEGRAM_ID || '7466363018';
-// Same support channels as MJ Hub website (index.html ADMIN_WA + t.me/mj_hub_tg)
+const ADMIN_ID = String(process.env.ADMIN_TELEGRAM_ID || '');
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 const SUPPORT_WA = (process.env.SUPPORT_WA || '14305583021').replace(/[^0-9]/g, '');
-const SUPPORT_WA_LINK = `https://wa.me/${SUPPORT_WA}`;
-const SUPPORT_TG_LINK = process.env.SUPPORT_TG || 'https://t.me/mj_hub_tg';
+const SUPPORT_TG = process.env.SUPPORT_TG || 'https://t.me/mj_hub_tg';
 const SUPPORT_SITE = process.env.SUPPORT_SITE || 'https://mjhub.store';
-// Grizzly blocks cancel shortly after getNumber (often ~2 min). Use 3 min default; override with MIN_CANCEL_SECONDS.
-const MIN_CANCEL_MS = (Number(process.env.MIN_CANCEL_SECONDS) || 180) * 1000;
-
-// Common Grizzly / SMS-Activate style country ids
-const COUNTRY_MAP = {
-  nigeria: 19, ng: 19, naija: 19,
-  usa: 12, us: 12, america: 12, 'united states': 12,
-  uk: 16, britain: 16, england: 16, 'united kingdom': 16,
-  ghana: 38, gh: 38,
-  kenya: 8, ke: 8,
-  'south africa': 31, sa: 31,
-  india: 22, in: 22,
-  canada: 36, ca: 36,
-  germany: 43, de: 43, deutschland: 43,
-  france: 78, fr: 78,
-  netherlands: 48, nl: 48,
-  indonesia: 6, id: 6,
-  philippines: 4, ph: 4,
-  brazil: 73, br: 73,
-  mexico: 54, mx: 54,
-  turkey: 62, tr: 62,
-  egypt: 21, eg: 21,
-  russia: 0, ru: 0,
-  ukraine: 1, ua: 1,
-  poland: 15, pl: 15,
-  spain: 56, es: 56,
-  italy: 86, it: 86,
-  china: 3, cn: 3,
-  vietnam: 10, vn: 10,
-  thailand: 52, th: 52,
-  malaysia: 7, my: 7,
-  australia: 175, au: 175,
-  belarus: 51, by: 51,
-
-  japan: 182, jp: 182,
-  'south korea': 103, korea: 103, kr: 103,
-  uae: 95, dubai: 95, emirates: 95, 'united arab emirates': 95,
-  portugal: 117, pt: 117,
-  pakistan: 66, pk: 66,
-  bangladesh: 60, bd: 60,
-  morocco: 37, ma: 37,
-  argentina: 39, ar: 39,
-  colombia: 33, co: 33,
-  chile: 151, cl: 151,
-  peru: 65, pe: 65,
-  romania: 32, ro: 32,
-  sweden: 46, se: 46,
-  norway: 174, no: 174,
-  denmark: 172, dk: 172,
-  finland: 163, fi: 163,
-  ireland: 23, ie: 23,
-  'new zealand': 67, nz: 67,
-  singapore: 196, sg: 196,
-  'hong kong': 14, hk: 14,
-  taiwan: 55, tw: 55,
-  israel: 13, il: 13,
-  saudi: 53, 'saudi arabia': 53, sa: 53,
-  iraq: 40, iq: 40,
-  serbia: 29, rs: 29,
-  croatia: 35, hr: 35,
-  hungary: 100, hu: 100,
-  czech: 63, 'czech republic': 63, cz: 63,
-  austria: 50, at: 50,
-  switzerland: 173, ch: 173,
-  belgium: 82, be: 82,
-  cameroon: 41, cm: 41,
-  'ivory coast': 27, 'cote divoire': 27, ci: 27,
-  senegal: 61, sn: 61,
-  uganda: 75, ug: 75,
-  tanzania: 34, tz: 34,
-  ethiopia: 71, et: 71
-};
-
-// Common service short-codes (Grizzly / SMS-Activate style)
-const SERVICE_MAP = {
-  whatsapp: 'wa', wa: 'wa',
-  telegram: 'tg', tg: 'tg',
-  google: 'go', gmail: 'go',
-  facebook: 'fb', fb: 'fb',
-  instagram: 'ig', ig: 'ig',
-  twitter: 'tw', x: 'tw',
-  tiktok: 'lf', douyin: 'lf',
-  discord: 'ds',
-  snapchat: 'fu', snap: 'fu',
-  microsoft: 'mm',
-  amazon: 'am',
-  apple: 'wx',
-  uber: 'ub',
-  viber: 'vi',
-  line: 'me',
-  netflix: 'nf',
-  paypal: 'ts',
-  bumble: 'mo',
-  tinder: 'oi',
-  linkedin: 'tn',
-  signal: 'aaw',
-  wechat: 'we',
-  imo: 'im'
-};
-
-// Human names for Grizzly service codes (aligned with MJ HUB website map)
-const SERVICE_NAMES = {
-  aaw: 'Signal', aax: 'Haraj', acz: 'Claude / AI', am: 'Amazon',
-  ds: 'Discord', fb: 'Facebook', fu: 'Snapchat', go: 'Google',
-  ig: 'Instagram', im: 'Imo', kc: 'X / Twitter (alt)', kt: 'KakaoTalk',
-  lf: 'TikTok', me: 'Line', mm: 'Microsoft', mo: 'Bumble',
-  nf: 'Netflix', oi: 'Tinder', ot: 'Any other', tg: 'Telegram',
-  tk: 'TikTok', tl: 'Truecaller', tn: 'LinkedIn', ts: 'PayPal',
-  tw: 'X / Twitter', uk: 'Airbnb', vi: 'Viber', vk: 'VK',
-  wa: 'WhatsApp', we: 'WeChat', wx: 'Apple', ya: 'Yandex'
-};
-
-function asName(v) {
-  if (v == null) return '';
-  if (typeof v === 'string' || typeof v === 'number') return String(v).trim();
-  if (typeof v === 'object') {
-    return String(v.eng || v.english || v.name || v.title || v.country || v.label || '').trim();
-  }
-  return String(v).trim();
-}
-
-function friendlyServiceName(code, rawName) {
-  const c = String(code || '').toLowerCase();
-  const raw = String(rawName || '').trim();
-  if (raw && raw.toLowerCase() !== c && !/^gr_/i.test(raw)) return raw.replace(/_/g, ' ');
-  if (SERVICE_NAMES[c]) return SERVICE_NAMES[c];
-  return c.toUpperCase();
-}
-
-function detectVariant(name, code) {
-  const s = `${name || ''} ${code || ''}`.toLowerCase();
-  // Only label virtual when supplier name/code clearly indicates it
-  if (/\bvirtual\b|\bvoip\b|temp number|temporary/.test(s)) return 'virtual';
-  if (/\bphysical\b|\breal sim\b|\bnormal\b|long.?term/.test(s)) return 'normal';
-  // Alternate route codes (wa_x style) — only when code has a suffix, not plain "wa"
-  if (/^(wa|tg|go|ig|fb)_.+/.test(s)) return 'alternate';
-  return 'normal';
-}
-
-
-if (!BOT_TOKEN) {
-  console.error('BOT_TOKEN missing');
-}
+if (!BOT_TOKEN) console.error('BOT_TOKEN missing');
 
 const bot = new Telegraf(BOT_TOKEN || 'missing');
+const md = { parse_mode: 'Markdown' };
+const safe = (s) => String(s ?? '').replace(/[_*`\[\]]/g, ' ');
+const isAdmin = (ctx) => ADMIN_ID && String(ctx.from?.id) === ADMIN_ID;
+const mins = (ms) => Math.round(ms / 60000);
 
-// Fallback store when Supabase session save fails (400/404)
-const pendingPayments = new Map(); // telegramUserId -> { reference, amount_ngn, authorization_url }
-/** In-memory session mirror — survives when Supabase patch fails mid-request */
-const sessionMem = new Map(); // userId string -> session object
-/** In-memory intent (survives within warm serverless instance; backed by Supabase too) */
-const pendingIntent = new Map(); // userId -> { service, countryId, countryName, at }
+const APPS = [['WhatsApp', 'wa'], ['Telegram', 'tg'], ['Google', 'go'], ['Instagram', 'ig'], ['Facebook', 'fb'], ['TikTok', 'lf'], ['Snapchat', 'fu'], ['Discord', 'ds']];
+const COUNTRIES = ['USA', 'UK', 'Canada', 'Nigeria', 'Ghana', 'Kenya'];
 
-function setIntent(userId, data) {
-  pendingIntent.set(String(userId), { ...data, at: Date.now() });
-}
-function getIntent(userId) {
-  const p = pendingIntent.get(String(userId));
-  if (!p) return null;
-  if (Date.now() - p.at > 45 * 60 * 1000) {
-    pendingIntent.delete(String(userId));
-    return null;
-  }
-  return p;
-}
-function clearIntent(userId) {
-  pendingIntent.delete(String(userId));
-}
+const menuKb = Markup.inlineKeyboard([
+  [Markup.button.callback('🛍 Open shop', 'menu:buy'), Markup.button.callback('💰 Wallet & deposit', 'menu:wallet')],
+  [Markup.button.callback('📦 My history', 'menu:orders'), Markup.button.callback('🆘 Support & help', 'menu:support')]
+]);
 
-/** If user replied to a bot message, pull service/country hints from that message */
-function contextFromReply(ctx) {
-  const rt = ctx.message?.reply_to_message;
-  if (!rt || !rt.text) return {};
-  const t = String(rt.text);
-  const out = {};
-  const forSvc = t.match(/country for\s+([a-z0-9][a-z0-9\s]{0,30}?)\??$/i)
-    || t.match(/for\s+(whatsapp|telegram|instagram|google|facebook|tiktok|snapchat|discord)\??/i);
-  if (forSvc) out.service = forSvc[1].trim();
-  const appFor = t.match(/app for\s+([a-z][a-z\s]{1,30}?)\??$/i);
-  if (appFor) out.country = appFor[1].trim();
-  const checking = t.match(/Checking\s+([^·\n]+)(?:·\s*(\S+))?/i);
-  if (checking) {
-    out.country = out.country || checking[1].trim();
-    if (checking[2]) out.service = out.service || checking[2].trim();
-  }
-  return out;
-}
-
-const creditedRefs = new Set();
-
-const axiosCfg = {
-  timeout: 25000,
-  headers: { Accept: 'application/json, text/plain, */*', 'User-Agent': 'MJ-SMS-Bot/2.0' }
+const MSG = {
+  greet: 'How far 👋 Welcome to *MJ SMS*.\nI be *Mira* — I go help you get *real number* for verification.\n\n' +
+    'Type country + app, e.g.\n• *USA WhatsApp*\n• *UK Telegram*\n• *Canada Instagram*\n\n' +
+    'We get *two servers* — I go show you both prices.\n\n/balance · /fund 2k · /orders · /support',
+  noStock: 'That one no dey available right now o. You fit try another country or app?',
+  fallback: 'I no too catch that one o.\n\nTry:\n• *USA WhatsApp* — buy number\n• *Fund 5k* — top up\n• *Balance* — check wallet\n• *Orders* — your numbers',
+  walletDown: 'Wallet service no gree answer small. Abeg try again in a minute. Nothing was charged.'
 };
 
-const sbHeaders = {
-  apikey: SUPABASE_SERVICE_KEY || '',
-  Authorization: `Bearer ${SUPABASE_SERVICE_KEY || ''}`,
-  'Content-Type': 'application/json',
-  Prefer: 'return=representation'
-};
+// ------------------------------------------------------------------ session (chat state only)
+async function S(ctx) { return wallet.getSession(ctx.from.id); }
+const save = (ctx, s) => wallet.saveSession(ctx.from.id, s);
+const clearFlow = (s) => { s.state = null; s.country = null; s.service = null; return s; };
 
-function markupNgn(usdPrice) {
-  const n = Number(usdPrice) || 0;
-  const ngn = n * USD_TO_NGN;
-  // MUST match lib/pricing.js's applyMarkup() on the main site exactly —
-  // otherwise the same GrizzlySMS number sells at a different price
-  // depending on whether the customer buys through the website or this
-  // bot, which is a real pricing-integrity/profit-control problem, not
-  // just a cosmetic inconsistency. If you ever change the range on the
-  // website (currently 40–85%, updated 2026-08-04), update it here too.
-  const percent = 40 + Math.random() * 45;
-  const finalPrice = Math.ceil(ngn * (1 + percent / 100));
-  return Math.ceil(finalPrice / 50) * 50;
+// ------------------------------------------------------------------ orders: OTP / expiry / refund
+/** Look at the supplier once and move the order forward. Safe to call repeatedly. */
+async function settleOrder(order) {
+  const p = providers[order.provider];
+  if (order.code) return { state: 'code', code: order.code, fresh: false };
+  if (order.refunded) return { state: 'refunded' };
+  const st = await p.status(order.order_id);
+  if (st.state === 'code') {
+    const r = await wallet.completeOrder(p.id, order.order_id, st.code);
+    return r.delivered ? { state: 'code', code: st.code, fresh: true } : { state: 'refunded' };
+  }
+  if (st.state === 'expired') {
+    const r = await wallet.refundOrder(p.id, order.order_id, 'expired');
+    return { state: 'refunded', refund: r };
+  }
+  const age = Date.now() - new Date(order.created_at).getTime();
+  if (age >= p.expiryMs) {
+    const c = await p.cancel(order.order_id);
+    if (c.ok) {
+      const r = await wallet.refundOrder(p.id, order.order_id, 'expired');
+      return { state: 'refunded', refund: r };
+    }
+  }
+  return { state: 'waiting' };
 }
 
-async function getUserSession(userId) {
-  const uid = String(userId);
-  const empty = {
-    balance: 0,
-    state: 'AWAITING_INPUT',
-    country: null,
-    countryId: null,
-    serviceQuery: null,
-    pendingService: null,
-    orders: [],
-    conversation: []
-  };
-  const mem = sessionMem.get(uid);
-  if (!SUPABASE_REST_URL || !SUPABASE_SERVICE_KEY) {
-    return mem ? { ...empty, ...mem } : empty;
-  }
+async function sendCode(userId, order, code) {
   try {
-    const res = await axios.get(
-      `${SUPABASE_REST_URL}/user_sessions?user_id=eq.${userId}&select=*`,
-      { ...axiosCfg, headers: sbHeaders }
-    );
-    if (res.data && res.data[0]) {
-      const row = res.data[0];
-      const allOrders = row.orders || [];
-      const meta = allOrders.find((o) => o && (o.type === '_meta' || o.type === '_payment_meta')) || {};
-      const orders = allOrders.filter((o) => o && o.type !== '_meta' && o.type !== '_payment_meta');
-      const fromDb = {
-        balance: parseFloat(row.balance || 0),
-        state: row.state || 'AWAITING_INPUT',
-        country: row.country || null,
-        countryId: row.country_id || null,
-        serviceQuery: row.selected_service_query || null,
-        pendingService: row.selected_service_query || meta.pendingService || null,
-        orders,
-        conversation: meta.conversation || [],
-        pending_payment: meta.pending_payment || null,
-        last_credited_reference: meta.last_credited_reference || null
-      };
-      // Prefer recent in-memory balance/state if DB lag/fail
-      if (mem) {
-        if (mem._balUpdatedAt && Date.now() - mem._balUpdatedAt < 180000) {
-          fromDb.balance = money(mem.balance);
+    await bot.telegram.sendMessage(userId,
+      `Your code don drop ✅\n\n*${safe(code)}*\n\n${p2(order)} · \`${order.order_id}\`\nCopy sharp. You need another number?`, md);
+  } catch (e) { console.error('sendCode', e.message); }
+}
+const p2 = (o) => providers[o.provider].label;
+
+/** After a purchase, keep checking for ~55s so the code is pushed without a tap. */
+async function pollOrder(order) {
+  for (let i = 0; i < 11; i++) {
+    await sleep(5000);
+    try {
+      const fresh = (await wallet.getOrder(order.provider, order.order_id)) || order;
+      const r = await settleOrder(fresh);
+      if (r.state === 'code') { if (r.fresh) await sendCode(order.user_id, order, r.code); return; }
+      if (r.state === 'refunded') {
+        if (r.refund?.refunded) {
+          await bot.telegram.sendMessage(order.user_id, `No code came, so I don refund you ✅\n${ngn(r.refund.amount)} back · Balance: ${ngn(r.refund.balance)}`);
         }
-        if (mem._stateUpdatedAt && Date.now() - mem._stateUpdatedAt < 180000 && mem.state) {
-          fromDb.state = mem.state;
-        }
+        return;
       }
-      sessionMem.set(uid, { ...fromDb, _balUpdatedAt: mem?._balUpdatedAt, _stateUpdatedAt: mem?._stateUpdatedAt });
-      return fromDb;
-    }
-  } catch (e) {
-    console.error('getUserSession', e.message);
-    if (mem) return { ...empty, ...mem };
+    } catch (e) { console.error('poll', e.message); }
   }
-  if (mem) return { ...empty, ...mem };
-  await saveUserSession(userId, empty);
-  return empty;
 }
 
-async function saveUserSession(userId, session) {
-  const uid = String(userId);
-  // Always keep memory mirror so fund state + debit work even if DB fails
-  sessionMem.set(uid, {
-    ...session,
-    balance: money(session.balance),
-    state: session.state || 'AWAITING_INPUT',
-    _balUpdatedAt: Date.now(),
-    _stateUpdatedAt: Date.now()
+// ------------------------------------------------------------------ buying
+async function showOptions(ctx, s, countryText, code) {
+  const appName = U.SERVICE_NAMES[code] || code.toUpperCase();
+  await ctx.reply(`Checking ${countryText} · ${appName}…`);
+  let res;
+  try { res = await catalog.options(countryText, code); }
+  catch (e) { console.error('options', e.message); return ctx.reply('Prices no gree load now. Try again in a moment.'); }
+  clearFlow(s); await save(ctx, s);
+  if (!res.list.length) return ctx.reply(MSG.noStock);
+
+  const rows = res.list.slice(0, 10).map((o) => {
+    const pool = o.countryName && o.server === 1 && /\(2\)/.test(o.countryName) ? ` ${o.countryName}` : '';
+    const label = `${o.provider === 'smsbus' ? 'S2' : 'S1'}${pool} · ${o.serviceName} · ${ngn(o.price)}`;
+    return [Markup.button.callback(label.slice(0, 60), `b:${o.server}:${o.countryId}:${o.serviceId}:${o.price}`.slice(0, 64))];
   });
-
-  if (!SUPABASE_REST_URL || !SUPABASE_SERVICE_KEY) {
-    console.error('saveUserSession: missing SUPABASE env — memory only');
-    return true;
-  }
-  const orders = [...(session.orders || [])].filter((o) => o && o.type !== '_meta');
-  const pending = session.pendingService || session.serviceQuery || null;
-  orders.push({
-    type: '_meta',
-    pending_payment: session.pending_payment || null,
-    last_credited_reference: session.last_credited_reference || null,
-    pendingService: pending,
-    conversation: (session.conversation || []).slice(-8)
-  });
-  const payload = {
-    user_id: uid,
-    balance: money(session.balance),
-    state: String(session.state || 'AWAITING_INPUT').slice(0, 64),
-    country: session.country ? String(session.country).slice(0, 64) : null,
-    country_id: session.countryId != null ? String(session.countryId) : null,
-    selected_service_query: pending ? String(pending).slice(0, 128) : null,
-    orders,
-    updated_at: new Date().toISOString()
-  };
-  try {
-    const existing = await axios.get(
-      `${SUPABASE_REST_URL}/user_sessions?user_id=eq.${userId}&select=user_id`,
-      { ...axiosCfg, headers: sbHeaders }
-    );
-    if (existing.data && existing.data.length) {
-      try {
-        await axios.patch(
-          `${SUPABASE_REST_URL}/user_sessions?user_id=eq.${userId}`,
-          payload,
-          { ...axiosCfg, headers: sbHeaders }
-        );
-      } catch (e1) {
-        console.error('saveUserSession full patch', e1.response?.status, e1.response?.data || e1.message);
-        // Fallback: balance + state only
-        await axios.patch(
-          `${SUPABASE_REST_URL}/user_sessions?user_id=eq.${userId}`,
-          { balance: payload.balance, state: payload.state, updated_at: payload.updated_at },
-          { ...axiosCfg, headers: sbHeaders }
-        );
-      }
-    } else {
-      await axios.post(`${SUPABASE_REST_URL}/user_sessions`, payload, {
-        ...axiosCfg,
-        headers: sbHeaders
-      });
-    }
-    return true;
-  } catch (e) {
-    console.error('saveUserSession', e.response?.status, e.response?.data || e.message);
-    // Memory holds the truth — allow debit/fund to continue
-    return true;
-  }
+  rows.push([Markup.button.callback('❌ Cancel', 'opt:cancel')]);
+  return ctx.reply(`*${safe(res.country)}* · ${safe(appName)}\nS1 = Server 1 · S2 = Server 2 (different stock and price).\nPick one:`,
+    { ...md, ...Markup.inlineKeyboard(rows) });
 }
 
-async function grizzlyGet(params) {
-  const res = await axios.get(GRIZZLY_BASE, {
-    ...axiosCfg,
-    params: { api_key: (GRIZZLY_KEY || '').trim(), ...params }
-  });
-  return res.data;
-}
-
-// Live country cache from Grizzly (full list, not hardcoded map only)
-let _countryCache = null;
-let _countryCacheAt = 0;
-const COUNTRY_CACHE_MS = 6 * 60 * 60 * 1000; // 6 hours
-
-async function grizzlyCountries() {
-  const now = Date.now();
-  if (_countryCache && now - _countryCacheAt < COUNTRY_CACHE_MS) return _countryCache;
-  try {
-    const data = await grizzlyGet({ action: 'getCountries' });
-    const list = [];
-    if (Array.isArray(data)) {
-      for (const c of data) {
-        const id = Number(c.id ?? c.country ?? c.code ?? c.country_id);
-        const name = asName(c.eng || c.english || c.name || c.country_name || c.title || c);
-        if (Number.isFinite(id) && id >= 0 && name && name !== '[object Object]') list.push({ id, name });
-      }
-    } else if (data && typeof data === 'object') {
-      for (const [k, info] of Object.entries(data)) {
-        const id = Number(info?.id ?? info?.country ?? k);
-        const name = asName(info?.eng || info?.english || info?.name || info?.country_name || info);
-        if (Number.isFinite(id) && id >= 0 && name && name !== '[object Object]') list.push({ id, name });
-      }
-    }
-    if (list.length) {
-      _countryCache = list;
-      _countryCacheAt = now;
-      console.log('[countries] loaded from Grizzly:', list.length);
-      return list;
-    }
-  } catch (e) {
-    console.error('grizzlyCountries', e.message);
-  }
-  // Fallback catalog when Grizzly getCountries is down (502 etc.)
-  // Names are searchable free-text; ids are SMS-Activate / Grizzly compatible.
-  const FALLBACK = [
-    [0,'Russia'],[1,'Ukraine'],[2,'Kazakhstan'],[3,'China'],[4,'Philippines'],
-    [5,'Myanmar'],[6,'Indonesia'],[7,'Malaysia'],[8,'Kenya'],[9,'Tanzania'],
-    [10,'Vietnam'],[11,'Kyrgyzstan'],[12,'USA'],[13,'Israel'],[14,'Hong Kong'],
-    [15,'Poland'],[16,'United Kingdom'],[17,'Madagascar'],[18,'Congo'],[19,'Nigeria'],
-    [20,'Macau'],[21,'Egypt'],[22,'India'],[23,'Ireland'],[24,'Cambodia'],
-    [25,'Laos'],[26,'Haiti'],[27,'Ivory Coast'],[28,'Gambia'],[29,'Serbia'],
-    [30,'Yemen'],[31,'South Africa'],[32,'Romania'],[33,'Colombia'],[34,'Estonia'],
-    [35,'Azerbaijan'],[36,'Canada'],[37,'Morocco'],[38,'Ghana'],[39,'Argentina'],
-    [40,'Uzbekistan'],[41,'Cameroon'],[42,'Chad'],[43,'Germany'],[44,'Lithuania'],
-    [45,'Croatia'],[46,'Sweden'],[47,'Iraq'],[48,'Netherlands'],[49,'Latvia'],
-    [50,'Austria'],[51,'Belarus'],[52,'Thailand'],[53,'Saudi Arabia'],[54,'Mexico'],
-    [55,'Taiwan'],[56,'Spain'],[57,'Iran'],[58,'Algeria'],[59,'Slovenia'],
-    [60,'Bangladesh'],[61,'Senegal'],[62,'Turkey'],[63,'Czech Republic'],[64,'Sri Lanka'],
-    [65,'Peru'],[66,'Pakistan'],[67,'New Zealand'],[68,'Guinea'],[69,'Mali'],
-    [70,'Venezuela'],[71,'Ethiopia'],[72,'Mongolia'],[73,'Brazil'],[74,'Afghanistan'],
-    [75,'Uganda'],[76,'Angola'],[77,'Cyprus'],[78,'France'],[79,'Papua New Guinea'],
-    [80,'Mozambique'],[81,'Nepal'],[82,'Belgium'],[83,'Bulgaria'],[84,'Hungary'],
-    [85,'Moldova'],[86,'Italy'],[87,'Paraguay'],[88,'Honduras'],[89,'Tunisia'],
-    [90,'Nicaragua'],[91,'Timor-Leste'],[92,'Bolivia'],[93,'Costa Rica'],[94,'Guatemala'],
-    [95,'UAE'],[96,'Zimbabwe'],[97,'Puerto Rico'],[98,'Sudan'],[99,'Togo'],
-    [100,'Kuwait'],[101,'El Salvador'],[102,'Libya'],[103,'South Korea'],[104,'Jamaica'],
-    [105,'Trinidad and Tobago'],[109,'Ecuador'],[114,'Lebanon'],[117,'Portugal'],
-    [129,'Greece'],[141,'Georgia'],[151,'Chile'],[163,'Finland'],[172,'Denmark'],
-    [173,'Switzerland'],[174,'Norway'],[175,'Australia'],[176,'Eritrea'],[179,'Niger'],
-    [182,'Japan'],[187,'USA'],[196,'Singapore']
-  ];
-  const byId = new Map(FALLBACK);
-  for (const [name, id] of Object.entries(COUNTRY_MAP)) {
-    if (name.length <= 2) continue;
-    if (!byId.has(id)) byId.set(id, name);
-  }
-  const list = [...byId.entries()].map(([id, name]) => ({ id, name: String(name) }));
-  console.log('[countries] using fallback list', list.length);
-  return list;
-}
-
-function isGrizzlyHubRow(r) {
-  // Strict: only MJ HUB rows that belong to Grizzly / Server 1 SMS — not log-domain / other servers
-  const blob = [
-    r.supplier, r.provider, r.server, r.domain, r.source, r.platform,
-    r.supplier_name, r.server_name, r.product_type, r.category
-  ].map((x) => String(x || '').toLowerCase()).join(' ');
-  if (!blob.trim()) return true; // no metadata → allow (legacy rows)
-  if (/log\s*domain|logdomain|server\s*2|hero|sms-?man|5sim|daisy/.test(blob)) return false;
-  if (/grizzly|server\s*1|server_1|server1/.test(blob)) return true;
-  // If metadata exists but doesn't look like another SMS supplier, keep
-  if (/log|account|boost/.test(blob) && !/grizzly|sms|number/.test(blob)) return false;
-  return true;
-}
-
-async function fetchHubPriceByServiceIds(countryId, serviceIds) {
-  if (!MJ_HUB_REST_URL || !MJ_HUB_SERVICE_KEY) return new Map();
-  const ids = [...new Set((serviceIds || []).map((s) => String(s).trim()).filter(Boolean))];
-  if (!ids.length) return new Map();
-  const priceMap = new Map(); // key: service_id lower -> ONE hub row (grizzly only)
-  // Request common supplier fields if present (PostgREST ignores unknown? use * safe subset)
-  const select =
-    'id,service_id,service_name,country_id,country_name,price,available_quantity,is_available,supplier_price,supplier,server,domain,provider,source';
-  for (let i = 0; i < ids.length; i += 25) {
-    const chunk = ids.slice(i, i + 25);
-    const inList = chunk.map((id) => `"${String(id).replace(/"/g, '')}"`).join(',');
-    try {
-      let url =
-        `${MJ_HUB_REST_URL}/number_services?select=${select}` +
-        `&country_id=eq.${encodeURIComponent(countryId)}` +
-        `&service_id=in.(${inList})` +
-        `&price=gt.0&order=price.asc&limit=100`;
-      let res;
-      try {
-        res = await axios.get(url, { ...axiosCfg, headers: mjHubHeaders });
-      } catch (colErr) {
-        // Table may not have supplier/server/domain columns — retry minimal select
-        const selectMin =
-          'id,service_id,service_name,country_id,country_name,price,available_quantity,is_available,supplier_price';
-        url =
-          `${MJ_HUB_REST_URL}/number_services?select=${selectMin}` +
-          `&country_id=eq.${encodeURIComponent(countryId)}` +
-          `&service_id=in.(${inList})` +
-          `&price=gt.0&order=price.asc&limit=100`;
-        res = await axios.get(url, { ...axiosCfg, headers: mjHubHeaders });
-      }
-      let rows = Array.isArray(res.data) ? res.data : [];
-      rows = rows.filter(isGrizzlyHubRow);
-      for (const r of rows) {
-        if (r.is_available === false || r.is_available === 'false') continue;
-        const sid = String(r.service_id || '').toLowerCase();
-        const price = Math.ceil(Number(r.price) || 0);
-        if (!(price > 0) || !sid) continue;
-        // One price per service_id only (first = cheapest due to order=price.asc)
-        if (priceMap.has(sid)) continue;
-        priceMap.set(sid, {
-          service_id: String(r.service_id),
-          service_name: friendlyServiceName(r.service_id, r.service_name),
-          price_ngn: price,
-          stock: Number(r.available_quantity) || 0,
-          price_usd: Number(r.supplier_price) || 0,
-          hub_id: r.id,
-          country_name: r.country_name || null,
-          source: 'hub'
-        });
-      }
-    } catch (e) {
-      console.error('fetchHubPriceByServiceIds', e.response?.status, e.message);
-    }
-  }
-  return priceMap;
-}
-
-async function grizzlyPrices(countryId) {
-  try {
-    const data = await grizzlyGet({ action: 'getPricesV3', country: String(countryId) });
-    const block = (data && (data[String(countryId)] || data[countryId])) || data || {};
-    const list = [];
-    for (const [code, info] of Object.entries(block)) {
-      if (!code || typeof info !== 'object') continue;
-      const cost = Number(info.cost ?? info.price ?? info.rate ?? 0);
-      const count = Number(info.count ?? info.phones ?? info.qty ?? 0);
-      if (!(cost > 0)) continue;
-      const rawName = info.name || info.service || info.eng || code;
-      const display = friendlyServiceName(code, rawName);
-      const variant = detectVariant(display, code);
-      list.push({
-        service_id: String(code),
-        service_name: display,
-        variant,
-        stock: count,
-        price_usd: cost,
-        price_ngn: markupNgn(cost)
-      });
-    }
-    return list;
-  } catch (e) {
-    console.error('grizzlyPrices', e.message);
-    return [];
-  }
-}
-
-
-// Pull selling prices from MJ HUB website catalog (number_services)
-async function fetchHubServices(countryId, serviceFilter) {
-  // Website catalog = different Supabase project
-  if (!MJ_HUB_REST_URL || !MJ_HUB_SERVICE_KEY) {
-    console.error('fetchHubServices: MJ_HUB_SUPABASE_URL / MJ_HUB_SERVICE_KEY missing');
-    return [];
-  }
-  try {
-    const select =
-      'id,service_id,service_name,country_id,country_name,price,available_quantity,is_available,supplier_price';
-
-    // Build optional service filter at the DB level (more reliable than JS-only)
-    let serviceQuery = '';
-    if (serviceFilter) {
-      const q = String(serviceFilter).toLowerCase().trim();
-      const code = (SERVICE_MAP[q] || q).toLowerCase();
-      // Map common apps to name patterns + exact codes
-      const namePat =
-        code === 'wa' || q.includes('whatsapp')
-          ? 'whatsapp'
-          : code === 'tg' || q.includes('telegram')
-            ? 'telegram'
-            : code === 'go' || q.includes('google') || q.includes('gmail')
-              ? 'google'
-              : code === 'ig' || q.includes('instagram')
-                ? 'instagram'
-                : code === 'fb' || q.includes('facebook')
-                  ? 'facebook'
-                  : code === 'lf' || q.includes('tiktok')
-                    ? 'tiktok'
-                    : code === 'fu' || q.includes('snapchat')
-                      ? 'snapchat'
-                      : code === 'ds' || q.includes('discord')
-                        ? 'discord'
-                        : q.replace(/[^a-z0-9]/g, '');
-      // Exclude false friends like WAF when looking for WhatsApp
-      const exclude =
-        namePat === 'whatsapp' ? '&service_id=neq.waf&service_name=not.ilike.*waf*' : '';
-      serviceQuery =
-        `&or=(service_id.eq.${encodeURIComponent(code)},service_name.ilike.*${encodeURIComponent(namePat)}*)` +
-        exclude;
-    }
-
-    let url =
-      `${MJ_HUB_REST_URL}/number_services?select=${select}` +
-      `&country_id=eq.${encodeURIComponent(countryId)}` +
-      `&price=gt.0` +
-      serviceQuery +
-      `&order=price.asc&limit=50`;
-
-    let res = await axios.get(url, { ...axiosCfg, headers: mjHubHeaders });
-    let rows = Array.isArray(res.data) ? res.data : [];
-
-    // Fallback: country_name match (admin shows "USA" / "USA (2)")
-    if (!rows.length) {
-      const pretty =
-        String(countryId) === '12'
-          ? 'USA'
-          : String(countryId) === '16'
-            ? 'United Kingdom'
-            : String(countryId) === '19'
-              ? 'Nigeria'
-              : '';
-      if (pretty) {
-        url =
-          `${MJ_HUB_REST_URL}/number_services?select=${select}` +
-          `&country_name=ilike.*${encodeURIComponent(pretty)}*` +
-          `&price=gt.0` +
-          serviceQuery +
-          `&order=price.asc&limit=50`;
-        res = await axios.get(url, { ...axiosCfg, headers: mjHubHeaders });
-        rows = Array.isArray(res.data) ? res.data : [];
-        console.log('[hub] country_name', pretty, 'rows', rows.length);
-      }
-    }
-
-    // Last try for WhatsApp: no country filter, then keep USA-ish rows
-    if (!rows.length && serviceFilter && /whatsapp|wa/i.test(String(serviceFilter))) {
-      url =
-        `${MJ_HUB_REST_URL}/number_services?select=${select}` +
-        `&or=(service_id.eq.wa,service_name.ilike.*whatsapp*)` +
-        `&service_id=neq.waf` +
-        `&price=gt.0&order=price.asc&limit=30`;
-      res = await axios.get(url, { ...axiosCfg, headers: mjHubHeaders });
-      let all = Array.isArray(res.data) ? res.data : [];
-      rows = all.filter((r) => {
-        const cn = String(r.country_name || '').toUpperCase();
-        const cid = String(r.country_id);
-        return cid === String(countryId) || cn.includes('USA') || cn.includes('UNITED STATES');
-      });
-      console.log('[hub] global whatsapp then USA filter', all.length, '->', rows.length);
-    }
-
-    const available = rows.filter((r) => r.is_available !== false && r.is_available !== 'false');
-    if (available.length) rows = available;
-
-    // Dedupe by service_id + price
-    const seen = new Set();
-    const out = [];
-    for (const r of rows) {
-      const name = friendlyServiceName(r.service_id, r.service_name);
-      const price = Math.ceil(Number(r.price) || 0);
-      if (!(price > 0)) continue;
-      // Drop WAF / non-whatsapp when user asked WhatsApp
-      if (serviceFilter && /whatsapp|^wa$/i.test(String(serviceFilter))) {
-        const id = String(r.service_id || '').toLowerCase();
-        const nm = String(r.service_name || '').toLowerCase();
-        if (id === 'waf' || (id !== 'wa' && !nm.includes('whatsapp'))) continue;
-      }
-      const key = `${r.service_id}|${price}|${r.country_id}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push({
-        service_id: String(r.service_id),
-        service_name: name,
-        variant: detectVariant(name, r.service_id),
-        stock: Number(r.available_quantity) || 0,
-        price_ngn: price,
-        price_usd: Number(r.supplier_price) || 0,
-        source: 'hub',
-        hub_id: r.id,
-        country_name: r.country_name || null
-      });
-    }
-    console.log(
-      '[hub] final',
-      countryId,
-      serviceFilter,
-      out.map((s) => `${s.service_id}:${s.price_ngn}`).join(',')
-    );
-    return out;
-  } catch (e) {
-    console.error('fetchHubServices', e.response?.status, JSON.stringify(e.response?.data || e.message));
-    return [];
-  }
-}
-
-async function getSellableServicesForOneCountry(countryId, serviceFilter) {
-  // 1) Full service catalog from Grizzly for this country
-  let live = await grizzlyPrices(countryId);
-  if (serviceFilter) live = matchServices(live, serviceFilter);
-  if (!live.length) {
-    const hubOnly = await fetchHubServices(countryId, serviceFilter);
-    if (hubOnly.length) {
-      return hubOnly.map((s) => ({
-        ...s,
-        country_id: s.country_id != null ? s.country_id : countryId,
-        country_name: s.country_name || countryPoolLabel(countryId)
-      }));
-    }
-    return [];
-  }
-
-  const hubMap = await fetchHubPriceByServiceIds(
-    countryId,
-    live.map((s) => s.service_id)
-  );
-
-  const MIN_SALE = Number(process.env.MIN_NUMBER_PRICE_NGN) || 1000;
-  const out = live.map((s) => {
-    const sid = String(s.service_id).toLowerCase();
-    const hub = hubMap.get(sid);
-    if (hub) {
-      return {
-        ...s,
-        service_name: hub.service_name || s.service_name,
-        price_ngn: hub.price_ngn,
-        stock: hub.stock > 0 ? hub.stock : s.stock,
-        price_usd: hub.price_usd || s.price_usd,
-        source: 'hub',
-        hub_id: hub.hub_id,
-        country_id: countryId,
-        country_name: hub.country_name || countryPoolLabel(countryId)
-      };
-    }
-    return {
-      ...s,
-      price_ngn: Math.max(MIN_SALE, Number(s.price_ngn) || 0),
-      source: 'live_grizzly',
-      country_id: countryId,
-      country_name: countryPoolLabel(countryId)
-    };
-  });
-
-  let deduped = dedupeServices(out);
-
-  if (serviceFilter) {
-    const code = (SERVICE_MAP[String(serviceFilter).toLowerCase().trim()] || '').toLowerCase();
-    if (code) {
-      const primary = deduped.filter((s) => String(s.service_id).toLowerCase() === code);
-      const variants = deduped.filter((s) => {
-        const id = String(s.service_id).toLowerCase();
-        const name = String(s.service_name).toLowerCase();
-        if (id === code) return false;
-        return (
-          new RegExp(`^${code}_`).test(id) ||
-          /virtual|voip|alternate/.test(name) ||
-          /virtual|voip|alternate/.test(id)
-        );
-      });
-      if (primary.length || variants.length) {
-        deduped = dedupeServices([...primary, ...variants]);
-      }
-    }
-  }
-  return deduped;
-}
-
-/** Fetch sellable options — expands USA → USA + USA (2) when both have stock */
-async function getSellableServices(countryId, serviceFilter) {
-  const ids = siblingCountryIds(countryId);
-  const merged = [];
-  for (const cid of ids) {
-    try {
-      const part = await getSellableServicesForOneCountry(cid, serviceFilter);
-      for (const s of part) {
-        merged.push({
-          ...s,
-          country_id: s.country_id != null ? s.country_id : cid,
-          country_name: s.country_name || countryPoolLabel(cid)
-        });
-      }
-    } catch (e) {
-      console.error('getSellableServices sibling', cid, e.message);
-    }
-  }
-
-  // Also pull hub rows by country_name for USA family (catches USA (2) labeled rows)
-  if (ids.includes(12) || ids.includes(187)) {
-    try {
-      const hubExtra = await fetchHubServicesUsaFamily(serviceFilter);
-      for (const s of hubExtra) {
-        const exists = merged.some(
-          (m) =>
-            String(m.service_id).toLowerCase() === String(s.service_id).toLowerCase() &&
-            Number(m.price_ngn) === Number(s.price_ngn) &&
-            String(m.country_name || '') === String(s.country_name || '')
-        );
-        if (!exists) merged.push(s);
-      }
-    } catch (e) {
-      console.error('usa family hub', e.message);
-    }
-  }
-
-  const deduped = dedupeServices(merged);
-  // Prefer cheaper first within same pool, but keep both pools
-  deduped.sort((a, b) => {
-    const ca = String(a.country_name || a.country_id || '');
-    const cb = String(b.country_name || b.country_id || '');
-    if (ca !== cb) return ca.localeCompare(cb);
-    return Number(a.price_ngn) - Number(b.price_ngn);
-  });
-
-  console.log(
-    '[prices] multi-pool',
-    ids.join(','),
-    '| final',
-    deduped.length,
-    '|',
-    deduped.map((s) => `${s.country_name || s.country_id}:${s.service_id}:₦${s.price_ngn}`).join(' · '),
-    serviceFilter || '(all)'
-  );
-  return deduped;
-}
-
-/** Hub rows for any country_name containing USA (covers USA + USA (2)) */
-async function fetchHubServicesUsaFamily(serviceFilter) {
-  if (!MJ_HUB_REST_URL || !MJ_HUB_SERVICE_KEY) return [];
-  try {
-    const select =
-      'id,service_id,service_name,country_id,country_name,price,available_quantity,is_available,supplier_price';
-    let serviceQuery = '';
-    if (serviceFilter) {
-      const q = String(serviceFilter).toLowerCase().trim();
-      const code = (SERVICE_MAP[q] || q).toLowerCase();
-      const namePat =
-        code === 'wa' || q.includes('whatsapp')
-          ? 'whatsapp'
-          : code === 'tg' || q.includes('telegram')
-            ? 'telegram'
-            : code === 'go' || q.includes('google') || q.includes('gmail')
-              ? 'google'
-              : code === 'ig' || q.includes('instagram')
-                ? 'instagram'
-                : code === 'fb' || q.includes('facebook')
-                  ? 'facebook'
-                  : code === 'lf' || q.includes('tiktok')
-                    ? 'tiktok'
-                    : code === 'fu' || q.includes('snapchat')
-                      ? 'snapchat'
-                      : q.replace(/[^a-z0-9]/g, '');
-      const exclude =
-        namePat === 'whatsapp' ? '&service_id=neq.waf&service_name=not.ilike.*waf*' : '';
-      serviceQuery =
-        `&or=(service_id.eq.${encodeURIComponent(code)},service_name.ilike.*${encodeURIComponent(namePat)}*)` +
-        exclude;
-    }
-    const url =
-      `${MJ_HUB_REST_URL}/number_services?select=${select}` +
-      `&country_name=ilike.*USA*` +
-      `&price=gt.0` +
-      serviceQuery +
-      `&order=price.asc&limit=40`;
-    const res = await axios.get(url, { ...axiosCfg, headers: mjHubHeaders });
-    let rows = Array.isArray(res.data) ? res.data : [];
-    rows = rows.filter((r) => r.is_available !== false && r.is_available !== 'false');
-    const out = [];
-    const seen = new Set();
-    for (const r of rows) {
-      const price = Math.ceil(Number(r.price) || 0);
-      if (!(price > 0)) continue;
-      if (serviceFilter && /whatsapp|^wa$/i.test(String(serviceFilter))) {
-        const id = String(r.service_id || '').toLowerCase();
-        const nm = String(r.service_name || '').toLowerCase();
-        if (id === 'waf' || (id !== 'wa' && !nm.includes('whatsapp'))) continue;
-      }
-      const key = `${r.country_id}|${r.service_id}|${price}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push({
-        service_id: String(r.service_id),
-        service_name: friendlyServiceName(r.service_id, r.service_name),
-        variant: detectVariant(r.service_name, r.service_id),
-        stock: Number(r.available_quantity) || 0,
-        price_ngn: price,
-        price_usd: Number(r.supplier_price) || 0,
-        source: 'hub',
-        hub_id: r.id,
-        country_id: r.country_id,
-        country_name: r.country_name || countryPoolLabel(r.country_id)
-      });
-    }
-    return out;
-  } catch (e) {
-    console.error('fetchHubServicesUsaFamily', e.message);
-    return [];
-  }
-}
-
-function optionButtons(countryId, services) {
-  const pools = new Set(
-    services.map((s) => String(s.country_name || s.country_id || countryId).trim()).filter(Boolean)
-  );
-  const showPool = pools.size > 1;
-  const variants = new Set(services.map((s) => s.variant || 'normal'));
-  const showVariantLabel = services.length > 1 && variants.size > 1 && !showPool;
-  const rows = services.slice(0, 12).map((s) => {
-    const cid = s.country_id != null ? s.country_id : countryId;
-    const pool = countryPoolLabel(cid, null, s.country_name);
-    let label;
-    if (showPool) {
-      // USA · WhatsApp · ₦2,500  vs  USA (2) · WhatsApp · ₦3,200
-      label = `${pool} · ${s.service_name} · ₦${Number(s.price_ngn).toLocaleString()}`;
-    } else if (showVariantLabel) {
-      const tag =
-        s.variant === 'virtual' ? '👻 Virtual' :
-        s.variant === 'alternate' ? '🔀 Alternate' :
-        '📱 Normal';
-      label = `${tag} · ${s.service_name} · ₦${Number(s.price_ngn).toLocaleString()}`;
-    } else if (services.length > 1) {
-      label = `${s.service_name} · ₦${Number(s.price_ngn).toLocaleString()}`;
-    } else {
-      label = `✅ Buy · ₦${Number(s.price_ngn).toLocaleString()}`;
-    }
-    const data = `opt:${cid}:${s.service_id}:${s.price_ngn}`;
-    return [Markup.button.callback(label.slice(0, 64), data.slice(0, 64))];
-  });
-  rows.push([Markup.button.callback('⬅️ Cancel', 'opt:cancel')]);
-  return Markup.inlineKeyboard(rows);
-}
-
-async function grizzlyBuy(serviceId, countryId) {
-  try {
-    const raw = await grizzlyGet({
-      action: 'getNumber',
-      service: serviceId,
-      country: String(countryId)
-    });
-    const text = typeof raw === 'string' ? raw.trim() : JSON.stringify(raw);
-    if (text.startsWith('ACCESS_NUMBER')) {
-      const parts = text.split(':');
-      return { success: true, order_id: parts[1], number: parts[2] };
-    }
-    // JSON style
-    if (raw && (raw.activationId || raw.id)) {
-      return {
-        success: true,
-        order_id: String(raw.activationId || raw.id),
-        number: String(raw.phoneNumber || raw.number || raw.phone || '')
-      };
-    }
-    return { success: false, message: text || 'No numbers' };
-  } catch (e) {
-    return { success: false, message: e.message || 'Buy failed' };
-  }
-}
-
-async function grizzlyStatus(orderId) {
-  try {
-    const raw = await grizzlyGet({ action: 'getStatus', id: orderId });
-    const text = typeof raw === 'string' ? raw.trim() : JSON.stringify(raw);
-    if (text.startsWith('STATUS_OK')) {
-      return { success: true, code: text.split(':')[1] || text.replace('STATUS_OK:', '') };
-    }
-    if (raw && raw.code) return { success: true, code: String(raw.code) };
-    return { success: false, waiting: /WAIT|STATUS_WAIT/i.test(text), message: text };
-  } catch (e) {
-    return { success: false, message: e.message };
-  }
-}
-
-async function grizzlyCancel(orderId) {
-  // Grizzly / SMS-Activate: status 8 = cancel activation
-  // Success response: ACCESS_CANCEL
-  // Common failures: NO_ACTIVATION, BAD_STATUS, EARLY_CANCEL_DENIED (often < ~2 min)
-  if (!orderId) {
-    return { success: false, message: 'Missing order id', raw: '' };
-  }
-  try {
-    const raw = await grizzlyGet({
-      action: 'setStatus',
-      id: String(orderId).trim(),
-      status: '8'
-    });
-    const text = typeof raw === 'string' ? raw.trim() : JSON.stringify(raw || '');
-    console.log('[cancel]', orderId, text);
-    if (/ACCESS_CANCEL/i.test(text)) {
-      return { success: true, message: 'Cancelled at supplier', raw: text };
-    }
-    if (/EARLY_CANCEL|TOO_EARLY|WAIT/i.test(text)) {
-      return {
-        success: false,
-        early: true,
-        message: 'Too early to cancel. Wait a few more minutes after buying, then try again.',
-        raw: text
-      };
-    }
-    if (/NO_ACTIVATION/i.test(text)) {
-      return { success: false, message: 'Supplier has no record of this order.', raw: text };
-    }
-    if (/BAD_STATUS|STATUS_CANCEL|already/i.test(text)) {
-      // Already cancelled on supplier — treat as success so wallet can refund once
-      return { success: true, message: 'Already cancelled at supplier', raw: text };
-    }
-    return {
-      success: false,
-      message: 'Could not cancel this order right now. Try again shortly.',
-      raw: text
-    };
-  } catch (e) {
-    console.error('grizzlyCancel', e.message);
-    return { success: false, message: 'Supplier unreachable. Try again in a few minutes.', raw: e.message || '' };
-  }
-}
-
-
-function cancelWaitInfo(order) {
-  const boughtAt = order?.date || order?.created_at || order?.bought_at || null;
-  if (!boughtAt) {
-    // No timestamp — still enforce short soft wait from now is not possible; allow API decide
-    return { allowed: true, waitMs: 0, waitSec: 0 };
-  }
-  const t0 = new Date(boughtAt).getTime();
-  if (!Number.isFinite(t0)) return { allowed: true, waitMs: 0, waitSec: 0 };
-  const elapsed = Date.now() - t0;
-  if (elapsed >= MIN_CANCEL_MS) return { allowed: true, waitMs: 0, waitSec: 0, unlockAt: t0 + MIN_CANCEL_MS };
-  const waitMs = MIN_CANCEL_MS - elapsed;
-  return {
-    allowed: false,
-    waitMs,
-    waitSec: Math.max(1, Math.ceil(waitMs / 1000)),
-    unlockAt: t0 + MIN_CANCEL_MS
-  };
-}
-
-function money(n) {
-  const v = Math.round(Number(n) || 0);
-  return v > 0 ? v : 0;
-}
-
-/**
- * Nigerian amount parse: 2k → 2000, 5k → 5000, 1.5k → 1500, 10,000 → 10000, ₦3k → 3000
- * Also plain digits. Returns 0 if nothing useful.
- */
-function parseNairaAmount(text) {
-  const raw = String(text || '').trim().toLowerCase().replace(/,/g, '');
-  if (!raw) return 0;
-  // 2k, 5k, 10k, 1.5k, 2.5k
-  let m = raw.match(/(\d+(?:\.\d+)?)\s*k\b/);
-  if (m) return Math.round(parseFloat(m[1]) * 1000);
-  // 2 thousand / 5 thsd
-  m = raw.match(/(\d+(?:\.\d+)?)\s*(?:thousand|thsd|ths)\b/);
-  if (m) return Math.round(parseFloat(m[1]) * 1000);
-  // plain number (strip currency junk)
-  m = raw.match(/(\d+(?:\.\d+)?)/);
-  if (m) return Math.round(parseFloat(m[1]));
-  return 0;
-}
-
-/** Reload session, debit only if enough funds. Verifies persist. Returns { ok, balance, session, debited } */
-async function safeDebit(userId, amount, meta = {}) {
-  const session = await getUserSession(userId);
-  amount = money(amount);
-  const bal = money(session.balance);
-  if (amount <= 0) return { ok: true, balance: bal, session, debited: 0 };
-  if (bal < amount) {
-    return { ok: false, balance: bal, session, debited: 0, need: amount };
-  }
-  const next = money(bal - amount);
-  session.balance = next;
-  const saved = await saveUserSession(userId, session);
-  if (!saved) {
-    console.error('[money] debit SAVE FAILED', userId, amount, meta);
-    return { ok: false, balance: bal, session: { ...session, balance: bal }, debited: 0, saveFailed: true };
-  }
-  // Re-read to confirm wallet actually moved
-  const verify = await getUserSession(userId);
-  const verifiedBal = money(verify.balance);
-  if (verifiedBal !== next) {
-    console.error('[money] debit VERIFY MISMATCH', userId, { expected: next, got: verifiedBal, meta });
-    // Force-write once more
-    verify.balance = next;
-    const saved2 = await saveUserSession(userId, verify);
-    if (!saved2) {
-      return { ok: false, balance: verifiedBal, session: verify, debited: 0, saveFailed: true };
-    }
-  }
-  const finalS = await getUserSession(userId);
-  console.log('[money] debit', userId, amount, '→', money(finalS.balance), meta);
-  return { ok: true, balance: money(finalS.balance), session: finalS, debited: amount };
-}
-
-/** Reload session, credit once. */
-async function safeCredit(userId, amount, meta = {}) {
-  const session = await getUserSession(userId);
-  amount = money(amount);
-  if (amount <= 0) return { ok: true, balance: money(session.balance), session, credited: 0 };
-  session.balance = money(money(session.balance) + amount);
-  const saved = await saveUserSession(userId, session);
-  if (!saved) {
-    console.error('[money] credit SAVE FAILED', userId, amount, meta);
-    return { ok: false, balance: money(session.balance) - amount, session, credited: 0, saveFailed: true };
-  }
-  const finalS = await getUserSession(userId);
-  console.log('[money] credit', userId, amount, '→', money(finalS.balance), meta);
-  return { ok: true, balance: money(finalS.balance), session: finalS, credited: amount };
-}
-
-function formatWait(sec) {
-  const m = Math.floor(sec / 60);
-  const s = sec % 60;
-  if (m <= 0) return `${s}s`;
-  return s ? `${m}m ${s}s` : `${m}m`;
-}
-
-async function grizzlyBalance() {
-  try {
-    const raw = await grizzlyGet({ action: 'getBalance' });
-    const text = typeof raw === 'string' ? raw.trim() : '';
-    if (text.startsWith('ACCESS_BALANCE')) return text.split(':')[1];
-    if (raw && raw.balance != null) return String(raw.balance);
-    return text || 'ok';
-  } catch (e) {
-    return null;
-  }
-}
-
-// ===========================================================================
-// GEMINI — conversational layer over the real MJ SMS (Server 1/GrizzlySMS)
-// actions above. This does NOT replace grizzlyPrices/grizzlyBuy/etc. — it
-// gives Gemini "function calling" access to call those exact same functions,
-// so what it tells the user is always backed by a real price/order/status,
-// never invented. If GEMINI_API_KEY isn't set, the bot falls back to the
-// old rigid parseCountryService flow below instead of breaking.
-// ===========================================================================
-
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-const MAX_CONVERSATION_TURNS = 16;
-const MAX_TOOL_ROUNDTRIPS = 6;
-
-const GEMINI_SYSTEM_PROMPT = `You be Mira, the official MJ SMS Assistant for MJ Hub (mjhub.store).
-
-Talk fluent Nigerian Pidgin mixed with clear English — natural, like real person wey dey help customer on Telegram. No force grammar. No robot vibe. No fake slang.
-
-Your main work:
-- Help users get real non-VOIP SMS numbers and OTP codes on this Telegram bot
-- Guide dem step by step to buy number
-- Deliver number and OTP ONLY from tools — never invent
-- Answer questions about MJ SMS and MJ Hub from the facts below only
-- Softly grow the brand without lies
-
-=== ZERO HALLUCINATION (strict) ===
-- NEVER invent: price, stock, phone number, OTP/SMS code, order id, balance, payment status, country availability
-- NEVER guess if a country or app "dey available" — use tools (get_prices / buy / status)
-- If you no sure → ask short clarifying question OR say you go check with tools
-- If tool fail or empty → tell customer straight: try another country/app or try again small time. No fabricate alternative
-- NEVER invent success stories, fake "plenty people just buy", or fake discounts
-- NEVER invent refund already done unless tool confirms
-- NEVER mention Grizzly, suppliers, API keys, Gemini, AI, or internal systems
-- NEVER claim you are AI/robot — you be Mira, MJ SMS assistant
-- Bot wallet and website (mjhub.store) wallet SEPARATE — never say dem join unless user already know
-- For MJ Logs / MJ Boosters: only point to mjhub.store — you no fit sell those for this bot
-
-Personality:
-- Calm, sharp, helpful, street-smart
-- Patient with new users; fast when dem ready to buy
-- Short replies when dem dey buy; warmer when dem just dey yarn
-
-About MJ Hub (facts only):
-- Marketplace: MJ Logs (accounts), MJ SMS (OTP numbers), MJ Boosters (SMM growth)
-- Website: https://mjhub.store
-- Referral on website: 2% for life when people you invite fund wallet
-- This bot = MJ SMS only (Server 1)
-
-About MJ SMS (this bot):
-- Real mobile numbers (not VOIP)
-- WhatsApp, Telegram, Instagram, Google, Facebook, TikTok, Snapchat, Discord, and more
-- Many countries — live stock from tools
-- Fund here: /fund AMOUNT or type fund + amount (2k, 5k…). Paystack. Min ~₦1,000 max ₦200,000 per payment
-- OTP usually within ~1 minute after dem request code for the app
-- Cancel/refund when allowed (often wait ~3 minutes after buy) — only after tool/status says so
-- Prices in Naira from tools only
-
-Buy flow:
-1. No app? → ask which app
-2. No country? → ask which country
-3. Full request like "USA WhatsApp" → get_prices, show real price, confirm, then buy_number
-4. After number: dem use am for OTP; code from check_status / Check button only
-
-Payment:
-- /fund 2k or fund 5000 → Paystack link
-- Low balance → guide /fund, no free number promise
-
-When dem just greet (how far, awfa, hi):
-- Reply natural Pidgin short, then soft: wetin you need — number, fund, or balance?
-
-If you no understand:
-- No invent. Ask dem to type like: USA WhatsApp, Fund 5k, or Balance.
-- Dem say USA → "Alright, USA WhatsApp. You ready make I get the number for you now?"
-- No stock → "That one no dey available for now. You fit try another country?"
-- Code waiting → "Code never drop yet. Make I check… If e no show after some minutes, you fit cancel for refund when the timer allow."
-- After code → "Your code don drop: XXXXXX. Copy am sharp. You need another number?"
-
-Tools you must use (do not skip):
-list_countries, get_prices, buy_number, check_status, cancel_order, get_balance, get_my_orders, create_payment, verify_payment.
-
-When user already typed full request like "UK WhatsApp" or "Nigeria Telegram", call get_prices immediately — no need to re-ask.
-`;
-
-const GEMINI_TOOLS = [{
-  functionDeclarations: [
-    {
-      name: 'list_countries',
-      description: 'List all countries available for number purchases (full catalog).',
-      parameters: { type: 'OBJECT', properties: {} }
-    },
-    {
-      name: 'get_prices',
-      description: 'Get live prices and stock for apps in a country. ALWAYS call before quoting price or buying.',
-      parameters: {
-        type: 'OBJECT',
-        properties: {
-          country: { type: 'STRING', description: 'Any country name the customer typed (free search, full catalog)' },
-          service: { type: 'STRING', description: 'Optional app filter e.g. WhatsApp, Telegram, Google' }
-        },
-        required: ['country']
-      }
-    },
-    {
-      name: 'buy_number',
-      description: 'Buy a number and charge wallet. Only after user clearly confirmed country, app, AND which option if multiple (normal vs virtual). Prefer service_code from get_prices.',
-      parameters: {
-        type: 'OBJECT',
-        properties: {
-          country: { type: 'STRING' },
-          service: { type: 'STRING', description: 'App name e.g. WhatsApp' },
-          service_code: { type: 'STRING', description: 'Exact service code from get_prices options e.g. wa' }
-        },
-        required: ['country', 'service']
-      }
-    },
-    {
-      name: 'check_status',
-      description: 'Check if SMS OTP has arrived. Omit order_id to use latest order.',
-      parameters: {
-        type: 'OBJECT',
-        properties: { order_id: { type: 'STRING' } }
-      }
-    },
-    {
-      name: 'cancel_order',
-      description: 'Cancel pending order and refund if eligible. Omit order_id to use latest pending.',
-      parameters: {
-        type: 'OBJECT',
-        properties: { order_id: { type: 'STRING' } }
-      }
-    },
-    {
-      name: 'get_balance',
-      description: 'Get customer wallet balance in Naira.',
-      parameters: { type: 'OBJECT', properties: {} }
-    },
-    {
-      name: 'get_my_orders',
-      description: 'Recent order history for this customer.',
-      parameters: { type: 'OBJECT', properties: {} }
-    },
-    {
-      name: 'create_payment',
-      description: 'Create a Paystack payment link so the customer can fund their bot wallet in Naira. Use when balance is low or they ask to fund/top up.',
-      parameters: {
-        type: 'OBJECT',
-        properties: {
-          amount_ngn: { type: 'NUMBER', description: 'Amount in Naira to fund. Minimum 500.' },
-          email: { type: 'STRING', description: 'Optional customer email. If missing a placeholder is used.' }
-        },
-        required: ['amount_ngn']
-      }
-    },
-    {
-      name: 'verify_payment',
-      description: 'Verify a Paystack payment by reference and credit wallet if successful. Use when user says they have paid.',
-      parameters: {
-        type: 'OBJECT',
-        properties: {
-          reference: { type: 'STRING', description: 'Paystack reference. Optional if latest pending reference is known.' }
-        }
-      }
-    }
-  ]
-}];
-
-
-async function paystackInitialize(amountNgn, telegramUserId, email) {
-  if (!PAYSTACK_SECRET_KEY) {
-    console.error('PAYSTACK_SECRET_KEY missing on this deployment');
-    return { success: false, message: 'Paystack no dey configured yet. Abeg set PAYSTACK_SECRET_KEY on Vercel and redeploy.' };
-  }
-  const amount = Math.min(200000, Math.max(1000, Math.ceil(Number(amountNgn) || 0)));
-  const reference = `MJSMS_${telegramUserId}_${Date.now()}`;
-  const mail = (email && String(email).includes('@'))
-    ? String(email).trim()
-    : `tg${telegramUserId}@mjhub.store`;
-  try {
-    const res = await axios.post(
-      'https://api.paystack.co/transaction/initialize',
-      {
-        email: mail,
-        amount: amount * 100,
-        currency: 'NGN',
-        reference,
-        metadata: {
-          telegram_user_id: String(telegramUserId),
-          product: 'mj_sms_bot_wallet',
-          amount_ngn: amount
-        }
-      },
-      {
-        ...axiosCfg,
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-    const data = res.data?.data;
-    if (!data?.authorization_url) {
-      return { success: false, message: res.data?.message || 'Paystack no return link' };
-    }
-    return {
-      success: true,
-      reference: data.reference || reference,
-      amount_ngn: amount,
-      authorization_url: data.authorization_url,
-      access_code: data.access_code
-    };
-  } catch (e) {
-    console.error('paystack init', e.response?.data || e.message);
-    return {
-      success: false,
-      message: e.response?.data?.message || e.message || 'Paystack init fail'
-    };
-  }
-}
-
-async function paystackVerify(reference) {
-  if (!PAYSTACK_SECRET_KEY) {
-    return { success: false, message: 'Paystack no dey configured' };
-  }
-  if (!reference) return { success: false, message: 'Reference missing' };
-  try {
-    const res = await axios.get(
-      `https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`,
-      {
-        ...axiosCfg,
-        headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` }
-      }
-    );
-    const data = res.data?.data;
-    if (!data) return { success: false, message: 'No verify data' };
-    const ok = String(data.status).toLowerCase() === 'success';
-    const amountNgn = Math.round((Number(data.amount) || 0) / 100);
-    const telegramUserId = data.metadata?.telegram_user_id || null;
-    return {
-      success: ok,
-      status: data.status,
-      amount_ngn: amountNgn,
-      reference: data.reference || reference,
-      telegram_user_id: telegramUserId,
-      message: ok ? 'Payment successful' : `Payment status: ${data.status}`
-    };
-  } catch (e) {
-    console.error('paystack verify', e.response?.data || e.message);
-    return {
-      success: false,
-      message: e.response?.data?.message || e.message || 'Verify fail'
-    };
-  }
-}
-
-async function resolveCountry(name) {
-  const raw = String(name || '').trim();
-  const key = raw.toLowerCase();
-  if (!key) return null;
-
-  const live = await grizzlyCountries();
-
-  // Numeric country id
-  if (/^\d+$/.test(key)) {
-    const id = Number(key);
-    const hit = live.find((c) => c.id === id);
-    return { id, name: asName(hit ? hit.name : key) || key };
-  }
-
-  // Exact match on live Grizzly country name
-  let hit = live.find((c) => c.name.toLowerCase() === key);
-  if (hit) return { id: hit.id, name: asName(hit.name) || key };
-
-  // Starts-with / contains on live names (prefer longer names)
-  const ranked = live
-    .map((c) => ({ ...c, n: c.name.toLowerCase() }))
-    .filter((c) => c.n.length >= 2)
-    .sort((a, b) => b.n.length - a.n.length);
-
-  hit = ranked.find((c) => c.n.startsWith(key) || key.startsWith(c.n));
-  if (hit) return { id: hit.id, name: asName(hit.name) || key };
-
-  hit = ranked.find((c) => c.n.includes(key) || key.includes(c.n));
-  if (hit) return { id: hit.id, name: asName(hit.name) || key };
-
-  // Soft alias only if live search missed (ng → Nigeria, etc.)
-  if (key in COUNTRY_MAP) {
-    const id = COUNTRY_MAP[key];
-    const liveHit = live.find((c) => c.id === id);
-    return { id, name: liveHit ? liveHit.name : key };
-  }
-  for (const [k, id] of Object.entries(COUNTRY_MAP)) {
-    if (k.length < 3) continue;
-    if (key.includes(k) || k.includes(key)) {
-      const liveHit = live.find((c) => c.id === id);
-      return { id, name: liveHit ? liveHit.name : k };
-    }
-  }
-  return null;
-}
-
-async function executeGeminiFunction(fnName, args, telegramUserId, session) {
-  switch (fnName) {
-    case 'list_countries': {
-      const live = await grizzlyCountries();
-      // Prefer proper country names; include popular aliases tip
-      const names = live
-        .map((c) => c.name)
-        .filter(Boolean)
-        .sort((a, b) => a.localeCompare(b));
-      return {
-        total: names.length,
-        countries: names.slice(0, 100),
-        tip: 'Full live catalog. Customer can type ANY country name freely — not limited to this preview.'
-      };
-    }
-
-    case 'get_prices': {
-      const c = await resolveCountry(args.country);
-      if (!c) return { error: `Unknown country "${args.country}". Ask the user to clarify or try list_countries.` };
-      const list = await getSellableServices(c.id, args.service || null);
-      if (!list.length) return { error: `No services currently available for ${c.name}.` };
-      session.country = c.name;
-      session.countryId = c.id;
-      session.last_options = list.slice(0, 12).map((s) => ({
-        service_code: s.service_id,
-        name: s.service_name,
-        variant: s.variant || 'normal',
-        price_ngn: s.price_ngn,
-        stock: s.stock,
-        country_id: c.id
-      }));
-      const services = session.last_options;
-      const hasMultiple = services.length > 1;
-      const hasVariants = new Set(services.map((s) => s.variant)).size > 1;
-      return {
-        country: c.name,
-        price_source: 'catalog',
-        must_choose: hasMultiple,
-        has_normal_and_virtual: hasVariants,
-        services,
-        tip: hasMultiple
-          ? 'User will also see Telegram buttons to pick Normal/Virtual. Still list options briefly and wait for their pick. Do not buy yet.'
-          : 'Only one option — confirm once then buy if they agree.'
-      };
-    }
-
-    case 'buy_number': {
-      const c = await resolveCountry(args.country);
-      if (!c) return { error: `Unknown country "${args.country}".` };
-      const list = await getSellableServices(c.id, args.service || null);
-      let svc = null;
-      if (args.service_code) {
-        svc = list.find((s) => String(s.service_id).toLowerCase() === String(args.service_code).toLowerCase());
-        // If filter missed it, try full country list
-        if (!svc) {
-          const all = await getSellableServices(c.id, null);
-          svc = all.find((s) => String(s.service_id).toLowerCase() === String(args.service_code).toLowerCase());
-        }
-      }
-      if (!svc) {
-        const matched = args.service ? matchServices(list, args.service) : list;
-        if (matched.length > 1 && !args.service_code) {
-          session.last_options = matched.slice(0, 12).map((s) => ({
-            service_code: s.service_id,
-            name: s.service_name,
-            variant: s.variant,
-            price_ngn: s.price_ngn,
-            stock: s.stock,
-            country_id: c.id
-          }));
-          return {
-            error: 'multiple_options',
-            message: 'More than one option exists. User should tap a button or tell you which one.',
-            options: session.last_options
-          };
-        }
-        svc = matched[0];
-      }
-      if (!svc) return { error: `"${args.service || args.service_code}" isn't available in ${c.name} right now.` };
-
-      if (svc.price_ngn > 0 && session.balance < svc.price_ngn) {
-        return {
-          error: 'insufficient_balance',
-          balance_ngn: session.balance,
-          price_ngn: svc.price_ngn,
-          message: `Customer's balance (₦${session.balance}) is below the price (₦${svc.price_ngn}). Tell them to top up their wallet and try again.`
-        };
-      }
-
-      const bought = await grizzlyBuy(svc.service_id, c.id);
-      if (!bought.success) return { error: bought.message || 'Purchase failed at the supplier.' };
-
-      const priceN = money(svc.price_ngn);
-      if (priceN > 0) {
-        const deb = await safeDebit(telegramUserId, priceN, { orderId: bought.order_id });
-        Object.assign(session, deb.session);
-      }
-      const order = {
-        orderId: bought.order_id,
-        provider: 'grizzly',
-        service: svc.service_id,
-        serviceName: svc.service_name || svc.service_id,
-        phoneNumber: bought.number,
-        price: money(svc.price_ngn),
-        status: 'Waiting for SMS',
-        date: new Date().toISOString(),
-        charged: true,
-        refunded: false
-      };
-      session.orders = [...(session.orders || []), order].slice(-30);
-
-      return {
-        success: true,
-        order_id: bought.order_id,
-        phone_number: bought.number,
-        price_ngn: svc.price_ngn,
-        new_balance_ngn: session.balance
-      };
-    }
-
-    case 'check_status': {
-      const orderId = args.order_id || (session.orders || []).slice(-1)[0]?.orderId;
-      if (!orderId) return { error: 'No recent order found for this customer.' };
-      const st = await grizzlyStatus(orderId);
-      if (st.success && st.code) {
-        session.orders = (session.orders || []).map((o) =>
-          String(o.orderId) === String(orderId) ? { ...o, status: `Code: ${st.code}` } : o
-        );
-        return { order_id: orderId, code: st.code };
-      }
-      return { order_id: orderId, waiting: !!st.waiting, message: st.message || 'Still waiting for the SMS to arrive.' };
-    }
-
-    case 'cancel_order': {
-      const orderId = args.order_id || (session.orders || []).slice(-1)[0]?.orderId;
-      if (!orderId) return { error: 'No recent order found for this customer.' };
-      const order = (session.orders || []).find((o) => String(o.orderId) === String(orderId));
-      if (order && /cancelled/i.test(order.status || '')) {
-        return { order_id: orderId, already_cancelled: true, balance_ngn: session.balance };
-      }
-      const wait = cancelWaitInfo(order);
-      if (!wait.allowed) {
-        return {
-          error: 'too_early',
-          early: true,
-          wait_seconds: wait.waitSec,
-          order_id: orderId,
-          message: `Too early to cancel. Tell user to wait about ${formatWait(wait.waitSec)} more (supplier needs ~${Math.round(MIN_CANCEL_MS / 60000)} min after purchase). Do NOT refund.`
-        };
-      }
-      const result = await grizzlyCancel(orderId);
-      if (!result.success) {
-        return {
-          error: result.message,
-          early: !!result.early,
-          order_id: orderId,
-          message: result.early
-            ? result.message
-            : 'Cancel failed at supplier. Do NOT tell user they were refunded.'
-        };
-      }
-      if (order && order.refunded === true) {
-        return {
-          success: true,
-          order_id: orderId,
-          already_refunded: true,
-          new_balance_ngn: money(session.balance)
-        };
-      }
-      const refunded = money(order?.price || 0);
-      if (refunded > 0) {
-        const cr = await safeCredit(telegramUserId, refunded, { orderId, reason: 'cancel' });
-        Object.assign(session, cr.session);
-      }
-      session.orders = (session.orders || []).map((o) =>
-        String(o.orderId) === String(orderId)
-          ? { ...o, status: 'Cancelled', refunded: true, refunded_amount: refunded }
-          : o
-      );
-      return {
-        success: true,
-        order_id: orderId,
-        refunded_ngn: refunded,
-        new_balance_ngn: money(session.balance)
-      };
-    }
-
-    case 'get_balance':
-      return { balance_ngn: session.balance };
-
-    case 'get_my_orders':
-      return { orders: (session.orders || []).slice(-10) };
-
-    case 'create_payment': {
-      let amount = Math.ceil(Number(args.amount_ngn) || 0);
-      if (!amount || amount < 1000) {
-        return { error: 'Minimum fund na ₦1,000. Ask the user how much (1,000 to 200,000).' };
-      }
-      if (amount > 200000) {
-        return { error: 'Maximum fund na ₦200,000 per payment. Ask them to pick within range.' };
-      }
-      const init = await paystackInitialize(amount, telegramUserId, args.email);
-      if (!init.success) return { error: init.message || 'Could not create payment link' };
-      const pending = {
-        reference: init.reference,
-        amount_ngn: init.amount_ngn,
-        authorization_url: init.authorization_url,
-        created_at: new Date().toISOString()
-      };
-      session.pending_payment = pending;
-      pendingPayments.set(String(telegramUserId), pending);
-      return {
-        success: true,
-        amount_ngn: init.amount_ngn,
-        reference: init.reference,
-        payment_link: init.authorization_url,
-        message: 'Payment ready. Tell user amount only and that Pay button dey below. Do NOT paste the long URL in chat. After pay dem should say: I don pay.'
-      };
-    }
-
-    case 'verify_payment': {
-      const mem = pendingPayments.get(String(telegramUserId));
-      const ref = args.reference || session.pending_payment?.reference || mem?.reference;
-      if (!ref) return { error: 'No pending payment found. Ask how much dem wan fund again.' };
-      const verified = await paystackVerify(ref);
-      if (!verified.success) {
-        return {
-          success: false,
-          status: verified.status || 'failed',
-          message: verified.message || 'Payment never show success yet. If dem don pay, wait small or send reference.'
-        };
-      }
-      if (session.last_credited_reference === ref || creditedRefs.has(ref)) {
-        return {
-          success: true,
-          already_credited: true,
-          amount_ngn: verified.amount_ngn,
-          balance_ngn: session.balance,
-          message: 'This payment already credited.'
-        };
-      }
-      session.balance = (Number(session.balance) || 0) + (Number(verified.amount_ngn) || 0);
-      session.last_credited_reference = ref;
-      session.pending_payment = null;
-      pendingPayments.delete(String(telegramUserId));
-      creditedRefs.add(ref);
-      return {
-        success: true,
-        amount_ngn: verified.amount_ngn,
-        balance_ngn: session.balance,
-        reference: ref,
-        message: 'Wallet funded successfully.'
-      };
-    }
-
-    default:
-      return { error: `Unknown function ${fnName}` };
-  }
-}
-
-async function callGeminiWithTools(session, telegramUserId, userText) {
-  const contents = [
-    ...(session.conversation || []),
-    { role: 'user', parts: [{ text: userText }] }
-  ];
-
-  for (let round = 0; round < MAX_TOOL_ROUNDTRIPS; round++) {
-    let res;
-    try {
-      res = await axios.post(
-        GEMINI_URL,
-        {
-          systemInstruction: { parts: [{ text: GEMINI_SYSTEM_PROMPT }] },
-          contents,
-          tools: GEMINI_TOOLS,
-          toolConfig: { functionCallingConfig: { mode: 'AUTO' } }
-        },
-        { ...axiosCfg, headers: { 'Content-Type': 'application/json' } }
-      );
-    } catch (e) {
-      const errData = e.response?.data || e.message;
-      console.error('gemini call failed', errData);
-      const status = e.response?.status;
-      const msg = String(e.response?.data?.error?.message || e.message || '');
-      if (status === 429 || /quota|rate.?limit|resource.?exhausted/i.test(msg)) {
-        return {
-          reply: 'QUOTA_EXCEEDED',
-          contents,
-          quota: true
-        };
-      }
-      if (status === 404 || /no longer available|not found/i.test(msg)) {
-        return {
-          reply: 'MODEL_UNAVAILABLE',
-          contents,
-          modelFail: true
-        };
-      }
-      return {
-        reply: 'Network dey do me somehow now. Abeg try that message again sharp sharp.',
-        contents
-      };
-    }
-
-    const candidate = res.data?.candidates?.[0];
-    const parts = candidate?.content?.parts || [];
-    const functionCalls = parts.filter((p) => p.functionCall);
-
-    if (!functionCalls.length) {
-      const text = parts.map((p) => p.text || '').join('').trim()
-        || 'I no too catch that one. You fit talk the country and app you want again?';
-      contents.push({ role: 'model', parts });
-      return { reply: text, contents };
-    }
-
-    contents.push({ role: 'model', parts });
-
-    const responseParts = [];
-    for (const fcPart of functionCalls) {
-      const fc = fcPart.functionCall || {};
-      const name = fc.name;
-      let args = fc.args || {};
-      if (typeof args === 'string') {
-        try { args = JSON.parse(args); } catch (_) { args = {}; }
-      }
-      const result = await executeGeminiFunction(name, args, telegramUserId, session);
-      responseParts.push({ functionResponse: { name, response: result } });
-    }
-    contents.push({ role: 'user', parts: responseParts });
-  }
-
-  return {
-    reply: 'E take longer than normal. Abeg send the request again or type the country and app clear.',
-    contents
-  };
-}
-
-async function parseCountryService(text) {
-  const original = String(text || '').trim();
-  // Pure digits / amounts = not a country
-  if (/^[\d,.\s₦k]+$/i.test(original) || parseNairaAmount(original) >= 1000) {
-    return { countryId: null, countryName: null, serviceCode: null, serviceName: null };
-  }
-  const t = original.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
-  let countryId = null;
-  let countryName = null;
-  let serviceCode = null;
-  let serviceName = null;
-
-  // Regions are not countries — leave countryId null so handler can ask for a specific country
-  if (/\b(europe|eu|european union|africa|asia|latin america|middle east|scandinavia)\b/.test(t) &&
-      !/\b(south africa|central african)\b/.test(t)) {
-    // still detect service if present
-  }
-
-  // Services first
-  const serviceEntries = Object.entries(SERVICE_MAP).sort((a, b) => b[0].length - a[0].length);
-  for (const [name, code] of serviceEntries) {
-    if (name.length < 2) continue;
-    if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\b`, 'i').test(t)) {
-      serviceCode = code;
-      serviceName = name;
-      break;
-    }
-  }
-
-  // Pretty labels for common ids (never show wrong country in "Checking…")
-  const PRETTY = {
-    12: 'USA',
-    187: 'USA (2)',
-    16: 'UK',
-    19: 'Nigeria',
-    36: 'Canada',
-    43: 'Germany',
-    38: 'Ghana',
-    8: 'Kenya',
-    31: 'South Africa',
-    22: 'India',
-    48: 'Netherlands',
-    78: 'France',
-    54: 'Mexico',
-    73: 'Brazil'
-  };
-
-  // ALIASES FIRST — offline, never depend on Grizzly uptime
-  // (if Grizzly hangs, old code left countryId null → stuck session used USA)
-  const aliasEntries = Object.entries(COUNTRY_MAP).sort((a, b) => b[0].length - a[0].length);
-  for (const [name, id] of aliasEntries) {
-    if (name.length < 2) continue;
-    if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\b`, 'i').test(t)) {
-      countryId = id;
-      countryName = PRETTY[id] || name.replace(/\b\w/g, (c) => c.toUpperCase());
-      break;
-    }
-  }
-
-  // Live Grizzly names only if alias missed
-  if (countryId == null) {
-    try {
-      const live = await grizzlyCountries();
-      const ranked = [...live]
-        .map((c) => ({ id: c.id, name: c.name, n: String(c.name || '').toLowerCase().trim() }))
-        .filter((c) => c.n.length >= 3)
-        .sort((a, b) => b.n.length - a.n.length);
-      for (const c of ranked) {
-        const re = new RegExp(`\\b${c.n.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\b`, 'i');
-        if (re.test(t)) {
-          countryId = c.id;
-          countryName = PRETTY[c.id] || c.name;
-          break;
-        }
-      }
-    } catch (_) {}
-  }
-
-  return { countryId, countryName, serviceCode, serviceName };
-}
-
-
-function matchServices(list, query) {
-  if (!query) return dedupeServices(list).slice(0, 20);
-  const q = String(query).toLowerCase().trim();
-  const code = (SERVICE_MAP[q] || q).toLowerCase();
-
-  // Primary exact service_id match first (wa, tg, go…)
-  const exact = list.filter((s) => String(s.service_id || '').toLowerCase() === code);
-
-  // Extra variants ONLY if supplier name/code clearly marks virtual/alternate
-  // Do NOT pull every service whose name merely contains "whatsapp"
-  const extras = list.filter((s) => {
-    const id = String(s.service_id || '').toLowerCase();
-    const name = String(s.service_name || '').toLowerCase();
-    if (id === code) return false; // already in exact
-    // same family with explicit suffix: wa_xxx, tg_xxx
-    if (code.length >= 2 && new RegExp(`^${code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}_`).test(id)) {
-      return true;
-    }
-    // name must include app AND variant keyword
-    const appWord =
-      code === 'wa' ? 'whatsapp' :
-      code === 'tg' ? 'telegram' :
-      code === 'go' ? 'google' :
-      code === 'ig' ? 'instagram' :
-      code === 'fb' ? 'facebook' :
-      code === 'lf' ? 'tiktok' :
-      code === 'fu' ? 'snapchat' :
-      q;
-    if (!name.includes(appWord) && id !== q) return false;
-    return /virtual|voip|alternate|temp/.test(name) || /virtual|voip|alternate|temp/.test(id);
-  });
-
-  let hit = [...exact, ...extras];
-
-  // Fallback: loose name match only if nothing exact (single best row)
-  if (!hit.length) {
-    hit = list.filter((s) => {
-      const id = String(s.service_id || '').toLowerCase();
-      const name = String(s.service_name || '').toLowerCase();
-      return id === q || name === q || name.includes(q);
-    });
-  }
-
-  hit = dedupeServices(hit);
-
-  // Prefer stock > 0, then cheaper
-  hit.sort((a, b) => {
-    const sa = a.stock > 0 ? 0 : 1;
-    const sb = b.stock > 0 ? 0 : 1;
-    if (sa !== sb) return sa - sb;
-    return (a.price_ngn || 0) - (b.price_ngn || 0);
-  });
-
-  // If only the primary code exists, return just that (1 option)
-  // If supplier has real extras, return primary + extras
-  return hit.slice(0, 8);
-}
-
-/** Unique by service_id — never show the same supplier service twice */
-function dedupeServices(list) {
-  const seen = new Set();
-  const out = [];
-  for (const s of list || []) {
-    const id = String(s.service_id || '').toLowerCase();
-    if (!id) continue;
-    // Keep same service across different country pools (USA vs USA (2))
-    const cid = s.country_id != null ? String(s.country_id) : '';
-    const key = `${cid}|${id}|${Number(s.price_ngn) || 0}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(s);
-  }
-  return out;
-}
-
-/**
- * Some countries have multiple supplier pools with the same label.
- * Grizzly: USA = 12 and USA (2) = 187. When user asks "USA WhatsApp"
- * we show both pools (if in stock) with their own prices.
- */
-function siblingCountryIds(countryId) {
-  const id = Number(countryId);
-  // USA / USA (2)
-  if (id === 12 || id === 187) return [12, 187];
-  // UK variants if any appear later — keep single for now
-  return [id];
-}
-
-function countryPoolLabel(countryId, countryName, hubCountryName) {
-  const cn = String(hubCountryName || countryName || '').trim();
-  if (cn) return cn;
-  const id = Number(countryId);
-  if (id === 12) return 'USA';
-  if (id === 187) return 'USA (2)';
-  return String(countryName || countryId);
-}
-
-
-// ---------- Bot commands ----------
-async function registerBotMenu() {
-  try {
-    await bot.telegram.setMyCommands([
-      { command: 'start', description: 'Start the bot · talk to Mira' },
-      { command: 'balance', description: 'Check your wallet balance' },
-      { command: 'fund', description: 'Top up your wallet (e.g. /fund 2000)' },
-      { command: 'orders', description: 'View numbers you bought' },
-      { command: 'privacy', description: 'View our privacy policy' },
-      { command: 'support', description: 'Contact customer care / help' }
-    ]);
-  } catch (e) {
-    console.error('setMyCommands', e.message);
-  }
-}
-registerBotMenu();
-
-
-
-bot.start(async (ctx) => {
-  await getUserSession(ctx.from.id);
-  await ctx.reply(
-    `How far 👋 Welcome to *MJ SMS*.\n` +
-      `I be *Mira* — I go help you get *real number* for verification sharp sharp.\n\n` +
-      `Numbers here na *real mobile* (no be VOIP) — dem dey work for WhatsApp, Telegram, Instagram, Google, TikTok and plenty more.\n\n` +
-      `*How e dey work*\n` +
-      `Just type country + app, e.g.\n` +
-      `• *USA WhatsApp*\n` +
-      `• *Canada Telegram*\n` +
-      `• *UK Instagram*\n\n` +
-      `*Quick commands*\n` +
-      `/balance — check your wallet\n` +
-      `/fund 2k — top up (even *5k*, *10k*…)\n` +
-      `/orders — numbers wey you don buy\n` +
-      `/support — talk to human\n\n` +
-      `Wetin you need right now?`,
-    { parse_mode: 'Markdown' }
-  );
-});
-
-bot.command('hubtest', async (ctx) => {
-  if (String(ctx.from.id) !== String(ADMIN_TELEGRAM_ID)) {
-    return ctx.reply('Admin only.');
-  }
-  const hasUrl = Boolean(MJ_HUB_REST_URL);
-  const hasKey = Boolean(MJ_HUB_SERVICE_KEY);
-  let msg = `MJ_HUB_REST_URL: ${hasUrl ? 'set' : 'MISSING'}\nMJ_HUB_SERVICE_KEY: ${hasKey ? 'set' : 'MISSING'}\n`;
-  if (!hasUrl || !hasKey) {
-    return ctx.reply(msg + '\nAdd env and redeploy.');
-  }
-  try {
-    // Direct WhatsApp query on Hub
-    const waUrl =
-      `${MJ_HUB_REST_URL}/number_services?select=service_id,service_name,country_id,country_name,price,supplier_price` +
-      `&or=(service_id.eq.wa,service_name.ilike.*whatsapp*)&price=gt.0&order=price.asc&limit=15`;
-    const waRes = await axios.get(waUrl, { ...axiosCfg, headers: mjHubHeaders });
-    const waRows = Array.isArray(waRes.data) ? waRes.data : [];
-    msg += `Hub WhatsApp rows (any country): ${waRows.length}\n`;
-    msg +=
-      waRows
-        .slice(0, 10)
-        .map(
-          (r) =>
-            `• ${r.service_id} | ${r.service_name} | ₦${r.price} | cid=${r.country_id} | ${r.country_name}`
-        )
-        .join('\n') || '(none)';
-
-    const sell = await getSellableServices(12, 'whatsapp');
-    msg += `\n\nSellable USA WhatsApp: ${sell.length}\n`;
-    msg += sell.map((s) => `• ${s.service_id} ${s.service_name} ₦${s.price_ngn} [${s.source}]`).join('\n');
-    await ctx.reply(msg.slice(0, 3500));
-  } catch (e) {
-    await ctx.reply(
-      msg +
-        `\nERROR ${e.response?.status || ''}\n` +
-        JSON.stringify(e.response?.data || e.message).slice(0, 500)
-    );
-  }
-});
-
-
-bot.command('privacy', async (ctx) => {
-  await ctx.reply(
-    `*MJ SMS Privacy Policy*\n\n` +
-      `• We only use your Telegram ID to run your wallet and orders on this bot.\n` +
-      `• Phone numbers you buy are for your OTP use; we do not sell your personal chat data.\n` +
-      `• Payments are processed securely via Paystack.\n` +
-      `• Order history is stored so you can check numbers and status.\n` +
-      `• You can request support anytime with /support.\n\n` +
-      `Website: mjhub.store`,
-    { parse_mode: 'Markdown' }
-  );
-});
-
-bot.command('support', async (ctx) => {
-  const prefill = encodeURIComponent(
-    `Hello MJ Hub support, I need help on MJ SMS Telegram bot.\nTelegram: @${ctx.from.username || 'n/a'} (id ${ctx.from.id})`
-  );
-  const waUrl = `${SUPPORT_WA_LINK}?text=${prefill}`;
-  await ctx.reply(
-    `*MJ SMS Support*\n\n` +
-      `I be *Mira* — I fit help you buy number and check OTP here.\n\n` +
-      `Need human support? Same channels as *mjhub.store*:`,
-    {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([
-        [Markup.button.url('💬 WhatsApp Support', waUrl)],
-        [Markup.button.url('✈️ Telegram Support', SUPPORT_TG_LINK)],
-        [Markup.button.url('🌐 MJ Hub website', SUPPORT_SITE)],
-        [Markup.button.callback('💰 Balance', 'menu:bal')],
-        [Markup.button.callback('💳 Fund wallet', 'menu:fund')]
-      ])
-    }
-  );
-});
-
-
-bot.command(['balance', 'bal'], async (ctx) => {
-  const s = await getUserSession(ctx.from.id);
-  await ctx.reply(`Balance: *₦${money(s.balance).toLocaleString()}*`, { parse_mode: 'Markdown' });
-});
-
-bot.command('orders', async (ctx) => {
-  const s = await getUserSession(ctx.from.id);
-  const list = (s.orders || []).filter((o) => o && o.orderId && o.type !== '_meta');
-  if (!list.length) {
-    return ctx.reply('No orders yet.\n\nType country + app e.g. *USA WhatsApp* to buy.', {
-      parse_mode: 'Markdown'
-    });
-  }
-  const lines = list
-    .slice(-15)
-    .reverse()
-    .map((o, i) => {
-      const phone = String(o.phoneNumber || o.number || o.phone || '').trim() || '—';
-      const svc = o.serviceName || o.service || 'SMS';
-      const price = money(o.price);
-      const st = o.status || '—';
-      const id = o.orderId || '';
-      const when = o.date ? new Date(o.date).toLocaleString('en-GB', { timeZone: 'Africa/Lagos' }) : '';
-      return (
-        `*${i + 1}. ${svc}*\n` +
-        `📞 \`${phone}\`\n` +
-        `🆔 \`${id}\`\n` +
-        `₦${price.toLocaleString()} · ${st}` +
-        (when ? `\n${when}` : '')
-      );
-    })
-    .join('\n\n');
-  await ctx.reply(`*Your recent orders*\n\n${lines}`, { parse_mode: 'Markdown' });
-});
-
-bot.command('status', async (ctx) => {
-  if (!GRIZZLY_KEY) return ctx.reply('GRIZZLYSMS_API_KEY not set on server.');
-  const bal = await grizzlyBalance();
-  if (bal == null) return ctx.reply('Supplier: OFFLINE');
-  await ctx.reply(`*Supplier:* ONLINE\nBalance: \`${bal}\``, {
-    parse_mode: 'Markdown'
-  });
-});
-
-bot.command('fund', async (ctx) => {
-  const parts = (ctx.message.text || '').trim().split(/\s+/);
-  const raw = parts[1];
-  const session = await getUserSession(ctx.from.id);
-
-  // /fund with no amount → ask and WAIT for next message as the amount
-  if (!raw) {
-    session.state = 'AWAITING_FUND_AMOUNT';
-    await saveUserSession(ctx.from.id, session);
-    return ctx.reply(
-      'How much you wan fund?\n\nMin ₦1,000 · Max ₦200,000\n\nExample: 5000\n(or type /fund 5000)'
-    );
-  }
-
-  let amount = parseNairaAmount(raw);
-  if (amount < 1000) {
-    session.state = 'AWAITING_FUND_AMOUNT';
-    await saveUserSession(ctx.from.id, session);
-    return ctx.reply('Minimum na ₦1,000. Example: *2k* or *5000*', { parse_mode: 'Markdown' });
-  }
-  if (amount > 200000) {
-    session.state = 'AWAITING_FUND_AMOUNT';
-    await saveUserSession(ctx.from.id, session);
-    return ctx.reply('Maximum na ₦200,000 for one payment. Example: *50k*', { parse_mode: 'Markdown' });
-  }
-
-  const init = await paystackInitialize(amount, ctx.from.id, null);
-  if (!init.success) {
-    return ctx.reply(init.message || 'Paystack no gree right now.');
-  }
-  const pending = {
-    reference: init.reference,
-    amount_ngn: init.amount_ngn,
-    authorization_url: init.authorization_url,
-    created_at: new Date().toISOString()
-  };
-  session.pending_payment = pending;
-  session.state = 'AWAITING_INPUT';
-  pendingPayments.set(String(ctx.from.id), pending);
-  await saveUserSession(ctx.from.id, session);
-  await ctx.reply(
-    `Top up ₦${init.amount_ngn.toLocaleString()}\n\nTap Pay below.\nWhen e successful, type: I don pay`,
-    Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', init.authorization_url)]])
-  );
-});
-
-// Buy callback: buy:countryId:serviceId:priceNgn
-
-bot.action('menu:home', async (ctx) => {
-  await ctx.answerCbQuery();
-  await ctx.reply(
-    'Select the country for your number:',
-    Markup.inlineKeyboard([
-      [
-        Markup.button.callback('🇺🇸 United States', 'cty:12'),
-        Markup.button.callback('🇬🇧 United Kingdom', 'cty:16')
-      ],
-      [
-        Markup.button.callback('🇨🇦 Canada', 'cty:36'),
-        Markup.button.callback('🇳🇬 Nigeria', 'cty:19')
-      ],
-      [
-        Markup.button.callback('🇬🇭 Ghana', 'cty:38'),
-        Markup.button.callback('🇰🇪 Kenya', 'cty:8')
-      ]
-    ])
-  );
-});
-
-bot.action('menu:fund', async (ctx) => {
-  await ctx.answerCbQuery();
-  const session = await getUserSession(ctx.from.id);
-  session.state = 'AWAITING_FUND_AMOUNT';
-  await saveUserSession(ctx.from.id, session);
-  await ctx.reply('How much you wan fund?\n\nMin ₦1,000 · Max ₦200,000\n\nExample: 5000');
-});
-
-bot.action('menu:bal', async (ctx) => {
-  await ctx.answerCbQuery();
-  const s = await getUserSession(ctx.from.id);
-  await ctx.reply(`Balance: ₦${Number(s.balance || 0).toLocaleString()}`);
-});
-
-bot.action(/^cty:(\d+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const countryId = ctx.match[1];
-  const nameFromId = Object.entries(COUNTRY_MAP).find(([, id]) => String(id) === String(countryId));
-  const countryName = nameFromId ? nameFromId[0] : `country ${countryId}`;
-  const session = await getUserSession(ctx.from.id);
-  session.countryId = Number(countryId);
-  session.country = countryName;
-  session.state = 'AWAITING_APP';
-  await saveUserSession(ctx.from.id, session);
-  await ctx.reply(
-    `Country: *${countryName}*\n\nWhich app?`,
-    {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([
-        [
-          Markup.button.callback('WhatsApp', `app:${countryId}:whatsapp`),
-          Markup.button.callback('Telegram', `app:${countryId}:telegram`)
-        ],
-        [
-          Markup.button.callback('Google', `app:${countryId}:google`),
-          Markup.button.callback('Instagram', `app:${countryId}:instagram`)
-        ],
-        [
-          Markup.button.callback('Facebook', `app:${countryId}:facebook`),
-          Markup.button.callback('TikTok', `app:${countryId}:tiktok`)
-        ],
-        [
-          Markup.button.callback('Snapchat', `app:${countryId}:snapchat`),
-          Markup.button.callback('Discord', `app:${countryId}:discord`)
-        ],
-        [Markup.button.callback('⬅️ Back', 'menu:home')]
-      ])
-    }
-  );
-});
-
-bot.action(/^app:(\d+):([^:]+)$/, async (ctx) => {
-  await ctx.answerCbQuery('Loading…');
-  const countryId = ctx.match[1];
-  const app = ctx.match[2];
-  const session = await getUserSession(ctx.from.id);
-  const nameFromId = Object.entries(COUNTRY_MAP).find(([, id]) => String(id) === String(countryId));
-  const countryName = session.country || (nameFromId ? nameFromId[0] : countryId);
-  await showServiceOptions(ctx, session, ctx.from.id, countryId, countryName, app);
-});
-
-bot.action('opt:cancel', async (ctx) => {
-  await ctx.answerCbQuery();
-  const session = await getUserSession(ctx.from.id);
-  session.last_options = null;
-  await saveUserSession(ctx.from.id, session);
-  await ctx.reply('Alright, cancelled. Wetin you need instead?');
-});
-
-bot.action(/^opt:(\d+):([^:]+):(\d+)$/, async (ctx) => {
-  await ctx.answerCbQuery('Buying…');
-  const countryId = ctx.match[1];
-  const serviceId = ctx.match[2];
-  const price = money(parseInt(ctx.match[3], 10) || 0);
-  const userId = ctx.from.id;
-  let session = await getUserSession(userId);
-
-  if (price > 0 && money(session.balance) < price) {
-    return ctx.reply(
-      `Balance no reach o.\nYou need ₦${price.toLocaleString()} · you get ₦${money(session.balance).toLocaleString()}.\n\nType /fund ${price} make I top you up.`
-    );
-  }
-
-  await ctx.reply('I dey grab the number… hold on.');
-  const bought = await grizzlyBuy(serviceId, countryId);
-  if (!bought.success) {
-    return ctx.reply(
-      /502|503|gateway|unreachable|timeout/i.test(String(bought.message || ''))
-        ? 'Supplier temporarily unavailable. Abeg try again in a few minutes.'
-        : `E no work: ${bought.message || 'No number available. Try another option.'}`
-    );
-  }
-
-  // MUST debit after supplier success — never give free number
-  const deb = await safeDebit(userId, price, { orderId: bought.order_id, path: 'opt' });
-  if (price > 0 && !deb.ok) {
-    // Try cancel at supplier so customer isn't charged twice later
-    try {
-      await grizzlyCancel(bought.order_id);
-    } catch (_) {}
-    console.error('[buy] debit failed after getNumber', userId, price, bought.order_id, deb);
-    return ctx.reply(
-      deb.saveFailed
-        ? 'Number come out but wallet no update. Abeg contact /support with this id: `' +
-            bought.order_id +
-            '` — we go sort am.'
-        : `Balance no reach to complete this buy.\nNeed ₦${price.toLocaleString()} · you get ₦${money(deb.balance).toLocaleString()}.\n\nFund and try again.`,
-      { parse_mode: 'Markdown' }
-    );
-  }
-
-  session = deb.session || (await getUserSession(userId));
-  const order = {
-    orderId: bought.order_id,
-    provider: 'grizzly',
-    service: serviceId,
-    serviceName: serviceId,
-    phoneNumber: bought.number,
-    price,
-    status: 'Waiting SMS',
-    date: new Date().toISOString(),
-    charged: true,
-    refunded: false
-  };
-  session.orders = [...(session.orders || []), order].slice(-30);
-  session.last_options = null;
-  session.state = 'AWAITING_INPUT';
-  session.pendingService = null;
-  await saveUserSession(userId, session);
-
-  // Fresh balance for message
-  const balNow = money((await getUserSession(userId)).balance);
-  const phone = String(bought.number || '');
-  const cancelLabel = `⏳ Cancel (wait ${Math.round(MIN_CANCEL_MS / 60000)}m)`;
-  await ctx.reply(
-    `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n₦${price.toLocaleString()} debited · Balance: ₦${balNow.toLocaleString()}\n\nUse am for the app to request OTP.\nI go auto-check the code — or tap Check anytime.\n\n_Cancel opens after ~${Math.round(MIN_CANCEL_MS / 60000)} minutes._`,
-    {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([
-        [{ text: '📋 Copy number', copy_text: { text: phone } }],
-        [Markup.button.callback('Check SMS code', `chk:${bought.order_id}:${price}`)],
-        [Markup.button.callback(cancelLabel.slice(0, 64), `can:${bought.order_id}:${price}`)]
-      ])
-    }
-  );
-  // Auto-poll SMS status → push code to user when ready
-  try {
-    const baseUrl =
-      process.env.BOT_PUBLIC_URL ||
-      (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : '');
-    if (baseUrl) {
-      startStatusPolling(baseUrl, userId, bought.order_id, price, 0).catch((e) =>
-        console.error('startStatusPolling', e.message)
-      );
-    }
-  } catch (e) {
-    console.error('schedule poll', e.message);
-  }
-});
-
-bot.action(/^buy:(\d+):([^:]+):(\d+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const userId = ctx.from.id;
-  const countryId = ctx.match[1];
-  const serviceId = ctx.match[2];
-  const price = parseInt(ctx.match[3], 10) || 0;
-  const session = await getUserSession(userId);
-
-  const priceN = money(price);
-  if (priceN > 0 && money(session.balance) < priceN) {
-    return ctx.reply(
-      `Balance no reach. Need ₦${priceN.toLocaleString()} · you get ₦${money(session.balance).toLocaleString()}.\nUse /fund to top up.`
-    );
-  }
-
-  await ctx.reply('I dey grab the number… hold on.');
-  const bought = await grizzlyBuy(serviceId, countryId);
-  if (!bought.success) {
-    return ctx.reply(
-      /502|503|gateway|unreachable|timeout/i.test(String(bought.message || ''))
-        ? 'Supplier temporarily unavailable. Abeg try again in a few minutes.'
-        : /NO_NUMBERS/i.test(String(bought.message || ''))
-          ? 'No stock for that country/app right now. Try another country.'
-          : `Failed: ${bought.message || 'No number'}`
-    );
-  }
-
-  const deb = await safeDebit(userId, priceN, { orderId: bought.order_id, service: serviceId, path: 'buy' });
-  if (priceN > 0 && !deb.ok) {
-    try {
-      await grizzlyCancel(bought.order_id);
-    } catch (_) {}
-    return ctx.reply(
-      deb.saveFailed
-        ? `Number come out but wallet no update. Contact /support with id \`${bought.order_id}\`.`
-        : `Balance no reach. Need ₦${priceN.toLocaleString()} · you get ₦${money(deb.balance).toLocaleString()}.`,
-      { parse_mode: 'Markdown' }
-    );
-  }
-  let sess = deb.session || (await getUserSession(userId));
-  const order = {
-    orderId: bought.order_id,
-    provider: 'grizzly',
-    service: serviceId,
-    serviceName: serviceId,
-    phoneNumber: bought.number,
-    price: priceN,
-    status: 'Waiting for SMS',
-    date: new Date().toISOString(),
-    charged: true,
-    refunded: false
-  };
-  sess.orders = [...(sess.orders || []), order].slice(-30);
-  await saveUserSession(userId, sess);
-
-  const balNow = money((await getUserSession(userId)).balance);
-  const phone = String(bought.number || '');
-  const cancelLabel = `⏳ Cancel (wait ${Math.round(MIN_CANCEL_MS / 60000)}m)`;
-  await ctx.reply(
-    `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n₦${priceN.toLocaleString()} debited · Balance: ₦${balNow.toLocaleString()}\n\nI go auto-check the code — or tap Check.\n\n_Cancel opens after ~${Math.round(MIN_CANCEL_MS / 60000)} minutes._`,
-    {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([
-        [{ text: '📋 Copy number', copy_text: { text: phone } }],
-        [Markup.button.callback('Check SMS code', `chk:${bought.order_id}:${priceN}`)],
-        [Markup.button.callback(cancelLabel.slice(0, 64), `can:${bought.order_id}:${priceN}`)]
-      ])
-    }
-  );
-  try {
-    const baseUrl =
-      process.env.BOT_PUBLIC_URL ||
-      (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : '');
-    if (baseUrl) {
-      startStatusPolling(baseUrl, userId, bought.order_id, priceN, 0).catch((e) =>
-        console.error('startStatusPolling', e.message)
-      );
-    }
-  } catch (e) {
-    console.error('schedule poll', e.message);
-  }
-});
-
-bot.action(/^chk:([^:]+):(\d+)$/, async (ctx) => {
-  await ctx.answerCbQuery('Checking…');
-  const orderId = ctx.match[1];
-  const price = parseInt(ctx.match[2], 10) || 0;
-  const st = await grizzlyStatus(orderId);
-  if (st.success && st.code) {
-    const session = await getUserSession(ctx.from.id);
-    session.orders = (session.orders || []).map((o) =>
-      String(o.orderId) === String(orderId) ? { ...o, status: `Code: ${st.code}` } : o
-    );
-    await saveUserSession(ctx.from.id, session);
-    return ctx.reply(`Code: *${st.code}*`, { parse_mode: 'Markdown' });
-  }
-  return ctx.reply(st.waiting ? 'Still waiting for SMS… tap Check again.' : `Status: ${st.message || 'waiting'}`);
-});
-
-bot.action(/^can:([^:]+):(\d+)$/, async (ctx) => {
-  await ctx.answerCbQuery('Cancelling…');
-  const orderId = ctx.match[1];
-  const price = parseInt(ctx.match[2], 10) || 0;
-  const session = await getUserSession(ctx.from.id);
-  const order = (session.orders || []).find((o) => String(o.orderId) === String(orderId));
-
-  // Already cancelled locally — don't double-refund
-  if (order && /cancelled/i.test(order.status || '')) {
-    return ctx.reply('This order already cancelled.');
-  }
-
-  // Dynamic countdown from order.date (default 3 min window)
-  const wait = cancelWaitInfo(order || { date: null });
-  if (!wait.allowed) {
-    const remain = formatWait(wait.waitSec);
-    const label = `⏳ ${remain} left`.slice(0, 64);
-    try {
-      await ctx.answerCbQuery(`⏳ Cancel opens in ${remain}`, { show_alert: true });
-    } catch (_) {}
-    // Refresh buttons with live remaining time
-    const phone = String(order?.phoneNumber || '');
-    const kb = {
-      inline_keyboard: [
-        phone ? [{ text: '📋 Copy number', copy_text: { text: phone } }] : [],
-        [{ text: 'Check SMS code', callback_data: `chk:${orderId}:${price}`.slice(0, 64) }],
-        [{ text: label, callback_data: `can:${orderId}:${price}`.slice(0, 64) }]
-      ].filter((row) => row.length)
-    };
-    try {
-      await ctx.editMessageReplyMarkup(kb);
-    } catch (_) {}
-    // Also edit message text footer with countdown if possible
-    try {
-      const base = (ctx.callbackQuery?.message?.text || '').split('\n\n⏳')[0];
-      if (base) {
-        await ctx.editMessageText(
-          `${base}\n\n⏳ Cancel available in *${remain}*\n(Tap Cancel again to refresh timer)`,
-          { parse_mode: 'Markdown', reply_markup: kb }
-        );
-      }
-    } catch (_) {}
-    return;
-  }
-
-  // Fresh session before any money move
-  let sess = await getUserSession(ctx.from.id);
-  const ord = (sess.orders || []).find((o) => String(o.orderId) === String(orderId));
-
-  if (ord && (/cancelled/i.test(ord.status || '') || ord.refunded === true)) {
-    return ctx.reply(
-      `This order already cancelled.\nBalance: ₦${money(sess.balance).toLocaleString()}`
-    );
-  }
-
-  const result = await grizzlyCancel(orderId);
-  if (!result.success) {
-    return ctx.reply(
-      result.early
-        ? `Supplier still blocking cancel.\n\nWait a bit more (about ${Math.round(MIN_CANCEL_MS / 60000)} min from purchase), then try again.\nNo refund yet.`
-        : `${result.message}\n\nNo refund yet — order still active on supplier.`
-    );
-  }
-
-  // Refund ONLY the order's recorded price (never trust button alone), once
-  const refundAmt = money(ord?.price ?? price);
-  let newBal = money(sess.balance);
-
-  if (refundAmt > 0 && ord && ord.refunded !== true) {
-    const credited = await safeCredit(ctx.from.id, refundAmt, { orderId, reason: 'cancel' });
-    sess = credited.session;
-    newBal = credited.balance;
-    sess.orders = (sess.orders || []).map((o) =>
-      String(o.orderId) === String(orderId)
-        ? { ...o, status: 'Cancelled', refunded: true, refunded_amount: refundAmt }
-        : o
-    );
-    await saveUserSession(ctx.from.id, sess);
-  } else {
-    sess.orders = (sess.orders || []).map((o) =>
-      String(o.orderId) === String(orderId) ? { ...o, status: 'Cancelled', refunded: true } : o
-    );
-    await saveUserSession(ctx.from.id, sess);
-    newBal = money(sess.balance);
-  }
-
-  // Re-read for display truth
-  const finalS = await getUserSession(ctx.from.id);
-  await ctx.reply(
-    refundAmt > 0
-      ? `Cancelled ✅\n₦${refundAmt.toLocaleString()} refunded.\nBalance: ₦${money(finalS.balance).toLocaleString()}`
-      : `Cancelled ✅\nBalance: ₦${money(finalS.balance).toLocaleString()}`
-  );
-});
-
-
-
-// ---------- Mira smart flow (works without Gemini) ----------
-const MIRA = {
-  greet:
-    'How far 👋 Welcome to *MJ SMS*.\nI be *Mira* — I go help you get *real number* for verification.\n\nType country + app:\n• *USA WhatsApp*\n• *Canada Telegram*\n• *UK Instagram*\n\n/balance · /fund 2k · /orders · /support\n\nWetin you need?',
-  askService: 'Which app you need the number for?\nWhatsApp, Telegram, Instagram, Google, Facebook, TikTok…',
-  askCountry: (svc) =>
-    svc
-      ? `Which country for *${svc}*?\nExample: USA, UK, Nigeria, Canada`
-      : 'Which country you want the number from?',
-  noStock: 'That one no dey available right now o. You fit try another country?',
-  lowBal: (need, bal) =>
-    `Balance no reach o.\nYou need ₦${Number(need).toLocaleString()} · you get ₦${Number(bal).toLocaleString()}.\n\nType /fund ${need} or *fund ${Math.ceil(Number(need) / 1000)}k* make I open Paystack.`,
-  yarn:
-    'I dey here. Just tell me country + app — e.g. *USA WhatsApp* — or *fund* / *balance*.',
-  about:
-    '*MJ Hub* na one place for three things:\n\n' +
-    '• *MJ SMS* — real numbers for OTP (wetin we dey do for this bot)\n' +
-    '• *MJ Logs* — verified accounts — order for *mjhub.store*\n' +
-    '• *MJ Boosters* — followers/likes/views — order for *mjhub.store*\n\n' +
-    'Site: mjhub.store\nThis bot wallet separate from website wallet.\nReferral for site: *2% for life* when people you invite fund.',
-  howSms:
-    'E simple:\n\n' +
-    '1. Tell me country + app (e.g. USA WhatsApp)\n' +
-    '2. I show *live* price → you buy from wallet\n' +
-    '3. You use the number request OTP for the app\n' +
-    '4. Code usually land within about 1 minute — tap *Check*\n' +
-    '5. If e no come, cancel after ~3 min for refund when e allow\n\n' +
-    'Numbers here na *real mobile*, no be VOIP.',
-  fundHelp:
-    'To fund this bot wallet:\n• */fund 2k* or */fund 5000*\n• or type *fund* then amount (*2k*, *5k*, *10k*…)\nPaystack go open — after pay, wallet update. You fit type *I don pay*.\n\nBot wallet ≠ mjhub.store wallet.',
-  supportHelp:
-    'I fit handle number and OTP here.\nFor human support type */support* or use mjhub.store.',
-};
-
-function detectServiceOnly(text) {
-  const t = String(text || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
-  if (!t || t.length > 40) return null;
-  const entries = Object.entries(SERVICE_MAP).sort((a, b) => b[0].length - a[0].length);
-  for (const [name, code] of entries) {
-    if (name.length < 2) continue;
-    if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(t)) {
-      return { serviceName: name, serviceCode: code };
-    }
-  }
-  return null;
-}
-
-function isYes(text) {
-  return /^(yes|y|yeah|yep|ok|okay|sure|go|process|buy|do am|ready|proceed|sharp|abeg)\b/i.test(
-    String(text || '').trim()
-  );
-}
-
-function isNo(text) {
-  return /^(no|nah|nope|cancel|stop|never mind|later)\b/i.test(String(text || '').trim());
-}
-
-function looksLikeNeedNumber(text) {
-  return /\b(number|sms|otp|verify|verification|i need|get me|buy|i wan|i want|give me|get number|need number)\b/i.test(
-    String(text || '')
-  );
-}
-
-function looksLikeChitchat(text) {
-  const t = String(text || '').toLowerCase().trim();
-  return (
-    /^(hi|hello|hey|yo|awfa|how far|how you dey|how far na|how body|body|abeg|please|wetin be your name|what is your name|who are you|good morning|good evening|good afternoon|sup|mira|thanks|thank you|ok|okay|alright|sharp|na so|ehn|hmm|lol)\b/i.test(
-      t
-    ) ||
-    /your name|who you be|you be who|wetin you (fit|can) do|you dey|how market/.test(t)
-  );
-}
-
-/** Short natural Pidgin replies for greetings — no fake prices or stock */
-function chitchatReply(text) {
-  const t = String(text || '').toLowerCase().trim();
-  if (/thank|thanks|appreciate/.test(t)) {
-    return 'You welcome 🙌 Anytime. You still need number, or you wan check balance?';
-  }
-  if (/name|who you|who are you|you be who/.test(t)) {
-    return 'I be *Mira* — MJ SMS assistant. I go help you get real number for OTP.\nJust type e.g. *USA WhatsApp*.';
-  }
-  if (/wetin you (fit|can) do|help me|commands?/.test(t)) {
-    return MIRA.greet;
-  }
-  if (/good morning/.test(t)) {
-    return 'Good morning ☀️ How you dey? You need number today, or you wan fund wallet?';
-  }
-  if (/good evening|good afternoon/.test(t)) {
-    return 'How far 👋 You need number, fund, or balance?';
-  }
-  // default hi / how far / awfa
-  return 'How far 👋 I dey.\nYou need *number*, *fund* wallet, or check *balance*?';
-}
-
-/** Resolve country only if message is mainly a country name (not random chat / amounts) */
-async function resolveCountryStrict(text) {
-  const raw = String(text || '').trim();
-  if (!raw || raw.length > 48) return null;
-  if (/[?]/.test(raw) || looksLikeChitchat(raw)) return null;
-  if (detectServiceOnly(raw)) return null;
-  if (/^[\d,.\s₦nairaNGNk]+$/i.test(raw) || parseNairaAmount(raw) >= 1000) return null;
-
-  const t = raw
-    .toLowerCase()
-    .replace(/[^a-z\s]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  const words = t.split(' ').filter(Boolean);
-
-  // Alias map first (usa, nigeria, uk…) — whole-word
-  const aliasEntries = Object.entries(COUNTRY_MAP).sort((a, b) => b[0].length - a[0].length);
-  for (const [name, id] of aliasEntries) {
-    if (name.length < 2) continue;
-    if (words.length === 1 && words[0].length <= 2 && name.length > 2) continue;
-    if (new RegExp(`\\b${name.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\b`).test(t)) {
-      const live = await grizzlyCountries();
-      const hit = live.find((c) => Number(c.id) === Number(id));
-      return { id, name: asName(hit?.name) || (name === 'usa' ? 'USA' : name) };
-    }
-  }
-
-  if (words.length === 1 && words[0].length <= 2) {
-    const key = words[0];
-    if (key in COUNTRY_MAP) {
-      const id = COUNTRY_MAP[key];
-      const live = await grizzlyCountries();
-      const hit = live.find((c) => Number(c.id) === Number(id));
-      return { id, name: asName(hit?.name) || key };
-    }
-  }
-  return resolveCountry(raw);
-}
-
-async function miraShowPricesAndConfirm(ctx, session, userId, countryId, countryName, serviceQuery) {
-  // Never show sticky pool name — label from id when needed
-  const idNum = Number(countryId);
-  const prettyById = {
-    12: 'USA',
-    187: 'USA',
-    36: 'Canada',
-    16: 'UK',
-    19: 'Nigeria',
-    43: 'Germany',
-    38: 'Ghana',
-    8: 'Kenya'
-  };
-  countryName =
-    prettyById[idNum] ||
-    asName(countryName) ||
-    String(countryName || countryId);
-  // If caller passed "USA (2)" as the search country, still say USA (pools listed in buttons)
-  if (/usa\s*\(?\s*2\s*\)?/i.test(String(countryName))) countryName = 'USA';
-  serviceQuery = asName(serviceQuery) || serviceQuery || '';
-  await ctx.reply(`Checking ${countryName}${serviceQuery ? ' · ' + serviceQuery : ''}…`);
-
-  let list = await getSellableServices(countryId, serviceQuery);
-  if (!list.length) {
-    list = await getSellableServices(countryId, null);
-    if (serviceQuery) list = matchServices(list, serviceQuery);
-  }
-  list = dedupeServices(list || []);
-  if (!list.length) {
-    session.state = 'AWAITING_INPUT';
-    session.pendingService = null;
-    clearIntent(userId);
-    await saveUserSession(userId, session);
-    return ctx.reply(MIRA.noStock);
-  }
-  setIntent(userId, { service: serviceQuery, countryId, countryName });
-
-  session.country = countryName;
-  session.countryId = countryId;
-  session.serviceQuery = serviceQuery;
-  session.pendingService = serviceQuery;
-  session.last_options = list.slice(0, 8).map((s) => ({
-    service_code: s.service_id,
-    name: s.service_name,
-    variant: s.variant || 'normal',
-    price_ngn: s.price_ngn,
-    stock: s.stock,
-    country_id: s.country_id != null ? s.country_id : countryId,
-    country_name: s.country_name || countryPoolLabel(s.country_id != null ? s.country_id : countryId)
-  }));
-  session.state = 'AWAITING_CONFIRM';
-  await saveUserSession(userId, session);
-
-  const top = list.slice(0, 8);
-  const multiPool = new Set(top.map((s) => String(s.country_name || s.country_id))).size > 1;
-
-  if (top.length === 1) {
-    const s = top[0];
-    const cid = s.country_id != null ? s.country_id : countryId;
-    const pool = countryPoolLabel(cid, countryName, s.country_name);
-    return ctx.reply(
-      `${pool} ${serviceQuery || s.service_name}\n₦${Number(s.price_ngn).toLocaleString()}\n\nYou ready?`,
-      Markup.inlineKeyboard([
-        [
-          Markup.button.callback(
-            `✅ Buy · ₦${Number(s.price_ngn).toLocaleString()}`,
-            `opt:${cid}:${s.service_id}:${s.price_ngn}`.slice(0, 64)
-          )
-        ],
-        [Markup.button.callback('❌ Cancel', 'opt:cancel')]
-      ])
-    );
-  }
-
-  const header = multiPool
-    ? `${countryName} ${serviceQuery || ''} — pick pool + price:\n_USA and USA (2) na different number pools._`
-    : `${countryName} · ${serviceQuery || 'options'}\nPick one:`;
-
-  return ctx.reply(header, {
-    parse_mode: 'Markdown',
-    ...optionButtons(countryId, top)
-  });
-}
-
-/** Only real apps count as a service — never junk like "cheaper ones" */
-function isRealServiceName(name) {
-  if (!name) return false;
-  const s = String(name).toLowerCase().trim();
-  if (s.length < 2 || s.length > 24) return false;
-  if (/cheaper|option|number|price|available|stock|please|help|fund|wallet|balance|country|service/.test(s)) {
-    return false;
-  }
-  if (SERVICE_MAP[s]) return true;
-  if (Object.keys(SERVICE_MAP).some((k) => k.length > 2 && (s.includes(k) || k.includes(s)))) return true;
-  if (SERVICE_NAMES[s]) return true;
+async function refundFailedBuy(userId, price, ref) {
+  for (let i = 0; i < 3; i++) {
+    try { await wallet.credit(userId, price, 'refund', `buyfail:${ref}`); return true; } catch (e) { await sleep(500); }
+  }
+  console.error('CRITICAL refund after failed buy NOT applied', userId, price, ref);
   return false;
 }
 
-function clearBuyState(session, userId) {
-  session.state = 'AWAITING_INPUT';
-  session.pendingService = null;
-  session.serviceQuery = null;
-  session.country = null;
-  session.countryId = null;
-  session.last_options = [];
-  clearIntent(userId);
+async function purchase(ctx, opt) {
+  const userId = ctx.from.id;
+  const p = byServer[opt.server];
+  const ref = `${p.id}:${userId}:${Date.now()}`;
+
+  let d;
+  try { d = await wallet.debit(userId, opt.price, 'purchase', ref, { service: opt.serviceId, country: opt.countryId }); }
+  catch (e) { console.error('debit', e.message); return ctx.reply(MSG.walletDown); }
+  if (!d.ok) {
+    return ctx.reply(`Balance no reach o.\nYou need ${ngn(opt.price)} · you get ${ngn(d.balance)}.`,
+      Markup.inlineKeyboard([[Markup.button.callback(`💳 Fund ${ngn(Math.max(1000, opt.price - d.balance))}`, `fund:${Math.max(1000, opt.price - d.balance)}`)]]));
+  }
+
+  await ctx.reply('I dey grab the number… hold on.');
+  const bought = await p.buy(opt.serviceId, opt.countryId);
+  if (!bought.ok) {
+    const ok = await refundFailedBuy(userId, opt.price, ref);
+    return ctx.reply(`${bought.message || 'No number available.'}\n${ok ? 'You no pay anything — wallet restored.' : 'If your balance dey short, contact /support.'}`);
+  }
+
+  const order = {
+    user_id: String(userId), provider: p.id, order_id: bought.orderId, service_id: opt.serviceId,
+    service_name: opt.serviceName, country_id: opt.countryId, country_name: opt.countryName || null,
+    phone: bought.number, price: opt.price, status: 'waiting', expires_at: new Date(Date.now() + p.expiryMs).toISOString()
+  };
+  await wallet.createOrder(order);
+  const bal = await wallet.balance(userId).catch(() => d.balance);
+  const phone = String(bought.number || '');
+  await ctx.reply(
+    `Number ready ✅  _(${p.label})_\n📞 \`${phone}\`\n🆔 \`${bought.orderId}\`\n${ngn(opt.price)} debited · Balance: ${ngn(bal)}\n\n` +
+    `Use am for the app to request OTP. I go send the code here — or tap Check.\n_Cancel opens after ~${Math.max(1, mins(p.cancelMinMs))} min. ` +
+    `${p.id === 'smsbus' ? 'This number expires in 5 min.' : ''}_`,
+    {
+      ...md,
+      ...Markup.inlineKeyboard([
+        [{ text: '📋 Copy number', copy_text: { text: phone } }],
+        [Markup.button.callback('Check SMS code', `chk:${p.id}:${bought.orderId}`)],
+        [Markup.button.callback(`⏳ Cancel (after ${Math.max(1, mins(p.cancelMinMs))}m)`, `can:${p.id}:${bought.orderId}`)]
+      ])
+    });
+  waitUntil(pollOrder({ ...order, created_at: new Date().toISOString() }));
 }
 
-async function miraHandleSmartText(ctx, session, userId, textMsg) {
-  const lower = String(textMsg || '').trim().toLowerCase();
-  let state = session.state || 'AWAITING_INPUT';
-
-  // Scrub junk pending service left from old bugs ("cheaper ones", etc.)
-  if (session.pendingService && !isRealServiceName(session.pendingService)) {
-    session.pendingService = null;
-    session.serviceQuery = null;
-    if (state === 'AWAITING_COUNTRY') state = 'AWAITING_INPUT';
-    session.state = state;
+bot.action(/^b:([12]):([^:]+):([^:]+):(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery('Checking…');
+  const [, srv, cid, sid, shown] = ctx.match;
+  let fresh;
+  try { fresh = await catalog.quote(Number(srv), cid, sid); } catch (e) { return ctx.reply('Prices no gree load now. Try again.'); }
+  if (!fresh) return ctx.reply('That option no dey available again. Pick another one.');
+  if (fresh.price !== Number(shown)) {
+    return ctx.reply(`Price don change to ${ngn(fresh.price)} (was ${ngn(shown)}). You still want am?`,
+      Markup.inlineKeyboard([[Markup.button.callback(`✅ Buy · ${ngn(fresh.price)}`, `b:${srv}:${cid}:${sid}:${fresh.price}`.slice(0, 64))], [Markup.button.callback('❌ Cancel', 'opt:cancel')]]));
   }
-  if (session.serviceQuery && !isRealServiceName(session.serviceQuery)) {
-    session.serviceQuery = null;
+  return purchase(ctx, fresh);
+});
+
+bot.action('opt:cancel', async (ctx) => { await ctx.answerCbQuery(); await ctx.reply('Alright, cancelled. Wetin you need instead?'); });
+
+// ------------------------------------------------------------------ OTP check + cancel
+async function ownOrder(ctx, provider, orderId) {
+  const o = await wallet.getOrder(provider, orderId);
+  return o && String(o.user_id) === String(ctx.from.id) ? o : null;
+}
+
+bot.action(/^chk:(grizzly|smsbus):([^:]+)$/, async (ctx) => {
+  await ctx.answerCbQuery('Checking…');
+  const order = await ownOrder(ctx, ctx.match[1], ctx.match[2]);
+  if (!order) return ctx.reply('I no see that order.');
+  const r = await settleOrder(order);
+  if (r.state === 'code') return ctx.reply(`Code: *${safe(r.code)}*`, md);
+  if (r.state === 'refunded') return ctx.reply(r.refund?.refunded ? `No code came — refunded ✅ Balance: ${ngn(r.refund.balance)}` : 'This order don close and refund.');
+  return ctx.reply('Still waiting for SMS… tap Check again in a few seconds.');
+});
+
+bot.action(/^can:(grizzly|smsbus):([^:]+)$/, async (ctx) => {
+  const [, provider, orderId] = ctx.match;
+  const order = await ownOrder(ctx, provider, orderId);
+  if (!order) { await ctx.answerCbQuery(); return ctx.reply('I no see that order.'); }
+  const p = providers[provider];
+  if (order.refunded) { await ctx.answerCbQuery(); return ctx.reply('This order already cancelled.'); }
+  if (order.code) { await ctx.answerCbQuery(); return ctx.reply('Code already arrive — cancel no dey available.'); }
+
+  const age = Date.now() - new Date(order.created_at).getTime();
+  if (age < p.cancelMinMs) {
+    const left = formatWait(Math.ceil((p.cancelMinMs - age) / 1000));
+    return ctx.answerCbQuery(`⏳ Cancel opens in ${left}`, { show_alert: true });
   }
+  await ctx.answerCbQuery('Cancelling…');
 
-  // ========== ESCAPE INTENTS (always win over stuck buy flow) ==========
-  const wantsFund =
-    /\b(fund|top\s*up|topup|deposit|recharge|add\s*money|load\s*wallet|pay\s*in)\b/i.test(lower);
-  // Balance ONLY if not a fund request ("fund my wallet" must not match balance)
-  const wantsBalance =
-    !wantsFund &&
-    /\b(balance|check\s*wallet|how\s*much\s*(i\s*get|dey|left)|wallet\s*balance|wetin\s*(remain|left)|what.?s?\s*my\s*balance|my\s*balance)\b/i.test(
-      lower
-    );
-  const wantsCancelFlow =
-    /^(cancel|stop|never mind|forget|reset|start over|abeg forget|no more)$/i.test(lower.trim());
-  const wantsHelp =
-    /^(help|menu|start)$/i.test(lower.trim()) ||
-    /\b(wetin you fit do|what can you do|commands?)\b/i.test(lower);
+  const last = await settleOrder(order);               // never refund if the SMS already came
+  if (last.state === 'code') return ctx.reply(`A code just arrive: *${safe(last.code)}* — cancel no dey available.`, md);
+  if (last.state === 'refunded') return ctx.reply(last.refund?.refunded ? `Cancelled ✅ ${ngn(last.refund.amount)} refunded · Balance: ${ngn(last.refund.balance)}` : 'This order already cancelled.');
 
-  if (wantsCancelFlow) {
-    clearBuyState(session, userId);
-    await saveUserSession(userId, session);
-    return ctx.reply('Alright, e clear. Wetin you need now? Number, fund, or balance?');
+  const c = await p.cancel(orderId);
+  if (!c.ok) return ctx.reply(`${c.message}\n\nNo refund yet — order still active.`);
+  const r = await wallet.refundOrder(provider, orderId, 'cancelled');
+  return ctx.reply(r.refunded
+    ? `Cancelled ✅\n${ngn(r.amount)} refunded.\nBalance: ${ngn(r.balance)}`
+    : `This order already cancelled.\nBalance: ${ngn(r.balance)}`);
+});
+
+// ------------------------------------------------------------------ funding
+async function startFund(ctx, s, amount) {
+  if (amount < paystack.MIN_FUND) { s.state = 'AWAITING_FUND'; await save(ctx, s); return ctx.reply('Minimum na ₦1,000. Example: *2k* or *5000*', md); }
+  if (amount > paystack.MAX_FUND) { s.state = 'AWAITING_FUND'; await save(ctx, s); return ctx.reply('Maximum na ₦200,000 per payment. Example: *50k*', md); }
+  const init = await paystack.initialize(amount, ctx.from.id, null);
+  if (!init.success) return ctx.reply(init.message || 'Paystack no gree right now.');
+  s.state = null;
+  s.pending_payment = { reference: init.reference, amount_ngn: init.amount_ngn, created_at: new Date().toISOString() };
+  await save(ctx, s);
+  return ctx.reply(`Top up *${ngn(init.amount_ngn)}*\n\nTap *Pay* below. When e successful, type: *I don pay*\n_(Your wallet also updates by itself.)_`,
+    { ...md, ...Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', init.authorization_url)]]) });
+}
+
+async function confirmPayment(ctx, s, ref) {
+  const v = await paystack.verify(ref);
+  if (!v.success) return ctx.reply(v.message === 'Payment successful' ? 'Could not verify.' : `${v.message}\nIf you don pay, wait 30 seconds and type: I don pay`);
+  if (v.telegram_user_id !== String(ctx.from.id)) return ctx.reply('That payment belongs to a different account.');
+  const c = await wallet.credit(ctx.from.id, v.amount_ngn, 'fund', v.reference);
+  if (s.pending_payment?.reference === v.reference) { s.pending_payment = null; await save(ctx, s); }
+  return ctx.reply(c.applied
+    ? `Payment confirmed ✅\n${ngn(v.amount_ngn)} don enter your wallet.\nNew balance: ${ngn(c.balance)}\n\nTell me country + app to buy.`
+    : `This payment already credited.\nBalance: ${ngn(c.balance)}`);
+}
+
+// ------------------------------------------------------------------ commands + menu
+bot.start(async (ctx) => ctx.reply(MSG.greet, { ...md, ...menuKb }));
+bot.command(['balance', 'bal'], async (ctx) => {
+  try { await ctx.reply(`Balance: *${ngn(await wallet.balance(ctx.from.id))}*`, md); } catch (e) { await ctx.reply(MSG.walletDown); }
+});
+bot.command('fund', async (ctx) => {
+  const s = await S(ctx);
+  const raw = (ctx.message.text || '').trim().split(/\s+/)[1];
+  if (!raw) { s.state = 'AWAITING_FUND'; await save(ctx, s); return ctx.reply('How much you wan fund?\n\nMin ₦1,000 · Max ₦200,000\nExample: 5000'); }
+  return startFund(ctx, s, parseNaira(raw));
+});
+
+async function sendOrders(ctx) {
+  let list;
+  try { list = await wallet.listOrders(ctx.from.id, 8); } catch (e) { return ctx.reply(MSG.walletDown); }
+  if (!list.length) return ctx.reply('No orders yet.\n\nType e.g. *USA WhatsApp* to buy.', md);
+  for (const o of list.filter((x) => x.status === 'waiting').slice(0, 3)) {   // catch up expired/OTP in the background of the listing
+    try { const r = await settleOrder(o); if (r.state === 'code') { o.code = r.code; o.status = 'completed'; } else if (r.state === 'refunded') { o.status = 'expired'; o.refunded = true; } } catch (_) {}
   }
+  const lines = list.map((o, i) =>
+    `*${i + 1}. ${safe(o.service_name || o.service_id)}* _(${p2(o)})_\n📞 \`${o.phone || '—'}\`\n${ngn(o.price)} · ${o.code ? `Code: ${safe(o.code)}` : (o.refunded ? 'Refunded' : o.status)}`).join('\n\n');
+  return ctx.reply(`*Your recent orders*\n\n${lines}`, md);
+}
+bot.command('orders', sendOrders);
 
-  // FUND first — never confuse with balance
-  if (wantsFund) {
-    clearBuyState(session, userId);
-    const amount = parseNairaAmount(textMsg);
-    if (amount >= 1000 && amount <= 200000) {
-      const init = await paystackInitialize(amount, userId, null);
-      if (!init.success) {
-        await saveUserSession(userId, session);
-        return ctx.reply(init.message || 'Paystack no gree right now. Try /fund later.');
+bot.command('support', async (ctx) => {
+  const pre = encodeURIComponent(`Hello MJ Hub support, I need help on MJ SMS Telegram bot.\nTelegram: @${ctx.from.username || 'n/a'} (id ${ctx.from.id})`);
+  return ctx.reply('*MJ SMS Support*\n\nNeed human? Same channels as *mjhub.store*:', {
+    ...md,
+    ...Markup.inlineKeyboard([
+      [Markup.button.url('💬 WhatsApp Support', `https://wa.me/${SUPPORT_WA}?text=${pre}`)],
+      [Markup.button.url('✈️ Telegram Support', SUPPORT_TG)],
+      [Markup.button.url('🌐 MJ Hub website', SUPPORT_SITE)]
+    ])
+  });
+});
+bot.command('privacy', (ctx) => ctx.reply(
+  '*MJ SMS Privacy*\n\n• We use your Telegram ID to run your wallet and orders.\n• Numbers you buy are for your OTP use; we do not sell your chat data.\n• Payments run through Paystack.\n• Order history is stored so you can check numbers and status.\n• Help: /support · mjhub.store', md));
+
+bot.command('status', async (ctx) => {          // admin: supplier health
+  if (!isAdmin(ctx)) return ctx.reply('Admin only.');
+  const [g, b] = await Promise.all([grizzly.balance(), smsbus.balance()]);
+  return ctx.reply(`Server 1: ${g == null ? 'OFFLINE' : `online · balance ${g}`}\nServer 2: ${b == null ? 'OFFLINE' : `online · balance ${b}`}`);
+});
+bot.command('stats', async (ctx) => {           // admin: business numbers
+  if (!isAdmin(ctx)) return ctx.reply('Admin only.');
+  try {
+    const x = await wallet.stats();
+    return ctx.reply(`Users: ${x.users}\nWallet money held: ${ngn(x.held)}\nOrders: ${x.orders} (${x.done} delivered)\nDelivered sales: ${ngn(x.sales)}`);
+  } catch (e) { return ctx.reply(`Stats failed: ${e.message}`); }
+});
+
+async function openShop(ctx) {
+  const rows = []; for (let i = 0; i < COUNTRIES.length; i += 2) rows.push(COUNTRIES.slice(i, i + 2).map((c) => Markup.button.callback(c, `cty:${c}`)));
+  return ctx.reply('🛍 *Shop*\nPick a country (or just type e.g. *France Telegram*):', { ...md, ...Markup.inlineKeyboard(rows) });
+}
+async function openWallet(ctx) {
+  let bal;
+  try { bal = await wallet.balance(ctx.from.id); } catch (e) { return ctx.reply(MSG.walletDown); }
+  return ctx.reply(`💰 *Wallet*\nBalance: *${ngn(bal)}*\n\nTop up with Paystack:`, {
+    ...md,
+    ...Markup.inlineKeyboard([
+      [1000, 2000, 5000].map((a) => Markup.button.callback(ngn(a), `fund:${a}`)),
+      [10000, 20000, 50000].map((a) => Markup.button.callback(ngn(a), `fund:${a}`)),
+      [Markup.button.callback('✏️ Other amount', 'menu:fund')]
+    ])
+  });
+}
+bot.command('shop', openShop);
+bot.command('wallet', openWallet);
+bot.action('menu:buy', async (ctx) => { await ctx.answerCbQuery(); return openShop(ctx); });
+bot.action(/^cty:(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = await S(ctx); s.country = ctx.match[1]; s.state = 'AWAITING_APP'; await save(ctx, s);
+  const rows = []; for (let i = 0; i < APPS.length; i += 2) rows.push(APPS.slice(i, i + 2).map(([n, c]) => Markup.button.callback(n, `app:${c}`)));
+  return ctx.reply(`Country: *${safe(s.country)}*\n\nWhich app?`, { ...md, ...Markup.inlineKeyboard(rows) });
+});
+bot.action(/^app:(\w+)$/, async (ctx) => {
+  await ctx.answerCbQuery('Loading…');
+  const s = await S(ctx);
+  if (!s.country) return ctx.reply('Pick a country first: type e.g. *USA WhatsApp*', md);
+  return showOptions(ctx, s, s.country, ctx.match[1]);
+});
+bot.action(['menu:wallet', 'menu:bal'], async (ctx) => { await ctx.answerCbQuery(); return openWallet(ctx); });
+bot.action('menu:orders', async (ctx) => { await ctx.answerCbQuery(); return sendOrders(ctx); });
+bot.action('menu:support', async (ctx) => { await ctx.answerCbQuery(); return ctx.reply('Type /support to reach a human.'); });
+bot.action('menu:fund', async (ctx) => {
+  await ctx.answerCbQuery(); const s = await S(ctx); s.state = 'AWAITING_FUND'; await save(ctx, s);
+  return ctx.reply('How much you wan fund?\n\nMin ₦1,000 · Max ₦200,000\nExample: 5000');
+});
+bot.action(/^fund:(\d+)$/, async (ctx) => { await ctx.answerCbQuery(); return startFund(ctx, await S(ctx), Number(ctx.match[1])); });
+
+// ------------------------------------------------------------------ free text
+const GREETING = /^(hi|hello|hey|yo|awfa|how far|good (morning|evening|afternoon)|sup|mira|thanks|thank you|ok|okay|alright)\b/i;
+const FUND_WORDS = /\b(fund|top\s*up|topup|deposit|recharge|add\s*money|load\s*wallet)\b/i;
+const BAL_WORDS = /\b(balance|how\s*much\s*(i\s*get|dey|left)|my\s*balance|wallet\s*balance)\b/i;
+const ORDER_WORDS = /\b(orders?|history|my\s*numbers?)\b/i;
+const PAID = /^(i\s*don\s*pay|i\s*have\s*paid|i\s*paid|payment\s*done|don\s*pay|paid)\b/i;
+
+/** Pull { code, country } out of a short message like "USA WhatsApp". */
+async function parseRequest(text) {
+  const t = String(text).toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const words = t.split(' ').filter(Boolean);
+  if (!t || words.length > 6) return {};
+  let code = null, country = null;
+  for (const [name, c] of Object.entries(SERVICE_MAP).sort((a, b) => b[0].length - a[0].length)) {
+    if (new RegExp(`\\b${esc(name)}\\b`).test(t)) { code = c; break; }
+  }
+  for (const name of Object.keys(COUNTRY_MAP).sort((a, b) => b.length - a.length)) {
+    if (new RegExp(`\\b${esc(name)}\\b`).test(t)) { country = name; break; }
+  }
+  if (!country) {
+    try {
+      for (const name of (await catalog.knownCountryNames()).sort((a, b) => b.length - a.length)) {
+        if (new RegExp(`\\b${esc(name.toLowerCase())}\\b`).test(t)) { country = name; break; }
       }
-      const pending = {
-        reference: init.reference,
-        amount_ngn: init.amount_ngn,
-        authorization_url: init.authorization_url,
-        created_at: new Date().toISOString()
-      };
-      session.pending_payment = pending;
-      session.state = 'AWAITING_INPUT';
-      pendingPayments.set(String(userId), pending);
-      await saveUserSession(userId, session);
-      return ctx.reply(
-        `Top up *₦${init.amount_ngn.toLocaleString()}*\n\nTap *Pay* below.\nWhen e successful, type: *I don pay*`,
-        {
-          parse_mode: 'Markdown',
-          ...Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', init.authorization_url)]])
-        }
-      );
-    }
-    session.state = 'AWAITING_FUND_AMOUNT';
-    await saveUserSession(userId, session);
-    return ctx.reply(
-      'How much you wan fund?\n\nMin ₦1,000 · Max ₦200,000\n\nExample: *2k* · *5k* · *5000*',
-      { parse_mode: 'Markdown' }
-    );
+    } catch (_) {}
   }
+  return { code, country };
+}
 
-  if (wantsBalance) {
-    clearBuyState(session, userId);
-    await saveUserSession(userId, session);
-    return ctx.reply(`Your balance na *₦${money(session.balance).toLocaleString()}* 💰`, {
-      parse_mode: 'Markdown'
-    });
+async function miraTools(ctx, name, args, box) {
+  const userId = ctx.from.id;
+  if (name === 'get_prices') {
+    const code = SERVICE_MAP[String(args.service || '').toLowerCase().trim()];
+    if (!code) return { error: `Unknown app "${args.service}". Ask which app (WhatsApp, Telegram, Instagram, Google, Facebook, TikTok...).` };
+    const res = await catalog.options(String(args.country || ''), code);
+    if (!res.list.length) return { error: `Nothing available for ${args.country} ${args.service} right now.` };
+    box.opts = { country: res.country, code, list: res.list };
+    return { country: res.country, note: 'Buy buttons will be shown to the customer. Tell them to tap one.',
+      options: res.list.slice(0, 10).map((o) => ({ server: o.server, name: o.serviceName, price_ngn: o.price, stock: o.stock })) };
   }
-
-  if (wantsHelp || looksLikeChitchat(textMsg)) {
-    // Don't trap greetings inside a stuck buy flow
-    if (state === 'AWAITING_COUNTRY' || state === 'AWAITING_SERVICE' || state === 'AWAITING_CONFIRM') {
-      clearBuyState(session, userId);
-      await saveUserSession(userId, session);
-    }
-    if (wantsHelp) {
-      return ctx.reply(MIRA.greet, { parse_mode: 'Markdown' });
-    }
-    return ctx.reply(chitchatReply(textMsg), { parse_mode: 'Markdown' });
+  if (name === 'get_balance') return { balance_ngn: await wallet.balance(userId) };
+  if (name === 'get_my_orders') return { orders: (await wallet.listOrders(userId, 8)).map((o) => ({ order_id: o.order_id, server: providers[o.provider].server, service: o.service_name, phone: o.phone, price_ngn: o.price, status: o.refunded ? 'refunded' : o.status, code: o.code })) };
+  if (name === 'check_status') {
+    const list = await wallet.listOrders(userId, 5);
+    const order = args.order_id ? list.find((o) => o.order_id === String(args.order_id)) : list.find((o) => o.status === 'waiting') || list[0];
+    if (!order) return { error: 'No recent order found.' };
+    const r = await settleOrder(order);
+    if (r.state === 'code' && r.fresh) return { order_id: order.order_id, code: r.code };
+    return { order_id: order.order_id, state: r.state, code: r.code || null, refunded_ngn: r.refund?.refunded ? r.refund.amount : undefined };
   }
-
-  // Knowledge FAQ — also escapes stuck flow
-  if (
-    /\b(what\s*is\s*mj\s*(hub|sms)|about\s*mj|wetin\s*be\s*mj|mj\s*hub\s*na\s*wetin|tell\s*me\s*about)\b/i.test(
-      lower
-    )
-  ) {
-    clearBuyState(session, userId);
-    await saveUserSession(userId, session);
-    return ctx.reply(MIRA.about, { parse_mode: 'Markdown' });
-  }
-  if (/\b(how\s*(does|do|e\s*dey)\s*work|how\s*to\s*(buy|get|use)|how\s*sms\s*work)\b/i.test(lower)) {
-    clearBuyState(session, userId);
-    await saveUserSession(userId, session);
-    return ctx.reply(MIRA.howSms, { parse_mode: 'Markdown' });
-  }
-
-  // Merge: memory intent + supabase session + reply-to message (only REAL services)
-  const mem = getIntent(userId) || {};
-  const replyCtx = contextFromReply(ctx);
-  if (replyCtx.service && isRealServiceName(replyCtx.service) && !session.pendingService) {
-    session.pendingService = replyCtx.service;
-    session.serviceQuery = replyCtx.service;
-  }
-  if (mem.service && isRealServiceName(mem.service) && !session.pendingService) {
-    session.pendingService = mem.service;
-    session.serviceQuery = mem.service;
-  }
-  if (mem.countryId && !session.countryId) {
-    session.countryId = mem.countryId;
-    session.country = mem.countryName || session.country;
-  }
-  if (session.pendingService && isRealServiceName(session.pendingService) && !state.startsWith('AWAITING')) {
-    state = 'AWAITING_COUNTRY';
-    session.state = 'AWAITING_COUNTRY';
-  }
-
-  // --- Confirm ---
-  if (state === 'AWAITING_CONFIRM') {
-    if (isNo(lower)) {
-      session.state = 'AWAITING_INPUT';
-      session.pendingService = null;
-      session.last_options = [];
-      await saveUserSession(userId, session);
-      return ctx.reply('Alright. Wetin else?');
-    }
-    if (isYes(lower) && session.last_options?.length) {
-      const s = session.last_options[0];
-      const countryId = session.countryId || s.country_id;
-      const price = money(s.price_ngn);
-      if (money(session.balance) < price) {
-        return ctx.reply(MIRA.lowBal(price, session.balance), {
-          ...Markup.inlineKeyboard([[Markup.button.callback('💳 Fund', 'menu:fund')]])
-        });
-      }
-      await ctx.reply('I dey grab the number… hold on.');
-      const bought = await grizzlyBuy(s.service_code, countryId);
-      if (!bought.success) {
-        return ctx.reply(
-          /502|503|gateway|unreachable|timeout/i.test(String(bought.message || ''))
-            ? 'Supplier offline now. Try again small time.'
-            : `E no work: ${bought.message || 'No number'}`
-        );
-      }
-      const deb = await safeDebit(userId, price, { orderId: bought.order_id, path: 'confirm' });
-      if (price > 0 && !deb.ok) {
-        try {
-          await grizzlyCancel(bought.order_id);
-        } catch (_) {}
-        return ctx.reply(
-          deb.saveFailed
-            ? `Number come out but wallet no update. Contact /support with id \`${bought.order_id}\`.`
-            : MIRA.lowBal(price, deb.balance),
-          { parse_mode: 'Markdown' }
-        );
-      }
-      Object.assign(session, deb.session || {});
-      session.balance = money(deb.balance);
-      const order = {
-        orderId: bought.order_id,
-        service: s.service_code,
-        serviceName: s.name,
-        phoneNumber: bought.number,
-        price,
-        status: 'Waiting for SMS',
-        date: new Date().toISOString(),
-        countryId,
-        charged: true,
-        refunded: false
-      };
-      session.orders = [...(session.orders || []), order].slice(-30);
-      session.state = 'AWAITING_INPUT';
-      session.pendingService = null;
-      session.last_options = [];
-      await saveUserSession(userId, session);
-      const balNow = money((await getUserSession(userId)).balance);
-      const phone = String(bought.number || '');
-      const cancelLabel = `⏳ Cancel (wait ${Math.round(MIN_CANCEL_MS / 60000)}m)`;
-      try {
-        const baseUrl =
-          process.env.BOT_PUBLIC_URL ||
-          (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : '');
-        if (baseUrl) {
-          startStatusPolling(baseUrl, userId, bought.order_id, price, 0).catch((e) =>
-            console.error('startStatusPolling', e.message)
-          );
-        }
-      } catch (e) {
-        console.error('schedule poll', e.message);
-      }
-      return ctx.reply(
-        `Number ready ✅\n📞 \`${phone}\`\n🆔 \`${bought.order_id}\`\n₦${price.toLocaleString()} debited · Balance: ₦${balNow.toLocaleString()}\n\nUse am for OTP. I go auto-check — or tap Check.`,
-        {
-          parse_mode: 'Markdown',
-          ...Markup.inlineKeyboard([
-            [{ text: '📋 Copy number', copy_text: { text: phone } }],
-            [Markup.button.callback('Check SMS code', `chk:${bought.order_id}:${price}`)],
-            [Markup.button.callback(cancelLabel.slice(0, 64), `can:${bought.order_id}:${price}`)]
-          ])
-        }
-      );
-    }
-  }
-
-  // --- Waiting for country (service already known — REAL apps only) ---
-  {
-    const rawPending =
-      session.pendingService || session.serviceQuery || mem.service || replyCtx.service || null;
-    const svcPending = isRealServiceName(rawPending) ? rawPending : null;
-    if (!svcPending && (session.pendingService || session.serviceQuery)) {
-      // Drop junk and don't trap the user
-      session.pendingService = null;
-      session.serviceQuery = null;
-      if (state === 'AWAITING_COUNTRY') {
-        state = 'AWAITING_INPUT';
-        session.state = 'AWAITING_INPUT';
-      }
-    }
-    const c = await resolveCountryStrict(textMsg);
-    if (c && svcPending) {
-      return miraShowPricesAndConfirm(ctx, session, userId, c.id, c.name, svcPending);
-    }
-    if (state === 'AWAITING_COUNTRY' && svcPending && !c && !detectServiceOnly(textMsg)) {
-      return ctx.reply(
-        `Which country for *${svcPending}*?\n\n_Reply with country name e.g. USA, UK, Nigeria_`,
-        { parse_mode: 'Markdown' }
-      );
-    }
-  }
-
-  // ========== PARSE THIS MESSAGE FIRST (root fix for sticky country) ==========
-  // Never reuse session.countryId when the user named a NEW country in this text.
-  const parsed = await parseCountryService(textMsg);
-
-  // Region words (not a single Grizzly country)
-  if (/\b(europe|eu|european|africa|asia|latin\s*america)\b/i.test(textMsg) && parsed.countryId == null) {
-    return ctx.reply(
-      'That is a *region*, not one country.\n\n' +
-        'Try a specific country, e.g.\n' +
-        '• *Germany WhatsApp*\n' +
-        '• *Netherlands TikTok*\n' +
-        '• *France Telegram*\n' +
-        '• *UK Instagram*',
-      { parse_mode: 'Markdown' }
-    );
-  }
-
-  // One-shot: country + app in the SAME message — always wins over sticky session
-  if (parsed.countryId && (parsed.serviceName || parsed.serviceCode)) {
-    session.countryId = parsed.countryId;
-    session.country = parsed.countryName;
-    session.state = 'AWAITING_INPUT';
-    session.pendingService = null;
-    session.serviceQuery = null;
-    session.last_options = [];
-    clearIntent(userId);
-    return miraShowPricesAndConfirm(
-      ctx,
-      session,
-      userId,
-      parsed.countryId,
-      parsed.countryName,
-      parsed.serviceName || parsed.serviceCode
-    );
-  }
-
-  // Country only in this message → set country, ask for app (or use pending service)
-  if (parsed.countryId && !(parsed.serviceName || parsed.serviceCode)) {
-    const pendingSvcEarly = isRealServiceName(session.pendingService || session.serviceQuery)
-      ? (session.pendingService || session.serviceQuery)
-      : null;
-    session.countryId = parsed.countryId;
-    session.country = parsed.countryName;
-    session.last_options = [];
-    if (pendingSvcEarly) {
-      session.state = 'AWAITING_INPUT';
-      return miraShowPricesAndConfirm(
-        ctx,
-        session,
-        userId,
-        parsed.countryId,
-        parsed.countryName,
-        pendingSvcEarly
-      );
-    }
-    session.state = 'AWAITING_SERVICE';
-    session.pendingService = null;
-    await saveUserSession(userId, session);
-    return ctx.reply(
-      `Which app for *${asName(parsed.countryName)}*?\n\nWhatsApp, Telegram, Instagram, TikTok, Google…`,
-      { parse_mode: 'Markdown' }
-    );
-  }
-
-  // Recover pending service from session (REAL apps only)
-  const pendingSvcRaw = session.pendingService || session.serviceQuery || null;
-  const pendingSvc = isRealServiceName(pendingSvcRaw) ? pendingSvcRaw : null;
-
-  // Service-only message → use sticky country ONLY if this message has NO country word
-  const svcGuess =
-    detectServiceOnly(textMsg) ||
-    (parsed.serviceName && isRealServiceName(parsed.serviceName)
-      ? { serviceName: parsed.serviceName, serviceCode: parsed.serviceCode }
-      : null);
-
-  if (svcGuess && session.countryId && !parsed.countryId) {
-    return miraShowPricesAndConfirm(
-      ctx,
-      session,
-      userId,
-      session.countryId,
-      session.country || session.countryId,
-      svcGuess.serviceName || svcGuess.serviceCode
-    );
-  }
-
-  if (state === 'AWAITING_SERVICE' && !svcGuess && !parsed.countryId) {
-    return ctx.reply(MIRA.askService);
-  }
-
-  // Country message while we already have a pending service
-  if (parsed.countryId && pendingSvc) {
-    session.countryId = parsed.countryId;
-    session.country = parsed.countryName;
-    return miraShowPricesAndConfirm(
-      ctx,
-      session,
-      userId,
-      parsed.countryId,
-      parsed.countryName,
-      pendingSvc
-    );
-  }
-
-  // Service only → ask country (keep service in session)
-  if (svcGuess || (parsed.serviceName && isRealServiceName(parsed.serviceName)) || parsed.serviceCode) {
-    const svc = svcGuess || {
-      serviceName: parsed.serviceName,
-      serviceCode: parsed.serviceCode
-    };
-    session.pendingService = svc.serviceName || svc.serviceCode;
-    session.serviceQuery = session.pendingService;
-    session.state = 'AWAITING_COUNTRY';
-    setIntent(userId, { service: session.pendingService });
-    await saveUserSession(userId, session);
-    // Ask as reply-friendly text so user can reply to this message
-    return ctx.reply(
-      `Which country for ${session.pendingService}?\n\n_Reply to this message with the country_`,
-      { parse_mode: 'Markdown' }
-    );
-  }
-
-  // country-only handled in PARSE THIS MESSAGE FIRST block above
-
-  if (looksLikeNeedNumber(textMsg)) {
-    clearBuyState(session, userId);
-    session.state = 'AWAITING_SERVICE';
-    await saveUserSession(userId, session);
-    return ctx.reply(MIRA.askService);
-  }
-
-  if (/\b(orders?|history|my\s*numbers?)\b/i.test(lower)) {
-    const list = (session.orders || []).filter((o) => o && o.orderId && o.type !== '_meta');
-    if (!list.length) {
-      return ctx.reply('You never buy any number yet.\n\nType e.g. *USA WhatsApp* make I get one for you.', {
-        parse_mode: 'Markdown'
-      });
-    }
-    const lines = list
-      .slice(-8)
-      .reverse()
-      .map((o, i) => {
-        const phone = String(o.phoneNumber || o.number || '').trim() || '—';
-        const svc = o.serviceName || o.service || 'SMS';
-        return `${i + 1}. *${svc}* · \`${phone}\` · ${o.status || '—'}`;
-      })
-      .join('\n');
-    return ctx.reply(`*Your recent orders*\n\n${lines}`, { parse_mode: 'Markdown' });
-  }
-
-  if (/\b(referral|2%|commission|invite)\b/i.test(lower)) {
-    return ctx.reply(
-      'For referral: go *mjhub.store*, sign up, copy your link.\nWhen your people fund, you earn *2% for life* on the website wallet.',
-      { parse_mode: 'Markdown' }
-    );
-  }
-
-  if (/\b(voip|real\s*number|is\s*it\s*real)\b/i.test(lower)) {
-    return ctx.reply(
-      'Numbers here na *real mobile* (non-VOIP). Dem dey work well for WhatsApp and major apps.\n\nTell me country + app e.g. *USA WhatsApp*.',
-      { parse_mode: 'Markdown' }
-    );
-  }
-
-  if (/\b(support|human|customer\s*care)\b/i.test(lower)) {
-    return ctx.reply(MIRA.supportHelp);
-  }
-
-  // Soft fallback — no invented prices/stock
-  return ctx.reply(
-    'I no too catch that one o.\n\n' +
-      'Talk to me clear like:\n' +
-      '• *USA WhatsApp* — buy number\n' +
-      '• *Fund* or */fund 5k* — top up\n' +
-      '• *Balance* — check wallet\n' +
-      '• *How e dey work?* — explain SMS\n' +
-      '• *Cancel* — clear and start fresh',
-    { parse_mode: 'Markdown' }
-  );
+  return { error: `Unknown tool ${name}` };
 }
 
 bot.on('text', async (ctx) => {
-  const textMsg = (ctx.message.text || '').trim();
-  if (textMsg.startsWith('/')) return;
+  const text = (ctx.message.text || '').trim();
+  if (!text || text.startsWith('/')) return;
+  const lower = text.toLowerCase();
+  const s = await S(ctx);
 
-  const userId = ctx.from.id;
-  const session = await getUserSession(userId);
-  const lower = textMsg.toLowerCase();
-
-  // --- "I don pay" / payment confirmation (works without Gemini) ---
-  if (/^(i\s*don\s*pay|i\s*have\s*paid|i\s*paid|payment\s*done|don\s*pay|paid)\b/i.test(lower)) {
-    const mem = pendingPayments.get(String(userId));
-    const ref = session.pending_payment?.reference || mem?.reference;
-    if (!ref) {
-      return ctx.reply('I no see any pending payment. Type /fund 2000 (or amount) first, pay, then come back.');
-    }
-    const verified = await paystackVerify(ref);
-    if (!verified.success) {
-      return ctx.reply(
-        verified.message ||
-          'Payment never show success yet. If you don pay, wait 30 seconds and type: I don pay'
-      );
-    }
-    if (session.last_credited_reference === ref || creditedRefs.has(ref)) {
-      return ctx.reply(
-        `This payment already credited.\nBalance: ₦${money(session.balance).toLocaleString()}`
-      );
-    }
-    session.balance = money(money(session.balance) + money(verified.amount_ngn));
-    session.last_credited_reference = ref;
-    session.pending_payment = null;
-    pendingPayments.delete(String(userId));
-    creditedRefs.add(ref);
-    await saveUserSession(userId, session);
-    return ctx.reply(
-      `Payment confirmed ✅\n₦${money(verified.amount_ngn).toLocaleString()} don enter your wallet.\nNew balance: ₦${money(session.balance).toLocaleString()}\n\nYou fit buy number now — tell me country + app.`
-    );
+  // payment confirmation (button-free): "I don pay" or a pasted reference
+  const refMatch = text.match(/MJSMS_\d+_\d+/);
+  if (PAID.test(lower) || refMatch) {
+    const ref = refMatch ? refMatch[0] : s.pending_payment?.reference;
+    if (!ref) return ctx.reply('I no see any pending payment. Type /fund 2000 first, pay, then come back.');
+    return confirmPayment(ctx, s, ref);
   }
 
-  // --- FUND WALLET amount (after /fund or bare 2k/5k) ---
-  const isFundAmountState = session.state === 'AWAITING_FUND_AMOUNT';
-  const looksLikeOnlyAmount =
-    /^(?:₦|ngn|naira)?\s*\d+(?:[.,]\d+)?\s*k?\s*$/i.test(textMsg.trim()) ||
-    /^\d+(?:[.,]\d+)?\s*(?:k|thousand)\s*$/i.test(textMsg.trim());
-  const bareFundAmount = looksLikeOnlyAmount ? parseNairaAmount(textMsg) : 0;
+  // funding amount
+  const onlyAmount = /^(?:₦|ngn|naira)?\s*\d+(?:[.,]\d+)?\s*(?:k|thousand)?\s*$/i.test(text);
+  if (s.state === 'AWAITING_FUND' || (onlyAmount && parseNaira(text) >= 1000 && parseNaira(text) <= paystack.MAX_FUND)) {
+    return startFund(ctx, s, parseNaira(text));
+  }
+  if (FUND_WORDS.test(lower)) {
+    const a = parseNaira(text);
+    if (a >= 1000) return startFund(ctx, s, a);
+    s.state = 'AWAITING_FUND'; await save(ctx, s);
+    return ctx.reply('How much you wan fund?\n\nMin ₦1,000 · Max ₦200,000\nExample: *2k* · *5k* · *5000*', md);
+  }
+  if (/^(cancel|stop|reset|start over|never mind)$/i.test(lower)) { clearFlow(s); await save(ctx, s); return ctx.reply('Alright, e clear. Wetin you need now?', menuKb); }
+  if (BAL_WORDS.test(lower)) { try { return ctx.reply(`Your balance na *${ngn(await wallet.balance(ctx.from.id))}* 💰`, md); } catch (e) { return ctx.reply(MSG.walletDown); } }
+  if (ORDER_WORDS.test(lower) && text.split(/\s+/).length <= 4) return sendOrders(ctx);
+  if (/^(help|menu)$/i.test(lower)) return ctx.reply(MSG.greet, { ...md, ...menuKb });
 
-  // Accept amount if we're waiting OR user sent only an amount (2k / 5000) in valid range
-  if (isFundAmountState || (bareFundAmount >= 1000 && bareFundAmount <= 200000)) {
-    const amount = isFundAmountState ? parseNairaAmount(textMsg) : bareFundAmount;
-    if (amount < 1000) {
-      session.state = 'AWAITING_FUND_AMOUNT';
-      await saveUserSession(userId, session);
-      return ctx.reply('Minimum na ₦1,000. Type *2k*, *5k* or *5000*.', {
-        parse_mode: 'Markdown'
-      });
-    }
-    if (amount > 200000) {
-      session.state = 'AWAITING_FUND_AMOUNT';
-      await saveUserSession(userId, session);
-      return ctx.reply('Maximum na ₦200,000 for one payment. Example: *50k*', {
-        parse_mode: 'Markdown'
-      });
-    }
-    const init = await paystackInitialize(amount, userId, null);
-    if (!init.success) {
-      session.state = 'AWAITING_INPUT';
-      await saveUserSession(userId, session);
-      return ctx.reply(init.message || 'Paystack no gree right now. Try /fund again later.');
-    }
-    const pending = {
-      reference: init.reference,
-      amount_ngn: init.amount_ngn,
-      authorization_url: init.authorization_url,
-      created_at: new Date().toISOString()
-    };
-    session.pending_payment = pending;
-    session.state = 'AWAITING_INPUT';
-    pendingPayments.set(String(userId), pending);
-    await saveUserSession(userId, session);
-    return ctx.reply(
-      `Top up *₦${init.amount_ngn.toLocaleString()}*\n\nTap *Pay* below.\nWhen e successful, type: *I don pay*`,
-      {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([[Markup.button.url('💳 Pay here', init.authorization_url)]])
-      }
-    );
+  // "<country> <app>" and its half-finished variants
+  const req = await parseRequest(text);
+  if (req.country && req.code) return showOptions(ctx, s, req.country, req.code);
+  if (req.country && !req.code) {
+    if (s.service) return showOptions(ctx, s, req.country, s.service);
+    s.country = req.country; s.state = 'AWAITING_APP'; await save(ctx, s);
+    return ctx.reply(`Which app for *${safe(req.country)}*?\nWhatsApp, Telegram, Instagram, TikTok, Google…`, md);
+  }
+  if (req.code && !req.country) {
+    if (s.country) return showOptions(ctx, s, s.country, req.code);
+    s.service = req.code; s.state = 'AWAITING_COUNTRY'; await save(ctx, s);
+    return ctx.reply(`Which country for *${safe(U.SERVICE_NAMES[req.code] || req.code)}*?\nExample: USA, UK, Nigeria, Canada`, md);
   }
 
-  // Fund intent BEFORE Gemini — Gemini was asking for amount without setting state
-  const fundIntent =
-    /\b(fund|top\s*up|topup|deposit|recharge|add\s*money|load\s*wallet|pay\s*in)\b/i.test(lower);
-  if (fundIntent) {
-    return miraHandleSmartText(ctx, session, userId, textMsg);
-  }
-
-  // ALWAYS parse country+service from THIS message before any sticky session
-  {
-    const parsedNow = await parseCountryService(textMsg);
-    if (parsedNow.countryId && (parsedNow.serviceName || parsedNow.serviceCode)) {
-      session.countryId = parsedNow.countryId;
-      session.country = parsedNow.countryName;
-      session.state = 'AWAITING_INPUT';
-      session.pendingService = null;
-      session.last_options = [];
-      clearIntent(userId);
-      return miraShowPricesAndConfirm(
-        ctx,
-        session,
-        userId,
-        parsedNow.countryId,
-        parsedNow.countryName,
-        parsedNow.serviceName || parsedNow.serviceCode
-      );
-    }
-    if (parsedNow.countryId && Number(parsedNow.countryId) !== Number(session.countryId || -1)) {
-      session.countryId = parsedNow.countryId;
-      session.country = parsedNow.countryName;
-      session.state = 'AWAITING_SERVICE';
-      session.pendingService = null;
-      await saveUserSession(userId, session);
-      return ctx.reply(
-        `Which app for *${parsedNow.countryName}*?\n(WhatsApp, Telegram, Instagram, TikTok…)`,
-        { parse_mode: 'Markdown' }
-      );
+  // everything else: Mira (read-only tools) or a short canned reply
+  if (process.env.GEMINI_API_KEY && !GREETING.test(lower)) {
+    const box = {};
+    const r = await gemini.chat(s.conversation, text, (n, a) => miraTools(ctx, n, a, box));
+    if (r.history) { s.conversation = r.history; await save(ctx, s); }
+    if (r.reply) {
+      if (box.opts) {
+        const rows = box.opts.list.slice(0, 10).map((o) => [Markup.button.callback(
+          `${o.provider === 'smsbus' ? 'S2' : 'S1'} · ${o.serviceName} · ${ngn(o.price)}`.slice(0, 60), `b:${o.server}:${o.countryId}:${o.serviceId}:${o.price}`.slice(0, 64))]);
+        rows.push([Markup.button.callback('❌ Cancel', 'opt:cancel')]);
+        return ctx.reply(r.reply.slice(0, 3500), Markup.inlineKeyboard(rows));
+      }
+      return ctx.reply(r.reply.slice(0, 3500));
     }
   }
-
-  // Sticky country ONLY when user sent service-only (no country in message)
-  if (session.countryId && session.state === 'AWAITING_APP') {
-    const parsedNow = await parseCountryService(textMsg);
-    if (parsedNow.countryId) {
-      // handled above
-    } else {
-      const svc = detectServiceOnly(textMsg) || parsedNow;
-      const q = svc.serviceName || svc.serviceCode || textMsg;
-      if (q && isRealServiceName(q)) {
-        return miraShowPricesAndConfirm(ctx, session, userId, session.countryId, session.country, q);
-      }
-    }
-  }
-
-  // Gemini optional enhancement for pure chat — Mira owns buy + fund path
-  const buyIntent =
-    looksLikeNeedNumber(textMsg) ||
-    fundIntent ||
-    session.state === 'AWAITING_FUND_AMOUNT' ||
-    !!(await parseCountryService(textMsg)).countryId ||
-    !!(await parseCountryService(textMsg)).serviceName ||
-    ['AWAITING_SERVICE', 'AWAITING_COUNTRY', 'AWAITING_CONFIRM', 'AWAITING_FUND_AMOUNT'].includes(
-      session.state
-    ) ||
-    detectServiceOnly(textMsg);
-
-  if (GEMINI_API_KEY && !buyIntent && session.state === 'AWAITING_INPUT') {
-    try {
-      const result = await callGeminiWithTools(session, userId, textMsg);
-      // Persist conversation + any side-effects from tools (balance, pending_payment, etc.)
-      if (result?.contents) {
-        session.conversation = result.contents
-          .filter((c) => c.role === 'user' || c.role === 'model')
-          .slice(-MAX_CONVERSATION_TURNS);
-      }
-      await saveUserSession(userId, session);
-
-      if (result?.quota) {
-        return miraHandleSmartText(ctx, session, userId, textMsg);
-      }
-      if (result?.modelFail) {
-        return miraHandleSmartText(ctx, session, userId, textMsg);
-      }
-      const replyText = result?.reply;
-      if (replyText && replyText !== 'QUOTA_EXCEEDED' && replyText !== 'MODEL_UNAVAILABLE') {
-        // If create_payment tool ran, attach Pay button instead of raw URL
-        if (session.pending_payment?.authorization_url) {
-          return ctx.reply(
-            replyText.slice(0, 3500),
-            Markup.inlineKeyboard([
-              [Markup.button.url('💳 Pay here', session.pending_payment.authorization_url)]
-            ])
-          );
-        }
-        const opts = session.last_options || [];
-        if (opts.length > 1 && session.countryId) {
-          return ctx.reply(
-            replyText.slice(0, 4000),
-            optionButtons(
-              session.countryId,
-              opts.map((o) => ({
-                service_id: o.service_code,
-                service_name: o.name,
-                price_ngn: o.price_ngn,
-                variant: o.variant
-              }))
-            )
-          );
-        }
-        return ctx.reply(replyText.slice(0, 4000));
-      }
-    } catch (e) {
-      console.error('gemini text', e.message);
-    }
-  }
-
-  // Built-in Mira smart conversation (always on)
-  return miraHandleSmartText(ctx, session, userId, textMsg);
+  if (GREETING.test(lower)) return ctx.reply('How far 👋 I dey.\nYou need *number*, *fund* wallet, or check *balance*?', { ...md, ...menuKb });
+  return ctx.reply(MSG.fallback, md);
 });
-
-
-async function showServiceOptions(ctx, session, userId, countryId, countryName, serviceQuery) {
-  countryName = asName(countryName) || `country ${countryId}`;
-  serviceQuery = asName(serviceQuery) || serviceQuery;
-  await ctx.reply(`Checking *${countryName}* prices…`, { parse_mode: 'Markdown' });
-  let list = await getSellableServices(countryId, serviceQuery);
-  if (!list.length) {
-    list = await getSellableServices(countryId, null);
-    if (serviceQuery) list = matchServices(list, serviceQuery);
-  }
-  if (!list.length) {
-    return ctx.reply('No numbers available for that option right now. Try another country or app.');
-  }
-
-  list = dedupeServices(list);
-
-  session.country = countryName;
-  session.countryId = countryId;
-  session.serviceQuery = serviceQuery;
-  session.last_options = list.slice(0, 8).map((s) => ({
-    service_code: s.service_id,
-    name: s.service_name,
-    variant: s.variant || 'normal',
-    price_ngn: s.price_ngn,
-    stock: s.stock,
-    country_id: countryId
-  }));
-  session.state = 'AWAITING_INPUT';
-  await saveUserSession(userId, session);
-
-  // Single supplier option → one buy button (no fake Normal/Virtual pair)
-  if (list.length === 1) {
-    const s = list[0];
-    return ctx.reply(
-      `*${s.service_name}* · ${countryName}\n₦${Number(s.price_ngn).toLocaleString()}\n\nTap to buy:`,
-      {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-          [Markup.button.callback(
-            `✅ Buy · ₦${Number(s.price_ngn).toLocaleString()}`,
-            `opt:${countryId}:${s.service_id}:${s.price_ngn}`.slice(0, 64)
-          )],
-          [Markup.button.callback('⬅️ Cancel', 'opt:cancel')]
-        ])
-      }
-    );
-  }
-
-  // Multiple real service_ids from supplier only
-  return ctx.reply(
-    `*${countryName}* · ${serviceQuery || 'services'}\n\nSelect an option:`,
-    {
-      parse_mode: 'Markdown',
-      ...optionButtons(countryId, list.slice(0, 8))
-    }
-  );
-}
 
 bot.catch((err) => console.error('bot error', err));
 
-// ---------- SMS status: webhook + auto-poll ----------
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-/** Find which Telegram user owns this activation id */
-async function findUserIdByOrderId(orderId) {
-  if (!orderId || !SUPABASE_REST_URL || !SUPABASE_SERVICE_KEY) return null;
-  const oid = String(orderId).trim();
-  try {
-    // orders is jsonb array — filter rows updated recently and scan
-    const res = await axios.get(
-      `${SUPABASE_REST_URL}/user_sessions?select=user_id,orders&orders=not.is.null&order=updated_at.desc&limit=80`,
-      { ...axiosCfg, headers: sbHeaders }
-    );
-    const rows = Array.isArray(res.data) ? res.data : [];
-    for (const row of rows) {
-      const orders = row.orders || [];
-      if (orders.some((o) => o && String(o.orderId) === oid)) {
-        return String(row.user_id);
-      }
-    }
-  } catch (e) {
-    console.error('findUserIdByOrderId', e.message);
-  }
-  return null;
-}
-
-/** Persist code on order + DM the customer */
-async function deliverCodeToUser(telegramUserId, orderId, code, fullText) {
-  const session = await getUserSession(telegramUserId);
-  let found = false;
-  session.orders = (session.orders || []).map((o) => {
-    if (String(o.orderId) === String(orderId)) {
-      found = true;
-      return { ...o, status: `Code: ${code}`, sms_text: fullText || null, code_at: new Date().toISOString() };
-    }
-    return o;
-  });
-  if (!found) {
-    session.orders = [
-      ...(session.orders || []),
-      {
-        orderId: String(orderId),
-        status: `Code: ${code}`,
-        sms_text: fullText || null,
-        code_at: new Date().toISOString()
-      }
-    ].slice(-30);
-  }
-  await saveUserSession(telegramUserId, session);
-  const msg =
-    `Your code don drop ✅\n\n` +
-    `*${code}*\n` +
-    (fullText && fullText !== code ? `\n_${String(fullText).slice(0, 200)}_\n` : '') +
-    `\nOrder: \`${orderId}\`\nCopy sharp. You need another number?`;
-  try {
-    await bot.telegram.sendMessage(telegramUserId, msg, { parse_mode: 'Markdown' });
-  } catch (e) {
-    console.error('deliverCodeToUser send', e.message);
-  }
-  return true;
-}
-
-/**
- * Handle inbound SMS status (webhook body or polled result).
- * Accepts SMS-Activate style:
- *   { activationId, code, text, service, country, receivedAt }
- * or our internal: { order_id, code, text, telegram_user_id }
- */
-async function handleSmsStatusPayload(body) {
-  const orderId =
-    body.activationId ||
-    body.activation_id ||
-    body.id ||
-    body.order_id ||
-    body.orderId ||
-    null;
-  const code = body.code || body.sms_code || body.otp || null;
-  const text = body.text || body.sms || body.message || null;
-  let userId =
-    body.telegram_user_id ||
-    body.telegramUserId ||
-    body.user_id ||
-    null;
-
-  if (!orderId) return { ok: false, error: 'missing order/activation id' };
-
-  // Extract code from text if needed
-  let finalCode = code ? String(code).trim() : '';
-  if (!finalCode && text) {
-    const m = String(text).match(/\b(\d{4,8})\b/);
-    if (m) finalCode = m[1];
-  }
-  if (!finalCode) return { ok: false, error: 'no code yet', waiting: true, orderId };
-
-  if (!userId) userId = await findUserIdByOrderId(orderId);
-  if (!userId) {
-    console.error('[status] no user for order', orderId);
-    return { ok: false, error: 'user not found for order', orderId, code: finalCode };
-  }
-
-  // Skip if already delivered
-  const session = await getUserSession(userId);
-  const existing = (session.orders || []).find((o) => String(o.orderId) === String(orderId));
-  if (existing && /Code:\s*\d/i.test(String(existing.status || ''))) {
-    return { ok: true, already: true, orderId, code: finalCode };
-  }
-
-  await deliverCodeToUser(userId, orderId, finalCode, text);
-  return { ok: true, orderId, code: finalCode, userId };
-}
-
-/** After buy: poll Grizzly a few times and push code when ready (serverless-friendly chain) */
-async function startStatusPolling(baseUrl, telegramUserId, orderId, price, attempt = 0) {
-  const maxAttempts = Number(process.env.STATUS_POLL_ATTEMPTS) || 18; // ~18 * 8s ≈ 2.5 min
-  const delayMs = Number(process.env.STATUS_POLL_MS) || 8000;
-  const secret = process.env.WEBHOOK_SECRET || process.env.INTERNAL_POLL_SECRET || '';
-
-  try {
-    const st = await grizzlyStatus(orderId);
-    if (st.success && st.code) {
-      await handleSmsStatusPayload({
-        order_id: orderId,
-        code: st.code,
-        telegram_user_id: String(telegramUserId)
-      });
-      return { done: true, code: st.code };
-    }
-  } catch (e) {
-    console.error('[poll] status', e.message);
-  }
-
-  if (attempt + 1 >= maxAttempts) {
-    console.log('[poll] give up', orderId, 'user', telegramUserId);
-    try {
-      await bot.telegram.sendMessage(
-        telegramUserId,
-        `Code never drop yet for order \`${orderId}\`.\nTap *Check SMS code* on the order message, or cancel when the timer allow.`,
-        { parse_mode: 'Markdown' }
-      );
-    } catch (_) {}
-    return { done: false, exhausted: true };
-  }
-
-  // Chain next poll via HTTP so each Vercel invocation stays short
-  const nextUrl = `${baseUrl.replace(/\/$/, '')}/api/poll-status`;
-  setTimeout(() => {
-    axios
-      .post(
-        nextUrl,
-        {
-          telegram_user_id: String(telegramUserId),
-          order_id: String(orderId),
-          price: price || 0,
-          attempt: attempt + 1
-        },
-        {
-          timeout: 8000,
-          headers: {
-            'Content-Type': 'application/json',
-            ...(secret ? { 'x-internal-secret': secret } : {})
-          }
-        }
-      )
-      .catch((e) => console.error('[poll] chain', e.message));
-  }, Math.min(delayMs, 2000)); // schedule soon; actual wait is between invocations via attempt spacing
-
-  // Also wait a bit in-process once (helps first few checks)
-  if (attempt === 0) {
-    await sleep(Math.min(delayMs, 6000));
-    try {
-      const st2 = await grizzlyStatus(orderId);
-      if (st2.success && st2.code) {
-        await handleSmsStatusPayload({
-          order_id: orderId,
-          code: st2.code,
-          telegram_user_id: String(telegramUserId)
-        });
-        return { done: true, code: st2.code };
-      }
-    } catch (_) {}
-  }
-
-  return { done: false, scheduled: true, attempt: attempt + 1 };
-}
-
-// ---------- Vercel / local handler ----------
+// ------------------------------------------------------------------ HTTP handler
+const readBody = (req) => (typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {}));
+const send = (res, code, body, type = 'text/plain') => { res.statusCode = code; res.setHeader('Content-Type', type); return res.end(body); };
 
 module.exports = async (req, res) => {
   try {
     const host = req.headers['x-forwarded-host'] || req.headers.host || '';
-    const proto = req.headers['x-forwarded-proto'] || 'https';
-    const base = `${proto}://${host}`;
-    const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
-    const pathOnly = String(req.url || '').split('?')[0];
+    const base = `${req.headers['x-forwarded-proto'] || 'https'}://${host}`;
+    const u = new URL(base + (req.url || '/'));
+    // vercel.json rewrites tag the route in ?route=...; plain paths work too
+    const path = (u.searchParams.get('route') || u.pathname).replace(/^\/+|\/+$/g, '') || '/';
 
-    if (req.method === 'GET' && (req.url === '/setup-webhook' || req.url?.startsWith('/setup-webhook'))) {
-      if (!BOT_TOKEN) {
-        res.statusCode = 500;
-        return res.end('BOT_TOKEN missing');
-      }
-      // This endpoint re-registers where Telegram sends your bot's traffic.
-      // Previously it had zero auth — anyone who found this URL could hit
-      // it (harmless-looking, since it always points back to this same
-      // deployment) but it also silently drops any messages that arrived
-      // in the moments before someone else re-ran it (drop_pending_updates)
-      // — a cheap way to disrupt real users. Now requires WEBHOOK_SECRET as
-      // a query param if that env var is set.
-      if (WEBHOOK_SECRET) {
-        const providedSecret = new URL(base + req.url).searchParams.get('secret');
-        if (providedSecret !== WEBHOOK_SECRET) {
-          res.statusCode = 401;
-          return res.end('Unauthorized — pass ?secret=YOUR_WEBHOOK_SECRET');
-        }
-      }
-      const url = `${base}/api`;
-      await bot.telegram.setWebhook(url, {
-        drop_pending_updates: true,
-        // Telegram echoes this back on every real update as the
-        // X-Telegram-Bot-Api-Secret-Token header — validated below on
-        // every POST, so requests NOT actually from Telegram get rejected
-        // instead of being processed as if a real user sent them.
-        ...(WEBHOOK_SECRET ? { secret_token: WEBHOOK_SECRET } : {})
-      });
-      res.statusCode = 200;
-      res.setHeader('Content-Type', 'application/json');
-      return res.end(JSON.stringify({
-        ok: true,
-        webhook: url,
-        secured: !!WEBHOOK_SECRET,
-        warning: WEBHOOK_SECRET ? undefined : 'WEBHOOK_SECRET is not set — this webhook accepts requests from anyone, not just Telegram. Set WEBHOOK_SECRET and re-run this endpoint.'
-      }));
+    if (req.method === 'GET' && path.startsWith('setup-webhook')) {
+      if (!BOT_TOKEN) return send(res, 500, 'BOT_TOKEN missing');
+      if (!WEBHOOK_SECRET) return send(res, 503, 'Set WEBHOOK_SECRET in Vercel first, then open this URL again with ?secret=YOUR_SECRET');
+      if (u.searchParams.get('secret') !== WEBHOOK_SECRET) return send(res, 401, 'Unauthorized');
+      await bot.telegram.setWebhook(`${base}/api`, { drop_pending_updates: true, secret_token: WEBHOOK_SECRET });
+      const menu = [
+        { command: 'start', description: '🏠 Main menu' },
+        { command: 'shop', description: '🛍 Open shop' },
+        { command: 'wallet', description: '💰 Wallet & deposit' },
+        { command: 'orders', description: '📦 My history' },
+        { command: 'support', description: '🆘 Support & help' }
+      ];
+      await bot.telegram.setMyCommands(menu).catch(() => {});
+      await bot.telegram.setChatMenuButton({ menuButton: { type: 'commands' } }).catch(() => {});
+      return send(res, 200, JSON.stringify({ ok: true, webhook: `${base}/api`, secured: true }), 'application/json');
     }
 
-    if (req.method === 'GET') {
-      res.statusCode = 200;
-      res.setHeader('Content-Type', 'text/plain');
-      return res.end('MJ SMS Bot — online');
-    }
+    if (req.method === 'GET') return send(res, 200, 'MJ SMS Bot — online');
 
-    // Paystack webhook / callback credit
-    if (req.method === 'POST' && (pathOnly === '/paystack' || pathOnly.startsWith('/paystack') || pathOnly === '/api/paystack')) {
-      const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
-      const event = body.event || '';
-      const data = body.data || {};
-      if (event === 'charge.success' || String(data.status).toLowerCase() === 'success') {
-        const reference = data.reference;
-        const amountNgn = Math.round((Number(data.amount) || 0) / 100);
-        const telegramUserId = data.metadata?.telegram_user_id;
-        if (telegramUserId && reference && amountNgn > 0) {
-          const session = await getUserSession(telegramUserId);
-          if (session.last_credited_reference !== reference) {
-            session.balance = money(money(session.balance) + amountNgn);
-            session.last_credited_reference = reference;
-            session.pending_payment = null;
-            await saveUserSession(telegramUserId, session);
-            try {
-              await bot.telegram.sendMessage(
-                telegramUserId,
-                `Payment confirmed ✅\n₦${amountNgn.toLocaleString()} don enter your wallet.\nNew balance: ₦${money(session.balance).toLocaleString()}\n\nYou fit buy number now. Just tell me country and app.`
-              );
-            } catch (e) {
-              console.error('notify user after paystack', e.message);
-            }
+    // Paystack webhook: the request body is NOT trusted. We only use its reference,
+    // then ask Paystack directly whether that payment really succeeded.
+    if (req.method === 'POST' && path.endsWith('paystack')) {
+      const ref = readBody(req).data?.reference;
+      if (ref && /^MJSMS_\d+_\d+$/.test(String(ref))) {
+        const v = await paystack.verify(ref);
+        if (v.success && v.telegram_user_id && v.amount_ngn > 0) {
+          const c = await wallet.credit(v.telegram_user_id, v.amount_ngn, 'fund', v.reference);
+          if (c.applied) {
+            await bot.telegram.sendMessage(v.telegram_user_id,
+              `Payment confirmed ✅\n${ngn(v.amount_ngn)} don enter your wallet.\nNew balance: ${ngn(c.balance)}\n\nTell me country + app to buy.`).catch(() => {});
           }
         }
       }
-      res.statusCode = 200;
-      return res.end('ok');
-    }
-
-    // SMS status webhook (Grizzly / SMS-Activate style callback)
-    // URL: https://YOUR-BOT.vercel.app/api/status  or  /status
-    if (
-      req.method === 'POST' &&
-      (pathOnly === '/status' ||
-        pathOnly === '/api/status' ||
-        pathOnly === '/sms-status' ||
-        pathOnly === '/api/sms-status' ||
-        pathOnly.startsWith('/status'))
-    ) {
-      let body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : req.body || {};
-      // Also accept query-string style (some providers GET/POST form)
-      try {
-        const u = new URL(base + (req.url || '/'));
-        for (const [k, v] of u.searchParams) {
-          if (body[k] == null) body[k] = v;
-        }
-      } catch (_) {}
-      const result = await handleSmsStatusPayload(body);
-      res.statusCode = 200;
-      res.setHeader('Content-Type', 'application/json');
-      return res.end(JSON.stringify(result));
-    }
-
-    // Internal status poller (chained after purchase)
-    if (
-      req.method === 'POST' &&
-      (pathOnly === '/poll-status' || pathOnly === '/api/poll-status')
-    ) {
-      const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : req.body || {};
-      const internal = process.env.WEBHOOK_SECRET || process.env.INTERNAL_POLL_SECRET || '';
-      if (internal && req.headers['x-internal-secret'] !== internal) {
-        res.statusCode = 401;
-        return res.end('unauthorized');
-      }
-      const userId = body.telegram_user_id || body.userId;
-      const orderId = body.order_id || body.orderId;
-      const attempt = Number(body.attempt) || 0;
-      const price = body.price || 0;
-      if (!userId || !orderId) {
-        res.statusCode = 400;
-        return res.end(JSON.stringify({ error: 'userId and orderId required' }));
-      }
-      // Space polls: each invocation does one check; chain with delay
-      await sleep(Number(process.env.STATUS_POLL_MS) || 8000);
-      const out = await startStatusPolling(base, userId, orderId, price, attempt);
-      res.statusCode = 200;
-      res.setHeader('Content-Type', 'application/json');
-      return res.end(JSON.stringify(out));
+      return send(res, 200, 'ok');                         // always 200 so Paystack stops retrying
     }
 
     if (req.method === 'POST') {
-      if (WEBHOOK_SECRET && req.headers['x-telegram-bot-api-secret-token'] !== WEBHOOK_SECRET) {
-        res.statusCode = 401;
-        return res.end('unauthorized');
-      }
-      await bot.handleUpdate(req.body);
-      res.statusCode = 200;
-      return res.end('ok');
+      // Fail closed: without the secret anybody could forge updates as any Telegram user.
+      if (!WEBHOOK_SECRET || req.headers['x-telegram-bot-api-secret-token'] !== WEBHOOK_SECRET) return send(res, 401, 'unauthorized');
+      await bot.handleUpdate(readBody(req));
+      return send(res, 200, 'ok');
     }
-
-    res.statusCode = 405;
-    res.end('Method not allowed');
+    return send(res, 405, 'Method not allowed');
   } catch (e) {
-    console.error(e);
-    res.statusCode = 200; // avoid Telegram retries storm
-    res.end('ok');
+    console.error('handler', e);
+    return send(res, 200, 'ok');                           // avoid Telegram retry storms
   }
 };
